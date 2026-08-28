@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ONTbarcoder 3.1b — User Manual</title>
+<style>
+  :root{
+    --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
+    --green:#3B6D11; --green-lt:#EAF3DE; --amber:#854F0B; --amber-lt:#FAEEDA;
+    --red:#A32D2D; --red-lt:#FCEBEB; --gray-bg:#F7F7F5; --line:#E0DED8;
+    --text:#1A1A18; --text-sec:#56544D; --text-hint:#8A8780; --dark:#203864;
+    --code-bg:#2A2D3A; --sidebar-w:300px;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0; font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
+    color:var(--text); background:#fff; line-height:1.65; font-size:16px;
+  }
+  /* ── Sidebar ── */
+  #sidebar{
+    position:fixed; top:0; left:0; width:var(--sidebar-w); height:100vh;
+    overflow-y:auto; background:var(--gray-bg); border-right:1px solid var(--line);
+    padding:24px 0;
+  }
+  #sidebar .brand{padding:0 24px 16px; border-bottom:1px solid var(--line); margin-bottom:12px;}
+  #sidebar .brand h1{font-size:21px; margin:0; color:var(--dark); letter-spacing:-.3px;}
+  #sidebar .brand .ver{font-size:13px; color:var(--blue); background:var(--blue-lt);
+    display:inline-block; padding:1px 9px; border-radius:10px; margin-top:6px; font-weight:600;}
+  #sidebar nav a{
+    display:block; padding:6px 24px; color:var(--text-sec); text-decoration:none;
+    font-size:14.5px; border-left:3px solid transparent;
+  }
+  #sidebar nav a:hover{background:var(--blue-lt); color:var(--blue);}
+  #sidebar nav a.sub{padding-left:40px; font-size:13.5px; color:var(--text-hint);}
+  #sidebar nav .sec{padding:14px 24px 4px; font-size:11px; font-weight:700;
+    text-transform:uppercase; letter-spacing:.6px; color:var(--text-hint);}
+  /* ── Content ── */
+  main{margin-left:var(--sidebar-w); max-width:920px; padding:48px 56px 120px;}
+  h2{font-size:30px; color:var(--dark); border-bottom:2px solid var(--line);
+    padding-bottom:10px; margin-top:56px; letter-spacing:-.4px;}
+  h2:first-child{margin-top:0;}
+  h3{font-size:22px; color:var(--blue); margin-top:38px;}
+  h4{font-size:17px; color:var(--text); margin-top:26px; margin-bottom:6px;}
+  p{margin:10px 0;}
+  code{background:#EEEDE9; padding:1.5px 6px; border-radius:4px; font-size:14px;
+    font-family:'Cascadia Code','Consolas',monospace; color:#9B2C2C;}
+  pre{background:var(--code-bg); color:#E6E6E6; padding:16px 20px; border-radius:10px;
+    overflow-x:auto; font-size:13.5px; font-family:'Cascadia Code','Consolas',monospace;
+    line-height:1.55;}
+  pre .c{color:#7FB3E0;} pre .g{color:#9DD36A;} pre .h{color:#E0A95E;}
+  a{color:var(--blue);}
+  ul,ol{padding-left:24px;} li{margin:5px 0;}
+  table{border-collapse:collapse; width:100%; margin:18px 0; font-size:14.5px;}
+  th,td{border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top;}
+  th{background:var(--blue-lt); color:var(--dark); font-weight:600;}
+  tr:nth-child(even) td{background:var(--gray-bg);}
+  td code{white-space:nowrap;}
+  .lead{font-size:18px; color:var(--text-sec);}
+  .note,.warn,.tip{border-radius:10px; padding:14px 18px; margin:18px 0; font-size:15px;}
+  .note{background:var(--blue-lt); border-left:4px solid var(--blue-mid);}
+  .warn{background:var(--red-lt); border-left:4px solid var(--red);}
+  .tip{background:var(--green-lt); border-left:4px solid var(--green);}
+  .note b,.warn b,.tip b{display:block; margin-bottom:3px;}
+  .pill{display:inline-block; font-size:12px; font-weight:700; padding:2px 9px;
+    border-radius:20px; vertical-align:middle;}
+  .pill.coi{background:var(--blue-lt); color:var(--blue);}
+  .pill.def{background:var(--green-lt); color:var(--green);}
+  .phase-flow{display:flex; gap:8px; flex-wrap:wrap; margin:22px 0;}
+  .phase-flow .step{flex:1; min-width:160px; background:var(--gray-bg);
+    border:1px solid var(--line); border-radius:10px; padding:14px;}
+  .phase-flow .step .n{font-weight:700; color:var(--blue); font-size:13px;}
+  .phase-flow .step .t{font-weight:600; margin:3px 0;}
+  .phase-flow .step .d{font-size:13px; color:var(--text-hint);}
+  .filetree{background:var(--gray-bg); border:1px solid var(--line); border-radius:10px;
+    padding:18px 22px; font-family:'Cascadia Code','Consolas',monospace; font-size:13.5px;
+    line-height:1.7;}
+  .filetree .dir{color:var(--blue); font-weight:600;}
+  .filetree .ok{color:var(--green);}
+  .filetree .cm{color:var(--text-hint);}
+  .filetree .root{margin-bottom:2px;}
+  .filetree .suffix-note{font-size:12px; margin:0 0 12px; font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;}
+  .filetree table{border-collapse:collapse; width:100%; margin:0; font-size:13.5px;}
+  .filetree td{border:none; padding:1px 8px 1px 0; background:transparent;
+    vertical-align:top; white-space:nowrap;}
+  .filetree tr:nth-child(even) td{background:transparent;}
+  .filetree td:last-child{white-space:normal; color:var(--text-hint);
+    font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif; font-size:13px; width:55%;}
+  /* ── Figures / screenshots ── */
+  figure{margin:24px 0; padding:0;}
+  figure img{display:block; width:100%; height:auto; border:1px solid var(--line);
+    border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,.07);}
+  figure.narrow{max-width:520px;}            /* for tall/portrait shots */
+  figure.center{margin-left:auto; margin-right:auto;}
+  figcaption{font-size:13.5px; color:var(--text-hint); text-align:center;
+    margin-top:8px; line-height:1.5;}
+  figcaption b{color:var(--text-sec);}
+  /* placeholder shown until you drop a real image in (remove .ph when done) */
+  figure.ph{background:repeating-linear-gradient(45deg,#F1F0EC,#F1F0EC 12px,#E9E8E3 12px,#E9E8E3 24px);
+    border:2px dashed var(--line); border-radius:10px; min-height:240px;
+    display:flex; align-items:center; justify-content:center; color:var(--text-hint);
+    font-size:14px; text-align:center; padding:24px;}
+  figure.ph img{display:none;}
+  footer{margin-left:var(--sidebar-w); padding:30px 56px; border-top:1px solid var(--line);
+    color:var(--text-hint); font-size:13.5px;}
+  @media print{#sidebar{display:none;} main,footer{margin-left:0;}}
+</style>
+</head>
+<body>
+
+<aside id="sidebar">
+  <div class="brand">
+    <h1>ONTbarcoder</h1>
+    <span class="ver">v3.1b — User Manual</span>
+  </div>
+  <nav>
+    <div class="sec">Getting started</div>
+    <a href="#intro">1. Introduction</a>
+    <a href="#install">2. Installation &amp; requirements</a>
+    <a href="#workflow">3. Workflow overview</a>
+    <div class="sec">Running an analysis</div>
+    <a href="#inputs">4. Input files</a>
+    <a href="#modes">5. Analysis modes</a>
+    <a href="#params">6. Parameters reference</a>
+    <a href="#noncoi">7. Non-coding marker mode</a>
+    <div class="sec">The pipeline</div>
+    <a href="#phase1" class="sub">Phase 1 — Demultiplexing</a>
+    <a href="#phase2a" class="sub">Phase 2a — Consensus by length</a>
+    <a href="#phase2b" class="sub">Phase 2b — Consensus by similarity</a>
+    <a href="#phase3" class="sub">Phase 3 — Barcode comparison</a>
+    <div class="sec">Outputs</div>
+    <a href="#outputs">8. Results &amp; output files</a>
+    <a href="#excel" class="sub">runsummary.xlsx</a>
+    <a href="#profiles">9. Parameter profiles</a>
+    <div class="sec">Utilities</div>
+    <a href="#util-compare">10. FASTA Compare</a>
+    <a href="#util-tools">11. FASTA Tools</a>
+    <a href="#util-fastq">12. FASTQ Inspector</a>
+    <a href="#util-blast">13. BLAST</a>
+    <a href="#util-notes">14. Notes</a>
+    <div class="sec">Reference</div>
+    <a href="#performance">15. Performance &amp; threads</a>
+    <a href="#troubleshoot">16. Troubleshooting</a>
+    <a href="#credits">17. Credits &amp; citation</a>
+  </nav>
+</aside>
+
+<main>
+
+<!--
+  ═══════════════════════════════════════════════════════════════════════
+  HOW TO ADD SCREENSHOTS  (read me, then delete this comment if you like)
+  ═══════════════════════════════════════════════════════════════════════
+  1. Create a folder called  images/  next to this MANUAL.html file.
+  2. Save each screenshot there, e.g.  images/panel-setup.png
+     (PNG is best for UI; keep width around 1200–1600 px.)
+  3. Find the placeholder blocks below — they look like:
+
+         <figure class="ph">
+           <img src="images/mode-conventional.png" alt="Conventional mode setup">
+           PLACEHOLDER · drop images/mode-conventional.png here
+         </figure>
+
+     To activate one, just remove the word  ph  from  class="ph"  →  class=""
+     (or class="narrow" for a tall/portrait shot). The image then shows and
+     the dashed placeholder disappears. Nothing else changes.
+
+  4. To add a NEW figure anywhere, paste this template:
+
+         <figure class="">
+           <img src="images/MY-IMAGE.png" alt="short description">
+           <figcaption><b>Figure N.</b> Caption text here.</figcaption>
+         </figure>
+
+     Optional variants:  class="narrow"  (max 520px wide, for portrait shots)
+                         class="center"  (centre a narrow figure)
+  ═══════════════════════════════════════════════════════════════════════
+-->
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="intro">1. Introduction</h2>
+<p class="lead">
+ONTbarcoder is a desktop application for <b>demultiplexing</b> and <b>consensus barcode
+reconstruction</b> from Oxford Nanopore Technologies (ONT) reads tagged with dual DNA
+barcodes (tags). It turns a raw FASTQ file and a demultiplexing sheet into validated,
+specimen-level barcode sequences — with no command line required.
+</p>
+<p>
+Version 3.x preserves the algorithmic logic of ONTbarcoder 2.0 (Srivathsan <i>et al.</i>,
+2024) while adding a redesigned graphical interface, deterministic multiprocessing, a
+real-time (live sequencing) mode, a non-coding marker mode, and a set of integrated utilities
+(FASTA comparison, FASTA tools, a FASTQ inspector and an NCBI BLAST client).
+</p>
+<p>This manual targets researchers already familiar with amplicon sequencing and DNA
+barcoding. It documents every parameter, each pipeline phase, and all output files.</p>
+
+<h4>Key concepts used throughout</h4>
+<ul>
+  <li><b>Tag</b> — the short oligonucleotide index (a.k.a. barcode index) appended to each
+      primer to identify a specimen. Each specimen is defined by a unique
+      <i>forward tag + reverse tag</i> combination.</li>
+  <li><b>Barcode</b> — the final consensus sequence reconstructed for a specimen (e.g. the
+      658&nbsp;bp COI fragment).</li>
+  <li><b>Coverage</b> — the number of reads used to build a consensus for a specimen.</li>
+  <li><b>QC-compliant barcode</b> — a barcode with no ambiguities (N) and no estimated
+      indel errors; the highest-confidence output category.</li>
+</ul>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="install">2. Installation &amp; requirements</h2>
+
+<h3>2.1 Packaged Windows build (recommended for end users)</h3>
+<p>The application is distributed as a self-contained folder built with PyInstaller
+(onedir). No Python installation is required.</p>
+<ol>
+  <li>Unzip the distribution archive.</li>
+  <li>Keep the folder layout intact — <code>ONTbarcoder3.exe</code> must remain next to the
+      <code>_internal</code> folder and the <code>_mafftfiles</code> folder.</li>
+  <li>Double-click <code>ONTbarcoder3.exe</code>.</li>
+</ol>
+
+<div class="warn">
+<b>Install in a writable location</b>
+The program writes its profiles, default output folders and temporary alignment files
+<i>next to the executable</i>. Do <u>not</u> place it under <code>C:\Program Files\</code>
+or any read-only directory — unzip it to the Desktop, Documents, or another folder where
+your user account has write permission. This is the single most common cause of failures.
+</div>
+
+<h4>Bundled components</h4>
+<ul>
+  <li><code>_mafftfiles/</code> — the alignment engine (<code>disttbfast.exe</code>, a MAFFT
+      component), its parameter file (<code>parfile</code>) and substitution matrix
+      (<code>_aamtx</code>). Required for all consensus phases.</li>
+  <li><code>icon.ico</code> — application icon.</li>
+  <li><code>_profiles/</code> — created automatically on first run to store parameter
+      profiles and tool configuration.</li>
+</ul>
+
+<h3>2.2 Running from source</h3>
+<p>For development or non-Windows platforms, run <code>ONTbarcoder3.py</code> with Python
+3.10+ and the following dependencies:</p>
+<pre><span class="c"># core dependencies</span>
+pip install PyQt5 biopython edlib xlsxwriter openpyxl
+<span class="c"># the _mafftfiles/ folder must sit at the project root (next to ONTbarcoder3.py)</span>
+python ONTbarcoder3.py</pre>
+<table>
+  <tr><th>Dependency</th><th>Purpose</th></tr>
+  <tr><td>PyQt5</td><td>Graphical interface</td></tr>
+  <tr><td>biopython</td><td>Translation / genetic-code validation (<code>Bio.Seq</code>)</td></tr>
+  <tr><td>edlib</td><td>Fast pairwise sequence alignment (demultiplexing &amp; comparison)</td></tr>
+  <tr><td>xlsxwriter</td><td>Excel report generation (<code>runsummary.xlsx</code>, BLAST/Compare reports)</td></tr>
+  <tr><td>openpyxl</td><td>Reading <code>.xlsx</code> files (FASTA Tools "Append info to headers from .xlsx")</td></tr>
+</table>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="workflow">3. Workflow overview</h2>
+<p>The left sidebar of the application is organized into a <b>Workflow</b> section (the
+analysis pipeline) and a <b>Utilities</b> section (standalone tools). A typical run moves
+through the workflow panels in order:</p>
+
+<div class="phase-flow">
+  <div class="step"><div class="n">PANEL 1</div><div class="t">Input files</div>
+    <div class="d">Choose the mode and load the FASTQ + demultiplexing CSV.</div></div>
+  <div class="step"><div class="n">PANEL 2</div><div class="t">Parameters</div>
+    <div class="d">Configure lengths, mismatches, consensus and which phases to run.</div></div>
+  <div class="step"><div class="n">PANEL 3</div><div class="t">Progress</div>
+    <div class="d">Live phase-by-phase progress, log, and barcode counters.</div></div>
+  <div class="step"><div class="n">PANEL 4</div><div class="t">Results</div>
+    <div class="d">Summary tables, output folders, and the Excel report.</div></div>
+</div>
+
+<p>Internally the barcode-building pipeline runs in up to four phases:</p>
+<div class="phase-flow">
+  <div class="step"><div class="n">PHASE 1</div><div class="t">Demultiplexing</div>
+    <div class="d">Assign reads to specimens by tag + primer.</div></div>
+  <div class="step"><div class="n">PHASE 2a</div><div class="t">Consensus by length</div>
+    <div class="d">Build consensus from length-filtered reads.</div></div>
+  <div class="step"><div class="n">PHASE 2b</div><div class="t">Consensus by similarity</div>
+    <div class="d">Rescue specimens using read-to-reference similarity.</div></div>
+  <div class="step"><div class="n">PHASE 3</div><div class="t">Barcode comparison</div>
+    <div class="d">Fix residual indels against the validated barcode set.</div></div>
+</div>
+
+<figure class="">
+  <img src="images/panel-progress.png" alt="Progress panel">
+  <figcaption><b>Figure 1.</b> The Progress panel: per-phase progress bars, live log and
+  running barcode counters.</figcaption>
+</figure>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="inputs">4. Input files</h2>
+
+<h3>4.1 FASTQ file (reads)</h3>
+<p>A single basecalled FASTQ file (<code>.fastq</code>, uncompressed) containing all reads
+of the run. In <b>conventional</b> mode you supply the complete file; in <b>real-time</b>
+mode the program watches a folder where new FASTQ files appear during sequencing.</p>
+
+<h3>4.2 Demultiplexing file (CSV)</h3>
+<p>A comma-separated file (<code>.csv</code> or <code>.txt</code>), <b>one row per
+specimen</b>, with no header row. Columns:</p>
+<pre><span class="h">sample, tag_f, tag_r, primer_f, primer_r</span> [, primer_f2, primer_r2, ...] [, gencode]</pre>
+<table>
+  <tr><th>Column</th><th>Content</th></tr>
+  <tr><td><code>sample</code></td><td>Unique specimen identifier (becomes the barcode name).</td></tr>
+  <tr><td><code>tag_f</code></td><td>Forward tag (index) sequence. All tags must be the same length.</td></tr>
+  <tr><td><code>tag_r</code></td><td>Reverse tag (index) sequence.</td></tr>
+  <tr><td><code>primer_f</code></td><td>Forward primer sequence (IUPAC ambiguity codes allowed).</td></tr>
+  <tr><td><code>primer_r</code></td><td>Reverse primer sequence (IUPAC ambiguity codes allowed).</td></tr>
+  <tr><td><code>primer_f2, primer_r2, …</code></td>
+      <td>Optional. Additional primer pairs for primer-cocktail designs. Add them as
+          further pairs of columns.</td></tr>
+  <tr><td><code>gencode</code></td>
+      <td>Optional trailing column: a per-specimen NCBI genetic-code table number
+          (0–33). Lets a single run mix specimens that use different genetic codes.
+          See the note below and <a href="#params">§6.1</a>.</td></tr>
+</table>
+<p>Example with one primer pair:</p>
+<pre><span class="g">BEE001</span>,AACGTGAT,AAACATCG,GGTCAACAAATCATAAAGATATTGG,TAAACTTCAGGGTGACCAAAAAATCA
+<span class="g">BEE002</span>,AAACATCG,AACGTGAT,GGTCAACAAATCATAAAGATATTGG,TAAACTTCAGGGTGACCAAAAAATCA</pre>
+<p>Example with a two-primer cocktail (extra columns):</p>
+<pre><span class="g">SPID01</span>,AACGTGAT,AAACATCG,PRIMER_F1,PRIMER_R1,PRIMER_F2,PRIMER_R2</pre>
+<p>Example with a per-specimen genetic code (trailing column):</p>
+<pre><span class="g">BEE001</span>,AACGTGAT,AAACATCG,GGTCAACAAATCATAAAGATATTGG,TAAACTTCAGGGTGACCAAAAAATCA,5
+<span class="g">BEE002</span>,AAACATCG,AACGTGAT,GGTCAACAAATCATAAAGATATTGG,TAAACTTCAGGGTGACCAAAAAATCA,1</pre>
+
+<div class="note">
+<b>Automatic validation</b>
+When you load the CSV, the panel reports the detected number of specimens and primer
+pairs (computed as <code>(columns − 3) / 2</code>, after excluding a trailing genetic-code
+column if present). Use this to confirm the file parsed as expected. The file is read as
+UTF-8 (BOM tolerated).
+</div>
+<div class="note">
+<b>Per-sample genetic code (mixed-code runs)</b>
+A trailing numeric column (0–33) is auto-detected as an NCBI genetic-code table and
+overrides the <i>Genetic code</i> combobox in Parameters → General for that specimen —
+useful when a run combines specimens whose COI (or other coding marker) uses different
+tables. The setup panel's file hint reports how many rows carry a code (e.g.
+<i>"per-sample genetic code"</i> when all rows have one, or a
+<i>"⚠ genetic code on N/M samples"</i> warning otherwise). <b>This is strict:</b> if the
+column is present for some rows but not all, <b>Start analysis</b> is blocked with an
+"Incomplete genetic codes" dialog until every row has a code — or the column is removed
+from all rows to fall back to the single global code. Ignored entirely in Non-Coding
+marker mode, where translation validation is skipped.
+</div>
+<div class="tip">
+<b>Tip — tag length</b>
+The tag length is inferred from the first row's <code>tag_f</code>. Keep all tags the same
+length, and make sure tags differ by enough edits — the demultiplexer tolerates tag errors
+by generating a mutant lookup table (substitutions, insertions and deletions up to 2 edits).
+</div>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="modes">5. Analysis modes</h2>
+<p>Choose the mode at the top of the <b>Input files</b> panel.</p>
+
+<h3>5.1 Conventional <span class="pill def">default</span></h3>
+<p>For a completed sequencing run. You provide one complete FASTQ file plus the
+demultiplexing CSV. The full pipeline runs once.</p>
+
+<figure class="">
+  <img src="images/mode-conventional.png" alt="Conventional mode setup">
+  <figcaption><b>Figure 2.</b> Conventional mode: the FASTQ and demultiplexing drop zones.</figcaption>
+</figure>
+
+<h3>5.2 Real-Time</h3>
+<p>For analysis <i>during</i> sequencing. The program processes FASTQ files as they are
+generated and updates provisional barcodes cycle by cycle, so you can monitor how many
+specimens have been recovered and stop the run once coverage is sufficient. A live chart
+panel (<b>📈 RT Charts</b>) appears in this mode.</p>
+
+<figure class="">
+  <img src="images/mode-realtime.png" alt="Real-Time mode setup">
+  <figcaption><b>Figure 3.</b> Real-Time mode: demultiplexing file plus the basecalling
+  configuration (MinKNOW folder or Dorado).</figcaption>
+</figure>
+<p>Real-time mode requires choosing how FASTQ files are produced:</p>
+<table>
+  <tr><th>Basecalling mode</th><th>What you provide</th></tr>
+  <tr><td><b>MinKNOW performing basecalling</b></td>
+      <td>The MinKNOW output folder where <code>.fastq</code> files are written. ONTbarcoder
+          watches this folder. (run mode 2)</td></tr>
+  <tr><td><b>Use Dorado for basecalling</b></td>
+      <td>The path to the Dorado executable, a model (<code>sup@latest</code>,
+          <code>hac@latest</code> or <code>fast@latest</code>), and the input folder
+          containing POD5/FAST5 signal files. ONTbarcoder drives Dorado to emit FASTQ.
+          (run mode 3)</td></tr>
+</table>
+<div class="warn">
+<b>Dorado requires an NVIDIA GPU</b>
+Before starting, ONTbarcoder checks for a CUDA-capable NVIDIA GPU (via <code>nvidia-smi</code>).
+If none is found, the analysis is aborted immediately with
+<i>"Dorado requires an NVIDIA GPU with CUDA. Analysis aborted."</i> If your machine has no
+GPU, basecall with MinKNOW or a separate Dorado install first, then use the
+<b>MinKNOW performing basecalling</b> option instead.
+</div>
+<div class="note">
+<b>Cycle triggers (real-time)</b>
+In real-time mode the <b>Consensus</b> tab gains a <i>Provisional consensus frequency</i>
+block. A new consensus cycle is triggered when <b>either</b> condition is met: every
+<i>N reads</i> (default 5000) <b>or</b> every <i>N minutes</i> (default 10). Enable one or
+both. In Coding mode all phases (1, 2a, 2b, 3) run each cycle; in Non-coding mode only phases 1
+and 2a run each cycle.
+</div>
+
+<figure class="">
+  <img src="images/panel-rtcharts.png" alt="RT Charts panel">
+  <figcaption><b>Figure 4.</b> The <b>📈 RT Charts</b> panel: recovered barcodes plotted
+  against reads/cycles during a live sequencing run.</figcaption>
+</figure>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="params">6. Parameters reference</h2>
+<p>The <b>Parameters</b> panel groups settings into four tabs. Defaults are tuned for the
+658&nbsp;bp COI barcode. Every value below shows its default and valid range.</p>
+
+<figure class="">
+  <img src="images/panel-parameters.png" alt="Parameters panel">
+  <figcaption><b>Figure 5.</b> The Parameters panel with the General, Demultiplexing,
+  Consensus and Phases tabs.</figcaption>
+</figure>
+
+<h3>6.1 General tab</h3>
+
+<h4>Intra-sample variant detection</h4>
+<p>Placed above the Non-coding block because it applies to <b>both</b> coding and non-coding
+markers. Off by default.</p>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Range</th><th>Description</th></tr>
+  <tr><td><b>Detect intra-sample sequence variants (keep dominant)</b></td><td>Off</td><td>—</td>
+      <td>When a specimen's reads carry more than one co-abundant template (cross-
+          contamination, index hopping, a paralog/NUMT, or a real heterozygous/allelic
+          variant), cluster the reads into haplotypes automatically and keep the
+          consensus of the <i>dominant</i> (most abundant) one as the barcode, instead of
+          a single majority call that can flip unpredictably with the parameters.
+          Secondary haplotypes are written to <code>secondary_variants.fa</code> and
+          reported in the <b>Intra-sample variants</b> sheet of
+          <code>runsummary.xlsx</code> (see <a href="#excel">§8.1</a>). In coding-marker
+          mode the cleanly-translating haplotype is preferred (this discards NUMTs); in
+          non-coding mode the dominant one is used regardless.</td></tr>
+  <tr><td><b>Min. secondary variant fraction (%)</b></td><td>20</td><td>10 … 50</td>
+      <td>Minimum proportion of a secondary haplotype for it to count as a real variant
+          (and for the sample to be flagged as mixed). Below this the minority is treated
+          as noise and the ordinary consensus is kept. Values below ~10% approach the ONT
+          error floor and risk false positives.</td></tr>
+  <tr><td><b>Variant tolerance (% of diagnostic sites)</b></td><td>10</td><td>0 … 40</td>
+      <td>Maximum percentage of the polymorphic (diagnostic) sites at which two reads of
+          the <i>same</i> haplotype may disagree — due to sequencing error — before they
+          are split into separate variant clusters. Lower = stricter (more clusters);
+          higher = lumps more reads together.</td></tr>
+</table>
+
+<h4>Non-coding / genetic code / performance</h4>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Range</th><th>Description</th></tr>
+  <tr><td><b>Non-coding marker</b></td><td>Off</td><td>—</td>
+      <td>Switch to non-coding markers (ITS, rbcL, matK…). Disables translation
+          validation and phases 2b &amp; 3. See <a href="#noncoi">§7</a>.</td></tr>
+  <tr><td><b>Genetic code</b></td><td>5 — Invertebrate mitochondrial</td>
+      <td>19 NCBI codes</td>
+      <td>Translation table used to validate coding-marker barcodes (no internal stop
+          codons, correct length). Disabled in Non-coding mode. Overridden per specimen if
+          the demultiplexing CSV carries a trailing genetic-code column — see
+          <a href="#inputs">§4.2</a>.</td></tr>
+  <tr><td><b>Number of processing threads</b></td><td>= physical cores</td>
+      <td>1 … logical CPUs</td>
+      <td>Parallel workers. The analysis is internally capped at the number of physical
+          cores; higher values oversubscribe the CPU and run slower. See
+          <a href="#performance">§15</a>.</td></tr>
+  <tr><td><b>Minimum mean read quality (Q, 0 = off)</b></td><td>0</td><td>0 … 50</td>
+      <td>Discards input reads whose mean quality is below this Q value before
+          demultiplexing. Mean read quality is computed the ONT/NanoPlot way
+          (<code>-10·log10(mean per-base error probability)</code>), not a plain average
+          of per-base Q scores. Requires FASTQ input with quality strings.</td></tr>
+</table>
+
+<h3>6.2 Demultiplexing tab</h3>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Range</th><th>Description</th></tr>
+  <tr><td><b>Minimum length (bp)</b></td><td>658</td><td>0 … 5000</td>
+      <td>Reads at or below this length are discarded before demultiplexing. The field is
+          tinted soft-red while it is 0 ("unset") — e.g. right after enabling Non-coding
+          mode, where the length is marker-specific and must be entered manually.</td></tr>
+  <tr><td><b>Barcode length (bp)</b></td><td>658</td><td>0 … 5000</td>
+      <td>Expected length of the final barcode (the amplicon target length). Same
+          "unset" red-tint behavior as above.</td></tr>
+  <tr><td><b>Window of barcode length ± (bp)</b></td><td>100</td><td>0 … 500</td>
+      <td>Tolerance window used to classify reads as single-product vs. double-product
+          (two ligated barcodes) and to split the latter.</td></tr>
+  <tr><td><b>Window for primer search (bp)</b></td><td>100</td><td>10 … 500</td>
+      <td>Number of terminal bases scanned at each read end when searching for the primer
+          (and the adjacent tag).</td></tr>
+  <tr><td><b>Primer mismatches allowed</b></td><td>10</td><td>0 … 30</td>
+      <td>Maximum edit distance tolerated when matching a primer (IUPAC-aware).</td></tr>
+  <tr><td><b>Tag mismatches allowed</b></td><td>2</td><td>0 … 5</td>
+      <td>Maximum tag errors tolerated. A mutant lookup table (substitutions, insertions,
+          deletions) is pre-built up to this many edits.</td></tr>
+</table>
+
+<h3>6.3 Consensus tab</h3>
+<h4>Main consensus calling</h4>
+<table>
+  <tr><th>Parameter</th><th>Default (Coding)</th><th>Range</th><th>Description</th></tr>
+  <tr><td><b>Main consensus calling frequency</b></td><td>0.30</td><td>0.05 … 0.95</td>
+      <td>Per-column frequency threshold: a base is called when its frequency exceeds this
+          value; otherwise the column becomes <code>N</code>. (Non-coding default: 0.40.)</td></tr>
+  <tr><td><b>Range of frequencies to assess (min, max)</b></td><td><code>0.2, 0.5</code></td>
+      <td>0–1</td>
+      <td>If the main-frequency consensus fails validation, the program sweeps thresholds in
+          this range to find a single valid consensus. (Non-coding: <code>0.3, 0.5</code>.)</td></tr>
+  <tr><td><b>Range step</b></td><td>0.05</td><td>0.01 … 0.5</td>
+      <td>Step size for the threshold sweep above.</td></tr>
+</table>
+<h4>Consensus by length (Phase 2a)</h4>
+<table>
+  <tr><th>Parameter</th><th>Default (Coding)</th><th>Description</th></tr>
+  <tr><td><b>Coverage for phase 2a</b></td><td><code>25, 50, 100, 200</code></td>
+      <td>Comma-separated list of coverage levels tried iteratively. For each level the
+          program subsets that many reads per specimen and attempts a valid consensus. Use
+          <b>↕ Reverse order</b> to flip the sequence. (Non-coding default:
+          <code>1500, 1000, 500, 200, 100, 50, 25</code>, descending.)</td></tr>
+  <tr><td><b>Maximum read length deviation from barcode length (bp)</b></td><td>50</td>
+      <td>Reads whose length deviates from <i>Barcode length</i> by more than this are
+          excluded from the length-based consensus.</td></tr>
+  <tr><td><b>Minimum read coverage</b></td><td>5</td>
+      <td>Specimens with fewer demultiplexed reads than this are skipped before any
+          consensus attempt (range 1 … 5000).</td></tr>
+</table>
+<h4>Consensus by similarity (Phase 2b)</h4>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Range</th><th>Description</th></tr>
+  <tr><td><b>Coverage phase 2b</b></td><td>100</td><td>1 … 5000</td>
+      <td>Number of closest reads (by similarity to the provisional reference) used to build
+          the rescue consensus. Disabled in Non-coding mode.</td></tr>
+</table>
+
+<h3>6.4 Phases tab</h3>
+<p>Enable or disable individual pipeline phases. All are on by default.</p>
+<table>
+  <tr><th>Phase</th><th>Notes</th></tr>
+  <tr><td><b>Phase 1: Demultiplexing</b></td>
+      <td>Always active in real-time mode (cannot be unchecked).</td></tr>
+  <tr><td><b>Phase 2a: Consensus by length</b></td><td>Core consensus step.</td></tr>
+  <tr><td><b>Phase 2b: Consensus by similarity (MSA)</b></td>
+      <td>Automatically disabled in Non-coding mode.</td></tr>
+  <tr><td><b>Phase 3: Correction by barcode comparisons</b></td>
+      <td>Automatically disabled in Non-coding mode.</td></tr>
+</table>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="noncoi">7. Non-coding marker mode</h2>
+<p>Enable <b>Non-coding marker</b> (General tab) for non-coding markers such as
+ITS, rbcL, matK, 16S, etc. This changes the acceptance logic:</p>
+<ul>
+  <li><b>No translation validation.</b> The genetic-code check is skipped (it would be
+      meaningless for non-coding loci). Internally the genetic code is set to 0, which
+      activates a dedicated path that validates a barcode <i>only</i> by correct length and
+      absence of ambiguities.</li>
+  <li><b>Acceptance criterion:</b> a barcode is "resolved" when it matches the expected
+      length and contains <b>no N</b>. Barcodes with Ns go to the next (lower) coverage
+      level, and finally to <code>Remaining</code>.</li>
+  <li><b>Phases 2b and 3 are disabled</b> automatically (they require translation
+      validation), and the phase-2b coverage field is locked.</li>
+  <li><b>Coverage list defaults to descending</b> (<code>1500 → 25</code>): for variable
+      markers, lower sub-sampling can yield a clean (0-N) consensus.</li>
+</ul>
+<div class="note">
+<b>Switching modes adjusts defaults</b>
+Toggling Non-coding on/off automatically swaps the coverage list and consensus-frequency
+defaults between the Coding and Non-coding presets — but only if you have not manually
+changed them. Your custom values are preserved.
+</div>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h3 id="phase1">Phase 1 — Demultiplexing</h3>
+<p>Phase 1 assigns each read to a specimen.</p>
+<ol>
+  <li><b>Length filtering &amp; product classification.</b> The FASTQ is read in a single
+      streaming pass. Reads ≤ <i>Minimum length</i> are dropped. Remaining reads are
+      classified by length:
+      <ul>
+        <li><b>Single product</b> (length below the single-product window): one barcode.</li>
+        <li><b>Double product</b> (length within the double window): two ligated barcodes —
+            the read is split into two halves at the computed cut/overlap points, each
+            processed independently.</li>
+        <li>Reads outside both windows are counted as wrong-length and excluded.</li>
+      </ul></li>
+  <li><b>Tag mutant table.</b> A lookup table of all tag variants up to 2 edits
+      (substitution / insertion / deletion) is generated, with conflicting variants
+      removed, so that tags carrying sequencing errors still resolve to the correct
+      specimen.</li>
+  <li><b>Primer &amp; tag location.</b> For each read, every forward primer in the design is
+      aligned (IUPAC-aware, edlib, semi-global) within the primer-search window, on both
+      orientations (the reverse complement is computed on demand). The best-scoring
+      orientation fixes the read direction; the adjacent bases yield the forward tag. The
+      reverse primer is then located at the other end to extract the reverse tag and the
+      clean inter-primer region. When several primer pairs are present, the lowest total
+      distance wins, so each read is written exactly once.</li>
+  <li><b>Assignment.</b> The (forward tag, reverse tag) pair is mapped through the mutant
+      table to a specimen, and the cleaned read is appended to that specimen's read set.</li>
+</ol>
+<div class="tip">
+<b>Deterministic by design</b>
+All dictionary iterations and file lists are sorted, and each alignment subprocess runs in
+an isolated temporary directory. Results are therefore identical regardless of thread count
+or run order — conventional and real-time modes converge on the same barcodes.
+</div>
+
+<h3 id="phase2a">Phase 2a — Consensus by length</h3>
+<p>For each specimen and each coverage level in the <i>Coverage for phase 2a</i> list:</p>
+<ol>
+  <li>Reads within <i>Maximum read length deviation</i> of the target length are selected
+      and sub-sampled to the coverage level (sorted by closeness to the target length, with
+      deterministic tie-breaking).</li>
+  <li>The sub-sample is aligned (MAFFT / disttbfast) and a consensus is called at the
+      <i>Main consensus calling frequency</i>.</li>
+  <li><b>Validation.</b> Coding: the consensus must have the expected length, zero Ns, and
+      translate without internal stop codons in the chosen genetic code. Non-coding: expected
+      length and zero Ns.</li>
+  <li>If the main-frequency consensus fails, thresholds across the assess-range are swept;
+      if exactly one valid consensus emerges, it is accepted.</li>
+  <li>Specimens that remain unresolved advance to the next coverage level. In ascending
+      (Coding) mode the best result so far (fewest Ns) is kept.</li>
+</ol>
+
+<h3 id="phase2b">Phase 2b — Consensus by similarity <span class="pill coi">Coding only</span></h3>
+<p>Specimens not resolved by length are rescued by similarity: the provisional
+(predicted-error) barcode becomes a reference, reads within ~10% edit distance of it are
+collected, the closest <i>Coverage phase 2b</i> reads are retained, re-aligned and a new
+consensus is called and re-validated. An MSA check then classifies the rescued barcodes.</p>
+
+<h3 id="phase3">Phase 3 — Correction by barcode comparison <span class="pill coi">Coding only</span></h3>
+<p>Residual barcodes still carrying errors are compared against the set of validated
+barcodes. For each, the 20 closest references are aligned; positions are compared to the
+consensus to estimate and remove indel errors (<code>estgaps</code>). The number of fixed
+errors determines the output category (1–5, 6–10, 11–15, &gt;15 errors).</p>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="outputs">8. Results &amp; output files</h2>
+<p>By default, results are written to an <code>output/</code> folder next to the executable
+(you are prompted to confirm/choose the location). The key results live in
+<code>Main_barcode_results/</code>.</p>
+
+<figure class="">
+  <img src="images/panel-results.png" alt="Results panel">
+  <figcaption><b>Figure 6.</b> The Results panel: barcode counts by category and quick
+  access to output files and the Excel report.</figcaption>
+</figure>
+
+<div class="filetree">
+<div class="root dir">output/ont-barcoder_&lt;timestamp&gt;_conv/</div>
+<p class="suffix-note cm">Folder suffix: <b>_conv</b> conventional run &nbsp;·&nbsp;
+<b>_rt</b> real-time cycle &nbsp;·&nbsp; <b>_rt-final</b> real-time wrap-up</p>
+<table>
+  <tr><td class="dir">├── Main_barcode_results/</td><td></td></tr>
+  <tr><td class="ok">│&nbsp; &nbsp;├── QC_Compliant_barcodes_noamb_noerr.fa</td>
+      <td>0 Ns <b>and</b> 0 indels — best quality</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Filtered_barcodes_1percamb_upto5err.fa</td>
+      <td>≤1% ambiguities, ≤5 indels</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Allbarcodes.fa</td><td>every barcode produced</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Fixed_barcodes_1to5err.fa</td><td>1–5 indels fixed (phase 3)</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Fixed_barcodes_6to10err.fa</td><td>6–10 indels fixed (phase 3)</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Fixed_barcodes_11to15err.fa</td><td>11–15 indels fixed (phase 3)</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Fixed_barcodes_16to20err.fa</td><td>16–20 indels fixed (phase 3)</td></tr>
+  <tr><td>│&nbsp; &nbsp;├── Remaining.fa</td><td>unresolved specimens</td></tr>
+  <tr><td class="dir">│&nbsp; &nbsp;└── QC_Compliant/ Filtered/ 1to5errors/ …</td>
+      <td>per-category subfolders</td></tr>
+  <tr><td>├── secondary_variants.fa</td>
+      <td>minority haplotypes from mixed samples (if enabled, §6.1)</td></tr>
+  <tr><td>├── secondary_variants_recovered.fa</td>
+      <td>secondary variants recovered on a later pass</td></tr>
+  <tr><td>├── runsummary.xlsx</td><td>full report (see §8.1)</td></tr>
+  <tr><td class="dir">├── barcodesets/</td><td>intermediate consensus sets</td></tr>
+  <tr><td class="dir">├── 2a_ConsensusByLength.zip</td><td></td></tr>
+  <tr><td class="dir">├── 2b_ConsensusBySimilarity.zip</td><td></td></tr>
+  <tr><td class="dir">└── 3_ConsensusByBarcodeComparison.zip</td><td></td></tr>
+</table>
+</div>
+<div class="tip">
+<b>secondary_variants.fa</b>
+Only produced when <b>Detect intra-sample sequence variants</b> (§6.1) is enabled and at
+least one specimen is found to be mixed. Minority haplotypes are never silently discarded —
+they land here so they can be reviewed instead of contaminating the main barcode set.
+</div>
+
+<h4>Output categories explained</h4>
+<table>
+  <tr><th>File</th><th>Inclusion rule</th></tr>
+  <tr><td><code>QC_Compliant_barcodes_noamb_noerr.fa</code></td>
+      <td>Ambiguities = 0 <b>and</b> estimated indels = 0. Use this set for high-confidence
+          downstream analyses.</td></tr>
+  <tr><td><code>Filtered_barcodes_1percamb_upto5err.fa</code></td>
+      <td>Ambiguities ≤ 1% of barcode length <b>and</b> indels ≤ 5.</td></tr>
+  <tr><td><code>Fixed_barcodes_*err.fa</code></td>
+      <td>Barcodes whose indels were corrected in Phase 3, binned by number of fixes.</td></tr>
+  <tr><td><code>Allbarcodes.fa</code></td><td>Union of all barcodes produced.</td></tr>
+  <tr><td><code>Remaining.fa</code></td>
+      <td>Specimens for which no acceptable barcode could be built.</td></tr>
+</table>
+<p>FASTA headers encode metadata, e.g.
+<code>&gt;SPID01_all.fa;658;142;ambs=0;estgaps=0</code> →
+<i>specimen;length;coverage;ambiguities;estimated&nbsp;indels</i>.</p>
+
+<h3 id="excel">8.1 runsummary.xlsx</h3>
+<p>A multi-sheet Excel report is generated at the run root:</p>
+<table>
+  <tr><th>Sheet</th><th>Contents</th></tr>
+  <tr><td><b>1. Demultiplexing</b></td><td>Reads per specimen after demultiplexing.</td></tr>
+  <tr><td><b>2a Consensus by length</b></td>
+      <td>Per-specimen length, barcode and translation/length check from Phase 2a.</td></tr>
+  <tr><td><b>2b Consensus by similarity</b></td>
+      <td>Coverage, length, barcode and translation check from Phase 2b (Coding runs).</td></tr>
+  <tr><td><b>3.Final barcodes</b></td>
+      <td>Final per-specimen barcode, stage, type (e.g. "removed N indels"), length,
+          ambiguities and validation flag.</td></tr>
+  <tr><td><b>Sample QC status</b></td>
+      <td>One row per demultiplexed specimen: reads demultiplexed, whether a barcode was
+          produced, a color-coded status (green/amber/red), length, number of Ns and
+          number of indels. A quick per-sample health check across the whole run.</td></tr>
+  <tr><td><b>Intra-sample variants</b></td>
+      <td>Only present when <b>Detect intra-sample sequence variants</b> (§6.1) is
+          enabled and finds mixed samples. Per haplotype cluster: sample, read count,
+          fraction of the sample's reads, length, Ns, whether it translates cleanly
+          (coding markers), and its role (dominant / secondary), plus samples flagged
+          "needs review" or with more variants than the recovery cap.</td></tr>
+  <tr><td><b>Final results / RT Timeline</b></td>
+      <td>In real-time runs: summary and a timeline of recovered barcodes per cycle.</td></tr>
+</table>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="profiles">9. Parameter profiles</h2>
+<p>At the bottom of the Parameters panel you can persist your full configuration:</p>
+<ul>
+  <li><b>💾 Save profile</b> — write all parameters (including Non-coding state and phase
+      selection) to a <code>.json</code> file.</li>
+  <li><b>📂 Load profile</b> — restore parameters from a saved <code>.json</code>.</li>
+  <li><b>↺ Default values</b> — reset everything to the Coding defaults.</li>
+</ul>
+<p>Profiles are stored by default in the <code>_profiles/</code> folder. Sharing a profile
+file is the simplest way to reproduce a colleague's exact settings.</p>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="util-compare">10. Utility — FASTA Compare</h2>
+<p>Compares barcode FASTA files to assess concordance — e.g. between runs, pipelines, or
+against a curated reference.</p>
+
+<figure class="">
+  <img src="images/util-compare.png" alt="FASTA Compare utility">
+  <figcaption><b>Figure 7.</b> The FASTA Compare utility.</figcaption>
+</figure>
+<ul>
+  <li><b>All-vs-all:</b> load N files; every shared specimen ID is compared across all
+      pairs.</li>
+  <li><b>Versus a reference:</b> compare N files against one chosen reference file.</li>
+</ul>
+<p>For each specimen, sequences are aligned (edlib, global) and classified as:</p>
+<table>
+  <tr><th>State</th><th>Meaning</th></tr>
+  <tr><td><b>Identical</b></td><td>Character-for-character equal.</td></tr>
+  <tr><td><b>Compatible (IUPAC)</b></td>
+      <td>Equal once IUPAC ambiguity codes are treated as matches; the count of ambiguous
+          positions is reported.</td></tr>
+  <tr><td><b>Different</b></td><td>Incompatible; the edit distance is reported.</td></tr>
+  <tr><td><b>Only in reference</b></td>
+      <td>(Versus-a-reference mode.) The ID exists in the reference file but in none of
+          the compared files.</td></tr>
+  <tr><td><b>No reference</b></td>
+      <td>(Versus-a-reference mode.) The opposite case: the ID exists in a compared file
+          but is absent from the reference file itself.</td></tr>
+</table>
+<p>Reverse-complement matches are detected and flagged <code>[RC]</code>. Outputs include a
+colour-coded <code>summary.xlsx</code> plus per-category FASTA files
+(<code>identical.fa</code>, <code>compatible_iupac.fa</code>, <code>different.fa</code>,
+<code>only_in_reference.fa</code>, <code>without_reference.fa</code>,
+<code>best_barcodes.fa</code>). When sequences differ, the "best" barcode is chosen by
+fewest ambiguities → fewest gaps → highest coverage.</p>
+
+<h4>Specimen ID extraction</h4>
+<p>Compare needs a consistent specimen ID to match records across files; headers rarely
+agree on format, so the panel offers two ways to derive one:</p>
+<ul>
+  <li><b>Delimiter mode (default).</b> Choose an ID delimiter (<code>_</code>,
+      <code>|</code>, <code>;</code>, space, <code>.</code>, <code>-</code>, or a custom
+      one) and which occurrence to split before (1st … 5th) — this generalizes the old
+      "split at <code>_all.fa</code>" behavior. An <b>"any of these"</b> checkbox treats
+      the delimiter string as a set of individual characters rather than a literal
+      substring.</li>
+  <li><b>Advanced (Regex) mode.</b> Supply one or more regex patterns, tried in order
+      until one matches the header. Optional ID normalization can lowercase IDs, strip
+      leading zeros, or strip a further regex from the extracted ID — useful when the
+      same specimen is written <code>BEE001</code> in one file and <code>bee_001</code>
+      in another.</li>
+</ul>
+<div class="tip">
+<b>Comparing coding vs. non-coding barcode lengths</b>
+Compare aligns globally (edlib), so barcodes of very different lengths — e.g. a full-length
+non-coding CytB barcode (with its stop codon and 3′ tail) against a trimmed coding-region
+barcode — can score as "Different" purely on length. The standalone script
+<code>_utilities/orf_trim_fasta.py</code> (run from a command line:
+<code>python orf_trim_fasta.py input.fa output.fa --gencode N</code>) trims a non-coding
+FASTA down to its longest clean open reading frame, making it length-comparable before
+you load it into Compare.
+</div>
+
+<h2 id="util-tools">11. Utility — FASTA Tools</h2>
+<p>Batch operations on one or many FASTA files. Optionally <b>merge files before
+processing</b> to treat them as a single dataset, or process each file individually.</p>
+
+<figure class="">
+  <img src="images/util-tools.png" alt="FASTA Tools utility">
+  <figcaption><b>Figure 8.</b> The FASTA Tools utility.</figcaption>
+</figure>
+<table>
+  <tr><th>Operation</th><th>Description</th></tr>
+  <tr><td><b>Extract unique sequences</b></td><td>Collapse duplicate sequences to a single
+      representative.</td></tr>
+  <tr><td><b>Extract identical sequences (duplicates)</b></td>
+      <td>Output the sequences that occur more than once, plus a
+          <code>_duplicate_groups.xlsx</code> grouping IDs by shared sequence.</td></tr>
+  <tr><td><b>Extract by pattern (grep)</b></td><td>Keep sequences whose headers match a
+      pattern; the pattern can be typed directly, loaded from a file (one pattern per
+      line), and optionally treated as a regex.</td></tr>
+  <tr><td><b>Filter sequences by header fields</b></td>
+      <td>Split headers by a separator and add one or more field-based criteria (by
+          field index, using <code>=</code>, <code>!=</code>, <code>&gt;</code>,
+          <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>contains</code>
+          or <code>not contains</code>) to keep only matching records.</td></tr>
+  <tr><td><b>Append info to headers from .xlsx</b></td>
+      <td>Enrich headers with metadata from a spreadsheet (keyed by ID).</td></tr>
+  <tr><td><b>Reformat sequence lines</b></td><td>Rewrap sequence lines (e.g. single-line
+      vs. wrapped FASTA).</td></tr>
+  <tr><td><b>Sort sequences</b></td><td>Reorder records by a chosen field.</td></tr>
+</table>
+
+<h2 id="util-fastq">12. Utility — FASTQ Inspector</h2>
+<p>Drag a FASTQ file (<code>.fastq</code> or <code>.fastq.gz</code>) to get a full
+descriptive quality report. <b>All reads are analysed</b>; only the scatter plot uses a
+random sample of 10,000 points for responsiveness.</p>
+
+<figure class="">
+  <img src="images/util-fastq.png" alt="FASTQ Inspector utility">
+  <figcaption><b>Figure 9.</b> The FASTQ Inspector utility with its descriptive statistics
+  and histograms.</figcaption>
+</figure>
+<p>Reported metrics include: read count, total bases, mean / median / min / max length,
+N50, length distribution buckets (&lt;500, 500–2k, &gt;2k bp), mean quality and the
+fraction of reads at Q≥10/15/20, mean and standard deviation of GC%, and histograms for
+length, quality and GC. Large uncompressed files are processed in parallel across CPU
+cores; gzip files are streamed sequentially.</p>
+
+<h2 id="util-blast">13. Utility — BLAST</h2>
+<p>Submit barcode FASTA files to NCBI BLAST (remote URL API) for taxonomic identification.
+Sequences are merged, normalized and split into batches; each batch is submitted, polled
+and its hits written incrementally to a timestamped <code>.tsv</code> (and an
+<code>.xlsx</code>).</p>
+
+<figure class="">
+  <img src="images/util-blast.png" alt="BLAST utility">
+  <figcaption><b>Figure 10.</b> The BLAST utility: batch submission and taxonomy options.</figcaption>
+</figure>
+<ul>
+  <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> — recommended,
+      <code>blastn</code>, or <code>megablast</code>), target database (<code>core_nt</code>,
+      <code>nt</code>, <code>refseq_rna</code>, <code>16S_ribosomal_RNA</code>), number of
+      hits per sequence, sequences per batch, and whether to fetch full taxonomy
+      (Kingdom → Genus + organism).</li>
+  <li>Taxonomy and accession lookups are <b>cached</b> on disk (<code>taxadb.dbx</code>,
+      <code>accdb.dbx</code>) and reused across runs in sibling result folders, minimizing
+      repeated network calls.</li>
+  <li>If the output file is locked (e.g. open in Excel) the writer retries; if it cannot
+      create the file at all, the run aborts cleanly rather than wasting network queries.</li>
+</ul>
+<div class="note">
+<b>NCBI API key required</b>
+The panel requires a personal NCBI API key before it will submit queries (registered free
+at NCBI); it is saved automatically once entered so you only need to set it up once per
+machine.
+</div>
+<div class="warn">
+<b>Network &amp; usage policy</b>
+This tool sends your sequences to NCBI's public BLAST servers over the internet. Respect
+NCBI usage guidelines (batch sizes / submission rate) and be mindful of submitting
+unpublished or sensitive sequence data to a third-party service.
+</div>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="util-notes">14. Utility — Notes</h2>
+<p>A lightweight, file-based Markdown notebook built into the app — a place to keep
+run-specific observations, protocols or lab notes without leaving ONTbarcoder. Open it
+from the <b>NOTES 📝</b> item at the bottom of the sidebar.</p>
+
+<figure class="">
+  <img src="images/util-notes.png" alt="Notes utility">
+  <figcaption><b>Figure 11.</b> The Notes utility: note list on the left, Markdown editor
+  and preview on the right.</figcaption>
+</figure>
+
+<h4>Storage</h4>
+<p>Each note is a plain <code>.md</code> file stored in a <code>_notes/</code> folder next
+to the executable — created automatically the first time you open the panel. Because
+notes are ordinary text files:</p>
+<ul>
+  <li>A colleague can drop a <code>.md</code>/<code>.txt</code>/<code>.markdown</code> file
+      straight into <code>_notes/</code> and it appears in the list next time the panel is
+      opened — no import step required.</li>
+  <li>Notes may start with a <code>---</code> frontmatter block recording title, created/
+      updated timestamps and tags.</li>
+  <li>Inserted images are copied into <code>_notes/_assets/</code> so they travel with the
+      note if you copy the folder elsewhere.</li>
+</ul>
+
+<h4>Editing</h4>
+<table>
+  <tr><th>Feature</th><th>Description</th></tr>
+  <tr><td>Formatting toolbar</td>
+      <td>Bold / italic / underline / strikethrough, a heading-level selector
+          (Normal/H1/H2/H3), bulleted and numbered lists, and an "＋ Insert" menu for
+          links, images, inline code, code blocks, blockquotes, checklist items,
+          horizontal rules and tables.</td></tr>
+  <tr><td>Live syntax highlighting</td><td>Markdown is colour-highlighted as you type.</td></tr>
+  <tr><td>Smart list continuation</td>
+      <td>Pressing Enter inside a list, checklist or blockquote continues the same
+          marker on the next line.</td></tr>
+  <tr><td>Find &amp; replace</td><td><kbd>Ctrl+F</kbd> opens a Find/Replace/Replace-All bar.</td></tr>
+  <tr><td>Preview toggle</td>
+      <td>The <b>👁</b> button switches between the raw Markdown source and a rendered,
+          read-only preview.</td></tr>
+</table>
+
+<h4>Managing notes</h4>
+<ul>
+  <li><b>+ New</b> creates a timestamp-named note; once you give it a title and save,
+      the file is renamed to a slug of that title (only for still-untitled notes, so
+      imported/shared notes keep their original filename).</li>
+  <li><b>Delete</b> removes the selected note. <b>Import…</b> / <b>Export…</b> copy note
+      files in or out of <code>_notes/</code> for sharing between computers.</li>
+  <li><b>Open <code>_notes</code> folder 📂</b> opens the storage folder directly in the
+      file explorer.</li>
+  <li>Saving is manual (a <b>Save</b> button); the status label shows
+      <i>"● Unsaved changes"</i> or <i>"Saved · updated …"</i>.</li>
+  <li>Use the search box above the note list to filter by title, tag or content.</li>
+</ul>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="performance">15. Performance &amp; threads</h2>
+<p>The heavy work is many short alignment subprocesses (<code>disttbfast.exe</code>, each
+forced to a single internal thread). Optimal concurrency therefore tracks the number of
+<b>physical</b> cores, not logical (hyperthreaded) processors.</p>
+<ul>
+  <li>The default thread count equals the detected physical core count, and the analysis is
+      internally capped there.</li>
+  <li>Setting more threads than physical cores oversubscribes the CPU and runs <i>slower</i>
+      (e.g. 20 workers on 16 physical / 24 logical cores is worse than 12).</li>
+  <li>Each alignment runs in an isolated temporary directory on the system TEMP drive, which
+      keeps results deterministic and avoids disk contention.</li>
+</ul>
+
+<h2 id="troubleshoot">16. Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
+  <tr><td>App fails to write output / profiles</td>
+      <td>The program is in a read-only location. Move it to a writable folder (Desktop,
+          Documents). See <a href="#install">§2.1</a>.</td></tr>
+  <tr><td>Consensus phases produce nothing / errors about disttbfast</td>
+      <td>The <code>_mafftfiles/</code> folder is missing or not next to the executable.
+          Restore the original folder layout.</td></tr>
+  <tr><td>"Output file locked" during BLAST</td>
+      <td>The result <code>.tsv</code>/<code>.xlsx</code> is open in Excel. Close it; the
+          writer resumes automatically.</td></tr>
+  <tr><td>Few reads pass demultiplexing</td>
+      <td>Check tag length consistency, primer sequences, and the <i>Minimum length</i> /
+          length-window settings against your amplicon. Increase <i>Primer/Tag mismatches
+          allowed</i> if your data are noisier.</td></tr>
+  <tr><td>Many specimens in <code>Remaining.fa</code></td>
+      <td>Coverage may be insufficient — add lower coverage levels to the Phase 2a list, or
+          (Non-coding) use the descending preset. Verify you selected the correct genetic
+          code for your marker.</td></tr>
+  <tr><td>"Incomplete genetic codes" dialog blocks Start analysis</td>
+      <td>The demultiplexing CSV has a trailing genetic-code column for some rows but not
+          all. Add a code (0–33) to every row, or remove the column entirely to use the
+          global <i>Genetic code</i> from Parameters → General. See <a href="#inputs">§4.2</a>.</td></tr>
+  <tr><td>"Dorado requires an NVIDIA GPU with CUDA. Analysis aborted."</td>
+      <td>No CUDA-capable GPU was detected. Basecall with MinKNOW (or a separate Dorado
+          install) instead and use the <b>MinKNOW performing basecalling</b> option. See
+          <a href="#modes">§5.2</a>.</td></tr>
+  <tr><td>Specimens land in <code>secondary_variants.fa</code> unexpectedly</td>
+      <td>Enable/disable or tune <b>Detect intra-sample sequence variants</b> (§6.1) — a
+          low <i>Min. secondary variant fraction</i> or high <i>Variant tolerance</i> makes
+          the detector more sensitive to minor haplotypes/noise. Check the <b>Intra-sample
+          variants</b> sheet in <code>runsummary.xlsx</code> for the per-sample breakdown.</td></tr>
+  <tr><td>Application crashes</td>
+      <td>A crash log is written to <code>ONTbarcoder_crash.log</code> in your home folder
+          (<code>%USERPROFILE%</code>). Include it when reporting issues.</td></tr>
+</table>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="credits">17. Credits &amp; citation</h2>
+<p><b>Original software:</b> Amrita Srivathsan, V. Feng, D. Suárez, B. Emerson &amp;
+R. Meier.</p>
+<p><b>Version 3 development:</b> Eduardo Tovar Luque · Instituto Humboldt (2026).</p>
+<p>If you use ONTbarcoder, please cite:</p>
+<blockquote>
+Srivathsan <i>et al.</i> (2024). ONTbarcoder 2.0: rapid species discovery and
+identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
+<i>Cladistics</i>, 40: 192–203.
+<a href="https://doi.org/10.1111/cla.12566">https://doi.org/10.1111/cla.12566</a>
+</blockquote>
+<p>Project repository:
+<a href="https://github.com/asrivathsan/ONTbarcoder">github.com/asrivathsan/ONTbarcoder</a></p>
+
+</main>
+
+<footer>
+ONTbarcoder 3.1b — User Manual · Generated for the research community ·
+Defaults shown are tuned for the 658&nbsp;bp COI barcode.
+</footer>
+
+</body>
+</html>

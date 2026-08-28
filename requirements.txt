@@ -1,0 +1,11 @@
+# ONTbarcoder v3 — runtime dependencies (Python 3.11+; tested on 3.13)
+PyQt5>=5.15
+biopython>=1.81
+edlib>=1.3.9
+XlsxWriter>=3.1
+openpyxl>=3.1        # optional: XLSX export in the BLAST / FASTA Tools panels
+
+# External (not pip):
+#   - MAFFT disttbfast is bundled in _mafftfiles/ (Windows binary committed;
+#     Linux binary shipped in the release tarball).
+#   - Dorado + POD5 tooling must be installed separately for real-time mode.

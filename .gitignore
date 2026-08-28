@@ -1,0 +1,32 @@
+# ─── Build / packaging artifacts ──────────────────────────────────────────────
+build/
+dist/
+*.spec
+*.manifest
+
+# ─── PyInstaller / Python bytecode ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# ─── Runtime / user data ─────────────────────────────────────────────────────
+output/
+_profiles/*.json
+!_profiles/blast_config.example.json
+
+# ─── Local reference copy of the upstream original (kept for diffing only) ────
+original/
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
