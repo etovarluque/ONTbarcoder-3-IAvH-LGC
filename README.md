@@ -53,19 +53,6 @@ guide/                   User manual (HTML) + screenshots
 icon.ico                 Application icon
 ```
 
-Not tracked (see `.gitignore`): `build/`, `dist/`, `output/`, `*.spec`,
-`original/` (local copy of the upstream 2.0 source, kept for diffing).
-
-## Building the executable
-
-Packaging uses PyInstaller with a local `ONTbarcoder3.spec` (one-folder,
-windowed). The spec is not committed; regenerate or restore it, then:
-
-```bash
-pyinstaller ONTbarcoder3.spec
-```
-
-The build copies `_mafftfiles/` and `icon.ico` next to the produced executable.
 
 ## Credits
 
