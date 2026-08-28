@@ -72,3 +72,8 @@ The build copies `_mafftfiles/` and `icon.ico` next to the produced executable.
 - **Original software:** Amrita Srivathsan, V. Feng, D. Suárez, B. Emerson &
   R. Meier — *ONTbarcoder 2.0*.
 - **Version 3 development:** Eduardo Tovar Luque — Instituto Humboldt, 2026.
+
+## License
+
+Licensed under the **GNU General Public License v3.0** — see [`LICENSE`](LICENSE).
+As a derivative of ONTbarcoder 2.0, this fork keeps the upstream copyleft terms.
