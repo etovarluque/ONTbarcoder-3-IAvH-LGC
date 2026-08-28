@@ -13,6 +13,13 @@ Compare, FASTA Tools, FASTQ Inspector, Notes) plus a non-coding marker mode.
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of differences from the
 original.
 
+## Screenshots
+
+| Conventional mode | Real-time mode |
+| :---: | :---: |
+| ![Conventional mode](guide/images/mode-conventional.png) | ![Real-time mode](guide/images/mode-realtime.png) |
+| Single completed FASTQ file | FASTQ files generated live during sequencing |
+
 ## Releases (ready-to-run executables)
 
 Prebuilt bundles are published on the **[Releases](../../releases)** page — no
@@ -20,7 +27,7 @@ Python install needed:
 
 | Platform | Asset                        |
 | -------- | ---------------------------- |
-| Windows  | `ONTbarcoder3.zip`           |
+| Windows  | `ONTbarcoder3_win.zip`       |
 | Linux    | `ONTbarcoder3_linux.tar.gz`  |
 
 Unpack and run the `ONTbarcoder3` executable.
