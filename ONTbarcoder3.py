@@ -1500,7 +1500,7 @@ class SetupPanel(QtWidgets.QWidget):
         fh_layout.addWidget(pipe_row)
         outer.addWidget(fixed_header)
 
-        # ── Zona scrollable: contenido dinámico ─────────────────────────
+        # ── Scrollable area: dynamic content ─────────────────────────
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -2823,10 +2823,10 @@ class ParamsPanel(BasePanel):
                 _rw.blockSignals(False)
             self._sync_resolve_controls()
 
-            # Disparar manualmente para refrescar estados de fases y código genético
+            # Trigger manually to refresh phase states and genetic code
             self._on_non_coi_changed(2 if profile.get("non_coi", d["non_coi"]) else 0)
 
-            # Restaurar fases (solo si no-Coding no las bloquea)
+            # Restore phases (only if non-Coding doesn't lock them)
             non_coi = profile.get("non_coi", d["non_coi"])
             for key in ("phase1", "phase2a"):
                 self._step_checks[key].setChecked(
@@ -3140,8 +3140,8 @@ class ParamsPanel(BasePanel):
 
         non_coi = getattr(self, 'p_non_coi', None) and self.p_non_coi.isChecked()
 
-        # Fracción mínima del contaminante (única perilla de la resolución de
-        # mezcla). El umbral de polimorfismo por columna se deriva de ella abajo.
+        # Minimum contaminant fraction (the sole knob for mixture resolution).
+        # The per-column polymorphism threshold is derived from it below.
         _resolve_secfrac = ((self.p_resolve_secfrac.value() / 100.0)
                             if getattr(self, 'p_resolve_secfrac', None) else 0.2)
         _resolve_tol = ((self.p_resolve_tol.value() / 100.0)
@@ -3172,13 +3172,13 @@ class ParamsPanel(BasePanel):
             "minq": (self.p_minq.value()
                      if getattr(self, 'p_minq', None) is not None else 0),
             "non_coi": bool(non_coi),
-            # Resolución de mezcla/contaminación por haplotipo dominante.
-            # Marca-agnóstica (Coding y no-Coding). On por defecto.
-            # Una sola perilla: la fracción mínima del contaminante. El umbral de
-            # polimorfismo por columna (minor_thresh) se DERIVA de ella y nunca se
-            # fija por encima, de modo que una mezcla de ese tamaño siempre puede
-            # detectarse (sin la "trampa del piso oculto"). Con el valor por defecto
-            # (20%) el comportamiento es idéntico al anterior (minor_thresh = 0.2).
+            # Mixture/contamination resolution by dominant haplotype.
+            # Marker-agnostic (Coding and non-Coding). On by default.
+            # A single knob: the minimum contaminant fraction. The per-column
+            # polymorphism threshold (minor_thresh) is DERIVED from it and is
+            # never set above it, so a mixture of that size can always be
+            # detected (avoiding the "hidden floor trap"). With the default
+            # value (20%) the behavior is identical to before (minor_thresh = 0.2).
             "resolve_mixed": {
                 "enabled": bool(getattr(self, 'p_resolve', None)
                                 and self.p_resolve.isChecked()),
@@ -3472,7 +3472,7 @@ class ProgressPanel(QtWidgets.QWidget):
         self.stat_dem   = StatCard("Assigned reads", "—", color=BLUE)
         self.stat_ok    = StatCard("QC barcodes", "—", color=GREEN)
 
-        # ── Cycle counter card (nuevo) ──
+        # ── Cycle counter card (new) ──
         self._cycle_card = QtWidgets.QFrame()
         self._cycle_card.setObjectName("stat_card")
         _cc_layout = QtWidgets.QVBoxLayout(self._cycle_card)
@@ -4812,20 +4812,20 @@ class SampleBarChartWindow(QtWidgets.QDialog):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _phase_callback(method):
-    """Decorador para los callbacks de fin de fase del pipeline (QThread → señal).
+    """Decorator for the pipeline's phase-end callbacks (QThread -> signal).
 
-    Estos callbacks hacen I/O y parsing pesado sin protección. Si uno lanza una
-    excepción no capturada en modo RT (tiempo real), se propagaba al event-loop de
-    Qt y NADIE reseteaba ``_live_consensus_running`` → todos los ciclos RT futuros
-    quedaban congelados en silencio (``_live_maybe_run_consensus`` retornaba temprano
-    para siempre) mientras la UI seguía aparentando estar activa.
+    These callbacks do heavy I/O and parsing without protection. If one raised
+    an uncaught exception in RT (real-time) mode, it propagated to the Qt
+    event loop and NOBODY reset ``_live_consensus_running`` -> all future RT
+    cycles froze silently (``_live_maybe_run_consensus`` returned early
+    forever) while the UI kept looking active.
 
-    Este wrapper captura cualquier fallo del callback y:
-      • RT (no finalizando): libera el guard del ciclo para que el SIGUIENTE ciclo
-        pueda ejecutarse, registra el error y deja el sondeo de FASTQs vivo.
-      • Convencional: marca el análisis como inactivo para que la UI no parezca
-        colgada, y registra el error.
-    El guard interno de cada callback (``if self._stopped: return``) se conserva.
+    This wrapper catches any callback failure and:
+      • RT (not finalizing): releases the cycle guard so the NEXT cycle can
+        run, logs the error, and keeps FASTQ polling alive.
+      • Conventional: marks the analysis as inactive so the UI doesn't look
+        stuck, and logs the error.
+    Each callback's internal guard (``if self._stopped: return``) is preserved.
     """
     @functools.wraps(method)
     def _wrapper(self, *args, **kwargs):
@@ -4834,14 +4834,14 @@ def _phase_callback(method):
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
-            print(f"[ONTbarcoder] {method.__name__} falló:\n{tb}", file=sys.stderr)
+            print(f"[ONTbarcoder] {method.__name__} failed:\n{tb}", file=sys.stderr)
             try:
                 self._panel_progress.append_log(
                     f"  ✗ Error in {method.__name__}: {exc}", "error")
             except Exception:
                 pass
-            # Liberar el guard del ciclo (inocuo en modo convencional, donde nunca
-            # se activa) para no congelar los ciclos RT posteriores.
+            # Release the cycle guard (harmless in conventional mode, where it's
+            # never activated) so later RT cycles don't freeze.
             self._live_consensus_running = False
             try:
                 if self._is_live() and not getattr(self, "_live_finalizing", False):
@@ -5238,10 +5238,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stopped = False
         self._analysis_active = True
         self._run_start = time.time()
-        # Limita la concurrencia a los núcleos físicos (evita la caída de
-        # rendimiento por sobre-suscripción). Se reescribe en params para que
-        # tanto el demultiplexado (Pool de procesos) como las fases de consenso
-        # (ThreadPool) usen el mismo valor efectivo.
+        # Limit concurrency to the physical cores (avoids the performance drop
+        # from over-subscription). Rewritten into params so both demultiplexing
+        # (process Pool) and the consensus phases (ThreadPool) use the same
+        # effective value.
         n_threads = _ont_mp.optimal_worker_count(params.get('n_threads', 4))
         params['n_threads'] = n_threads
         _ont_mp.set_threads(n_threads)
@@ -5532,7 +5532,7 @@ class MainWindow(QtWidgets.QMainWindow):
         logfile.write(f"  Tag mismatches allowed: {params.get('tagmm', '?')}\n")
         logfile.write(f"  Coverages phase 2a: {params.get('coveragelist', '?')}\n")
         logfile.write(f"  Main consensus calling frequency: {params.get('consfreqfixed', '?')}\n")
-        logfile.write(f"  Range of frequencies to assess (min, max): {params.get('consfreqmin', '?')} – {params.get('consfreqmax', '?')} (paso {params.get('consfreqstep', '?')})\n")
+        logfile.write(f"  Range of frequencies to assess (min, max): {params.get('consfreqmin', '?')} – {params.get('consfreqmax', '?')} (step {params.get('consfreqstep', '?')})\n")
         logfile.write(f"  Threads: {params.get('n_threads', '?')}\n")
         fases = [f"Phase {k.replace('run_','').upper()}" for k, v in params.items() if k.startswith('run_') and v]
         logfile.write(f"  Active phases: {', '.join(fases)}\n")
@@ -5795,9 +5795,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         CRITICAL — prepdemultiplex support:
         prepdemultiplex reads the accumulated with zip_longest(*[infile]*4), which
-        consumes exactly 4 lines per iteration. Any empty line
-        extra between files shifts the offset and corrupts all reads
-        posteriores (line2 pasa a ser '+' en vez de la secuencia, etc.).
+        consumes exactly 4 lines per iteration. Any extra empty line
+        between files shifts the offset and corrupts all subsequent
+        reads (line2 becomes '+' instead of the sequence, etc.).
 
         Therefore, before writing each file to the accumulated:
         1. ALL trailing empty lines are removed (byte rstrip).
@@ -6286,8 +6286,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # In RT mode self.totalseqs is managed by _live_concatenate_fastqs
             # via _live_total_reads. We don't overwrite it here to
             # not break the comparison with _live_last_total_reads that uses the
-            # exclusive RT counter. We only update the display with the value
-            # actual pipeline (nseqspasslen) as secondary information.
+            # exclusive RT counter. We only update the display with the
+            # pipeline's current value (nseqspasslen) as secondary information.
             pass
         else:
             self.totalseqs = self.worker_prep.totalseqs
@@ -7479,8 +7479,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ── Same as original (try/except IOError in fixbarcodessetup):
         # if musclepgoodset is empty (phase 2b did not run or did not produce file),
-        # only musclergoodset barcodes are written, identical to the block
-        # except IOError del original.
+        # only musclergoodset barcodes are written, identical to the original's
+        # except IOError block.
         with open(os.path.join(outpath, "barcodesets",
                                "Final_predgood_combined_barcodes.fa"), "w") as outfile, \
              open(os.path.join(outpath, "barcodesets",
@@ -7668,10 +7668,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return "1" if len(t) == int(len(s) / 3) else "0"
 
         def orf_trim(seq, gencode):
-            """ORF en marco más largo sin paro interno. Si ya traduce limpio se
-            devuelve intacto (COI); si hay un paro interno + cola 3' no codificante
-            (amplicón que abarca el codón de terminación del gen, p. ej. CytB) se
-            recorta el paro y el 3'. Devuelve (seq_recortada, n_aa)."""
+            """Longest-frame ORF with no internal stop. If it already translates
+            cleanly it is returned intact (COI); if there is an internal stop +
+            non-coding 3' tail (amplicon spanning the gene's stop codon, e.g.
+            CytB) the stop and the 3' tail are trimmed. Returns (trimmed_seq, n_aa)."""
             s = seq.replace("-", "")
             if not s:
                 return "", 0
@@ -7732,9 +7732,9 @@ class MainWindow(QtWidgets.QMainWindow):
                             else:
                                 newseq += j
                     newseq = newseq.upper()
-                    # Recorta el ORF limpio (quita el codón de paro del gen + cola
-                    # 3'); acepta si cubre ≥95% de la reconstrucción. El barcode
-                    # corregido se escribe ya recortado (sin paro → válido BOLD).
+                    # Trim the clean ORF (removes the gene's stop codon + 3' tail);
+                    # accepted if it covers ≥95% of the reconstruction. The corrected
+                    # barcode is written already trimmed (no stop -> valid for BOLD).
                     _orf_bp = newseq.replace("-", "").replace("?", "")
                     _orf, _aalen = orf_trim(_orf_bp, gencode)
                     if _orf_bp and _aalen * 3 >= len(_orf_bp) * 0.95:
@@ -8047,7 +8047,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Data for JS inline graphs (if there is a timeline) ─────────────────
         # Force point (0,0) at the beginning of the graphs
         if timeline and len(timeline) > 0:
-            # Crear una copia del timeline con un punto inicial en (0,0)
+            # Create a copy of the timeline with an initial point at (0,0)
             extended_timeline = [{"min": 0, "total": 0, "dem": 0, "ok": 0, "ts": "Start", "cycle": 0}]
             extended_timeline.extend(timeline)
         else:
@@ -8311,7 +8311,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<tr><td>Primer mismatches allowed</td><td>{p.get('primermismatch','?')}</td></tr>"
                 f"<tr><td>Tag mismatches allowed</td><td>{p.get('tagmm','?')}</td></tr>"
                 f"<tr><td>Phase 2a coverages</td><td>{p.get('coveragelist','?')}</td></tr>"
-                f"<tr><td>Main consensus calling frequency</td><td>{p.get('consfreqfixed','?')} (rango {p.get('consfreqmin','?')}–{p.get('consfreqmax','?')})</td></tr>"
+                f"<tr><td>Main consensus calling frequency</td><td>{p.get('consfreqfixed','?')} (range {p.get('consfreqmin','?')}–{p.get('consfreqmax','?')})</td></tr>"
                 f"<tr><td>Threads</td><td>{p.get('n_threads','?')}</td></tr>"
                 f"<tr><td>Active phases</td><td>{', '.join(fases)}</td></tr>"
             )
@@ -8944,7 +8944,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not _rm.get("recover_secondaries", True):
                 return
             gencode = params.get("gencode", 5)
-            is_coi = (gencode != 0)   # no-Coding (gencode 0): aceptación por 0 Ns
+            is_coi = (gencode != 0)   # non-Coding (gencode 0): accepted by 0 Ns
             maxn = int(_rm.get("max_variant_Ns", 5))
             maxvar = int(_rm.get("max_variants", 3))
             # Honour the user's "Minimum read coverage": a secondary cluster
@@ -8958,9 +8958,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # Eligible secondaries: < maxn Ns, ≥ mincov reads, the maxvar most
             # abundant per sample.
             candidates = []  # (varname, seq)
-            cov_map = {}      # varname -> size (nº reads = cobertura del cluster)
-            frac_map = {}     # varname -> frac (proporción del cluster, 0..1)
-            div_map = {}      # varname -> divergencia vs dominante (0..1)
+            cov_map = {}      # varname -> size (number of reads = cluster coverage)
+            frac_map = {}     # varname -> frac (cluster proportion, 0..1)
+            div_map = {}      # varname -> divergence vs. dominant (0..1)
             for k, v in getattr(self, "mixinfo_all", {}).items():
                 if k not in getattr(self, "con200barcodes", {}):
                     continue
@@ -9090,9 +9090,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return len(t) == int(len(s) / 3)
 
             def _orf_trim(seq):
-                """ORF en marco más largo sin paro interno; recorta el codón de paro
-                del gen + cola 3' si los hay (CytB), intacto si ya traduce (COI).
-                Devuelve (seq_recortada, n_aa)."""
+                """Longest-frame ORF with no internal stop; trims the gene's stop
+                codon + 3' tail if present (CytB), intact if it already translates
+                (COI). Returns (trimmed_seq, n_aa)."""
                 s = seq.replace("-", "")
                 if not s:
                     return "", 0
@@ -9145,14 +9145,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                 newseq += j
                     newseq = newseq.upper()
                     if newseq:
-                        # En marcador codificante, recortar al ORF limpio (quita el
-                        # codón de paro del gen + cola 3'); si cubre ≥95% se usa el
-                        # ORF recortado (sin paro → válido BOLD).
+                        # For a coding marker, trim to the clean ORF (removes the
+                        # gene's stop codon + 3' tail); if it covers ≥95% the
+                        # trimmed ORF is used (no stop -> valid for BOLD).
                         if is_coi:
                             _orf, _aalen = _orf_trim(newseq)
                             if _aalen * 3 >= len(newseq.replace("-", "")) * 0.95:
                                 newseq = _orf
-                        # En no-Coding no hay traducción (gencode 0): translates=None.
+                        # For non-Coding there is no translation (gencode 0): translates=None.
                         _tr = _translates(newseq) if is_coi else None
                         recovered.append((qname, newseq, _tr, errcount))
                 except Exception:
@@ -9170,14 +9170,14 @@ class MainWindow(QtWidgets.QMainWindow):
             n_ok = 0
             with open(out_fa, "w") as of:
                 for vname, seq, tr, gaps in sorted(recovered):
-                    # no-Coding: translates=NA; "válido" = 0 Ns (sin criterio de marco).
+                    # non-Coding: translates=NA; "valid" = 0 Ns (no frame criterion).
                     tr_tag = ("yes" if tr is True
                               else "no" if tr is False else "NA")
-                    # Cobertura con la que se obtuvo el consenso = nº de reads del
-                    # cluster secundario (análogo a con200cov en consensus_no_errors.fa).
+                    # Coverage the consensus was obtained with = number of reads in
+                    # the secondary cluster (analogous to con200cov in consensus_no_errors.fa).
                     _size = cov_map.get(vname)
                     cov_val = _size if _size is not None else "NA"
-                    # Fracción que representa el cluster (igual que secondary_variants.fa).
+                    # Fraction the cluster represents (same as secondary_variants.fa).
                     _frac = frac_map.get(vname)
                     frac_tag = (f"{float(_frac) * 100:.0f}%"
                                 if _frac is not None else "NA")
@@ -9237,7 +9237,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{delta_str} ({self.ndemultiplexed:,} demultiplexed reads){note}", "ok"
             )
             self._live_prev_best = n_good
-            # Registrar valor real en gráfica (sin floor)
+            # Record the actual value in the chart (no floor)
             self._panel_live_chart.record(
                 self.ndemultiplexed,
                 n_good,
@@ -9269,10 +9269,10 @@ class MainWindow(QtWidgets.QMainWindow):
             except OSError:
                 pass
 
-        # Borra los directorios temporales por-hilo de los workers MAFFT (uno por
-        # hilo × fase). Todas las fases han terminado aquí, así que ningún worker
-        # los está usando. Evita la acumulación en el temp del sistema entre runs
-        # de la misma sesión (atexit es solo la red de seguridad al cerrar la app).
+        # Delete the per-thread temp directories from the MAFFT workers (one per
+        # thread × phase). All phases have finished by this point, so no worker
+        # is using them. Prevents buildup in the system temp folder across runs
+        # of the same session (atexit is only the safety net when the app closes).
         _ont_mp.cleanup_worker_tmpdirs()
 
         elapsed = time.time() - self._run_start
@@ -9366,7 +9366,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.wb.close()
             except Exception as e_close:
-                self._panel_progress.append_log(f"Warning al cerrar Excel: {e_close}", "warn")
+                self._panel_progress.append_log(f"Warning closing Excel: {e_close}", "warn")
 
         n_final_val = getattr(self, 'nfinal', n_good_2a)
         n_qc_val = getattr(self, 'nperfectbarcodes', 0) if getattr(self, 'nperfectbarcodes', None) is not None else n_good_2a
@@ -9545,7 +9545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Concatenate ALL the FASTQs in the folder to the accumulated one.
         # We do NOT use (current -_live_known_fastqs) because _live_known_fastqs can
         # have marked files that arrived during the confirmation dialog
-        # sin que fueran concatenados (poll pausado por _live_finalizing=True).
+        # without being concatenated (polling paused by _live_finalizing=True).
         # Instead, we rebuild the entire rollup from scratch to
         # ensure that no files are lost.
         try:
@@ -9987,7 +9987,7 @@ class MainWindow(QtWidgets.QMainWindow):
         logfile.write(f"  Tag mismatches allowed: {params.get('tagmm', '?')}\n")
         logfile.write(f"  Coverages phase 2a: {params.get('coveragelist', '?')}\n")
         logfile.write(f"  Main consensus calling frequency: {params.get('consfreqfixed', '?')}\n")
-        logfile.write(f"  Range of frequencies to assess (min, max): {params.get('consfreqmin', '?')} – {params.get('consfreqmax', '?')} (paso {params.get('consfreqstep', '?')})\n")
+        logfile.write(f"  Range of frequencies to assess (min, max): {params.get('consfreqmin', '?')} – {params.get('consfreqmax', '?')} (step {params.get('consfreqstep', '?')})\n")
         logfile.write(f"  Threads: {params.get('n_threads', '?')}\n")
         _fases = [k.replace('run_','').upper() for k, v in params.items() if k.startswith('run_') and v]
         logfile.write(f"  Active phases: {', '.join(_fases)}\n")
@@ -10143,9 +10143,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        # Workers MAFFT detenidos: borra sus directorios temporales por-hilo
-        # (best-effort; rmtree ignora los que un disttbfast aún en marcha pueda
-        # retener en Windows — atexit los recogerá al cerrar la app).
+        # MAFFT workers stopped: delete their per-thread temp directories
+        # (best-effort; rmtree ignores any that a still-running disttbfast may
+        # be holding on Windows — atexit will collect them when the app closes).
         try:
             _ont_mp.cleanup_worker_tmpdirs()
         except Exception:
@@ -10252,8 +10252,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             self.pool = None
 
-        # Workers MAFFT detenidos: borra sus directorios temporales por-hilo
-        # (best-effort; atexit recoge lo que un disttbfast aún en marcha retenga).
+        # MAFFT workers stopped: delete their per-thread temp directories
+        # (best-effort; atexit collects whatever a still-running disttbfast holds).
         try:
             _ont_mp.cleanup_worker_tmpdirs()
         except Exception:

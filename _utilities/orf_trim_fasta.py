@@ -1,34 +1,35 @@
 #!/usr/bin/env python3
 """
-orf_trim_fasta.py — Recorta los barcodes de un FASTA a su ORF codificante,
-eliminando el codón de paro del gen y la cola 3' no codificante (misma lógica
-que las fases 2a/2b/3 de ONTbarcoder). Sirve para llevar un archivo non-Coding
-(barcodes de longitud completa, p. ej. CytB 1062 pb con stop) a la misma región
-codificante que produce el modo marcador-codificante (p. ej. 1032 pb), de modo
-que ambos archivos sean comparables en el panel Compare (que usa alineamiento
-global NW y, por tanto, penaliza diferencias de longitud).
+orf_trim_fasta.py — Trims the barcodes in a FASTA file down to their coding ORF,
+removing the gene's stop codon and the non-coding 3' tail (same logic as
+ONTbarcoder's phases 2a/2b/3). Useful for bringing a non-Coding file
+(full-length barcodes, e.g. CytB 1062 bp with stop) down to the same coding
+region produced by coding-marker mode (e.g. 1032 bp), so that both files are
+comparable in the Compare panel (which uses global NW alignment and therefore
+penalizes length differences).
 
-Uso:
-    python orf_trim_fasta.py entrada.fa salida.fa --gencode 2
-    python orf_trim_fasta.py entrada.fa salida.fa --gencode 2 --min-coverage 0.95
+Usage:
+    python orf_trim_fasta.py input.fa output.fa --gencode 2
+    python orf_trim_fasta.py input.fa output.fa --gencode 2 --min-coverage 0.95
 
-- Si una secuencia ya traduce sin paro interno (p. ej. COI Folmer) se deja intacta.
-- Si tras recortar el ORF cubre < min-coverage del original, la secuencia se
-  escribe SIN recortar y se marca en el log (posible NUMT/pseudogén o longitud
-  inesperada): así nunca se pierde información de forma silenciosa.
-- El campo de longitud del encabezado (>id;LEN;...) se actualiza al nuevo valor.
+- If a sequence already translates with no internal stop (e.g. Folmer COI) it is
+  left untouched.
+- If after trimming the ORF covers < min-coverage of the original, the sequence
+  is written UNTRIMMED and flagged in the log (possible NUMT/pseudogene or
+  unexpected length): information is never silently lost.
+- The length field in the header (>id;LEN;...) is updated to the new value.
 """
 import sys
 import argparse
 import warnings
-warnings.simplefilter("ignore")  # silencia el aviso "Partial codon" de Biopython
+warnings.simplefilter("ignore")  # silence Biopython's "Partial codon" warning
 from Bio.Seq import Seq
 
 
 def orf_trim(seq, gencode):
-    """Devuelve (seq_recortada, n_aa). ORF en marco más largo sin paro interno;
-    si ya traduce limpio se devuelve intacto; si hay paro interno + cola se recorta
-    el paro y todo lo 3' de él."""
+    """Returns (trimmed_seq, n_aa). Longest in-frame ORF with no internal stop;
+    if it already translates cleanly it is returned unchanged; if there is an
+    internal stop plus a tail, the stop and everything 3' of it are trimmed."""
     s = seq.replace("-", "").upper()
     if not s:
         return "", 0
@@ -64,8 +65,8 @@ def read_fasta(path):
 
 
 def update_len_field(hdr, newlen):
-    """Actualiza el 2º campo (longitud) de un encabezado estilo ONTbarcoder
-    '>id;LEN;cov;...'. Si no tiene ese formato, deja el encabezado igual."""
+    """Updates the 2nd field (length) of an ONTbarcoder-style header
+    '>id;LEN;cov;...'. If the header doesn't match that format, it is left as-is."""
     parts = hdr.split(";")
     if len(parts) > 1 and parts[1].strip().isdigit():
         parts[1] = str(newlen)
@@ -74,13 +75,13 @@ def update_len_field(hdr, newlen):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Recorta barcodes al ORF codificante.")
+    ap = argparse.ArgumentParser(description="Trim barcodes to their coding ORF.")
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--gencode", type=int, required=True,
-                    help="Tabla NCBI (2=vert. mt, 5=invert. mt, etc.)")
+                    help="NCBI table (2=vert. mt, 5=invert. mt, etc.)")
     ap.add_argument("--min-coverage", type=float, default=0.95,
-                    help="Fracción mínima del ORF para recortar (default 0.95).")
+                    help="Minimum ORF fraction required to trim (default 0.95).")
     args = ap.parse_args()
 
     recs = read_fasta(args.input)
@@ -98,12 +99,12 @@ def main():
             out.append((hdr, s))
             n_keep += 1
         else:
-            # ORF demasiado corto: no recortar (posible NUMT/longitud rara).
+            # ORF too short: don't trim (possible NUMT/unusual length).
             out.append((hdr, s))
             n_skip += 1
             sys.stderr.write(
-                f"  [aviso] {hdr.split(';')[0]}: ORF limpio cubre solo "
-                f"{aalen*3}/{len(s)} pb (<{args.min_coverage:.0%}); se deja intacto.\n")
+                f"  [warning] {hdr.split(';')[0]}: clean ORF covers only "
+                f"{aalen*3}/{len(s)} bp (<{args.min_coverage:.0%}); left intact.\n")
 
     with open(args.output, "w", encoding="utf-8") as f:
         for hdr, seq in out:
@@ -112,13 +113,13 @@ def main():
     lens = {}
     for _, seq in out:
         lens[len(seq)] = lens.get(len(seq), 0) + 1
-    print(f"Procesados: {len(out)} barcodes")
-    print(f"  recortados al ORF : {n_trim}")
-    print(f"  sin cambio (limpio): {n_keep}")
-    print(f"  no recortados (ORF corto): {n_skip}")
-    print(f"  distribución de longitudes de salida: "
+    print(f"Processed: {len(out)} barcodes")
+    print(f"  trimmed to ORF     : {n_trim}")
+    print(f"  unchanged (clean)  : {n_keep}")
+    print(f"  not trimmed (short ORF): {n_skip}")
+    print(f"  output length distribution: "
           f"{dict(sorted(lens.items(), key=lambda x:-x[1])[:6])}")
-    print(f"Escrito: {args.output}")
+    print(f"Written: {args.output}")
 
 
 if __name__ == "__main__":

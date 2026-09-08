@@ -13,8 +13,8 @@ from .shared import _get_base_dir, _tr, _fmt_num
 # FASTQ INSPECTOR – chart widgets
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Color del marco/separador de las gráficas (solo afecta a estos gráficos,
-# independiente de GRAY_LINE del resto de la interfaz). Cámbialo aquí.
+# Chart frame/separator color (only affects these charts, independent of
+# GRAY_LINE for the rest of the UI). Change it here.
 CHART_FRAME_COLOR = "#B7BABA"
 
 
@@ -1222,7 +1222,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             font-size: 10pt;
             line-height: 1.5;
         }
-        /* Header — fondo sólido + texto blanco explícito para Qt (sin gradientes ni márgenes negativos) */
+        /* Header — solid background + explicit white text for Qt (no gradients or negative margins) */
         .header {
             background: #1a365d;
             color: white;
@@ -1253,7 +1253,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             font-family: 'Courier New', monospace;
             font-size: 9pt;
         }
-        /* Tarjetas de métricas */
+        /* Metric cards */
         .metrics-grid {
             display: flex;
             flex-wrap: wrap;
@@ -1291,10 +1291,10 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             font-size: 8pt;
             color: #A0AEC0;
         }
-        /* Secciones */
+        /* Sections */
         .section { margin: 15px 0; }
-        /* Título dentro del thead de la tabla — page-break-inside:avoid en la tabla
-           es la única forma fiable de mantener título y datos juntos en QTextDocument */
+        /* Title inside the table's thead — page-break-inside:avoid on the table
+           is the only reliable way to keep title and data together in QTextDocument */
         .section-title-row {
             font-size: 13pt;
             font-weight: 600;
@@ -1305,7 +1305,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             border-bottom: 2px solid #CBD5E0;
         }
         .section-title-row i { font-weight: 400; color: #718096; }
-        /* Título suelto (solo sección de gráficas) */
+        /* Standalone title (charts section only) */
         .section-title {
             font-size: 14pt;
             font-weight: 600;
@@ -1315,15 +1315,15 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             margin: 0 0 10px 0;
         }
         .section-title i { font-weight: 400; color: #718096; }
-        /* Tablas modernas */
+        /* Modern tables */
         .data-table {
-            /* QTextDocument no respeta margin:auto (empuja la tabla a la derecha).
-               Se centra con margen izquierdo EXPLÍCITO:
-                 width        = ancho de la tabla
-                 margin-left  = hueco a la izquierda (≈ (100-width)/2 para centrar;
-                                con 80% → ~70px en Letter).
-               Sube margin-left para moverla a la derecha, bájalo para acercarla
-               al borde izquierdo. */
+            /* QTextDocument doesn't honor margin:auto (it pushes the table right).
+               Centered with an EXPLICIT left margin instead:
+                 width        = table width
+                 margin-left  = left gap (≈ (100-width)/2 to center;
+                                with 80% → ~70px on Letter).
+               Increase margin-left to move it right, decrease it to move it
+               toward the left edge. */
             width: 60%;
             border-collapse: collapse;
             margin: 12px 0 12px 70px;
@@ -1348,7 +1348,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             text-align: right;
             font-family: 'Courier New', monospace;
         }
-        /* Notas bajo las gráficas */
+        /* Notes below the charts */
         .chart-note {
             font-size: 8pt;
             color: #A0AEC0;
@@ -1364,18 +1364,18 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             color: #A0AEC0;
             border-top: 1px solid #E2E8F0;
         }
-        /* Badges de calidad */
+        /* Quality badges */
         .badge-good { background: #C6F6D5; color: #22543D; padding: 2px 8px; border-radius: 20px; font-size: 8pt; font-weight: 600; }
         .badge-warning { background: #FEEBC8; color: #7B341E; padding: 2px 8px; border-radius: 20px; font-size: 8pt; font-weight: 600; }
         .badge-info { background: #BEE3F8; color: #1A365D; padding: 2px 8px; border-radius: 20px; font-size: 8pt; font-weight: 600; }
         """
 
-        # Calcular indicadores de calidad
+        # Compute quality indicators
         q_mean = r['mean_q']
         q_badge = 'badge-good' if q_mean >= 20 else ('badge-warning' if q_mean >= 15 else 'badge-info')
         q_badge_text = 'Excellent' if q_mean >= 20 else ('Good' if q_mean >= 15 else 'Fair')
 
-        # Tarjetas de métricas
+        # Metric cards
         metrics = f"""
         <div class="metrics-grid">
             <div class="metric-card">
@@ -1408,9 +1408,9 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         </div>
         """
 
-        # Tabla de longitud — título dentro de thead para que page-break-inside:avoid
-        # en la tabla mantenga título y filas juntos (QTextDocument no respeta el
-        # page-break en <div>, pero sí en elementos <table>)
+        # Length table — title inside thead so page-break-inside:avoid on the
+        # table keeps title and rows together (QTextDocument doesn't honor
+        # page-break on <div>, but it does on <table> elements)
         length_table = f"""
         <table class="data-table" style="page-break-before: always; margin-top: 0;">
             <thead>
@@ -1430,7 +1430,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         </table>
         """
 
-        # Tabla de calidad
+        # Quality table
         quality_table = f"""
         <table class="data-table">
             <thead>
@@ -1446,7 +1446,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         </table>
         """
 
-        # Tabla de GC
+        # GC table
         gc_table = f"""
         <table class="data-table">
             <thead>
@@ -1460,11 +1460,11 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         </table>
         """
 
-        # Las dos gráficas de cada hoja van en UNA sola <table> y la celda de cada
-        # imagen lleva line-height:100% (ver _img_row). Sin eso, el line-height:1.5
-        # del body inflaba cada imagen ~1.5× y solo entraba una gráfica por hoja.
-        # Resultado: dos gráficas por hoja.
-        _cw = self._PDF_CHART_W   # PNG ya embebido a este tamaño exacto
+        # The two charts on each sheet go in a SINGLE <table>, and each image's
+        # cell carries line-height:100% (see _img_row). Without that, the body's
+        # line-height:1.5 inflated each image ~1.5× and only one chart fit per
+        # sheet. Result: two charts per sheet.
+        _cw = self._PDF_CHART_W   # PNG already embedded at this exact size
         _ch = self._PDF_CHART_H
 
         def _title_row(title, top_border=False):
@@ -1474,17 +1474,17 @@ class FastqInspectorPanel(QtWidgets.QWidget):
                 f' color:#4A5568; border-bottom:1px solid #E2E8F0;{bt}">{title}</td></tr>'
             )
 
-        # ▼▼ Espacio (px) DEBAJO de cada gráfica, antes del título de la siguiente.
-        #    Sube/baja este número para ajustar ese hueco. Ojo: si lo subes mucho,
-        #    la 2ª gráfica podría no caber en la hoja.
+        # ▼▼ Space (px) BELOW each chart, before the next title.
+        #    Raise/lower this number to adjust that gap. Careful: if you raise it
+        #    too much, the 2nd chart might not fit on the sheet.
         _gap_below_chart = 40
 
         def _img_row(b64):
-            # line-height:100% es clave: QTextDocument aplica el line-height (1.5
-            # heredado del body) de forma MULTIPLICATIVA a la línea que contiene la
-            # imagen, así que cada gráfica de 280px ocupaba ~420px y sobraban ~140px
-            # de hueco debajo (lo que empujaba la 2ª gráfica a otra hoja). Con 100%
-            # la línea mide exactamente la altura de la imagen.
+            # line-height:100% is key: QTextDocument applies the line-height (1.5
+            # inherited from body) MULTIPLICATIVELY to the line containing the
+            # image, so each 280px chart occupied ~420px, leaving ~140px of extra
+            # space below (which pushed the 2nd chart onto another sheet). At 100%
+            # the line is exactly the height of the image.
             return (
                 f'<tr><td style="padding:4px 8px {_gap_below_chart}px; line-height:100%;">'
                 f'<img src="data:image/png;base64,{b64}" width="{_cw}" height="{_ch}"/>'

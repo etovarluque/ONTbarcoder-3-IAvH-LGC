@@ -102,7 +102,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
             path_bar.setFixedHeight(30)
             pb_layout = QtWidgets.QHBoxLayout(path_bar)
             pb_layout.setContentsMargins(20, 0, 16, 0)
-            path_lbl = QtWidgets.QLabel(f"<span style='color:{TEXT_HINT};'>📁 Salida:</span>"
+            path_lbl = QtWidgets.QLabel(f"<span style='color:{TEXT_HINT};'>📁 Output:</span>"
                                          f" <span style='color:{TEXT_SEC};'>{outdir}</span>")
             path_lbl.setTextFormat(QtCore.Qt.RichText)
             path_lbl.setStyleSheet("font-size: 11px;")

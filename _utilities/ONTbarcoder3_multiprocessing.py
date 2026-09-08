@@ -1,15 +1,15 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 """
-ONTbarcoder_multiprocessing.py - VERSIÓN PATCHADA
+ONTbarcoder_multiprocessing.py - PATCHED VERSION
 ==================================================
-Modificaciones para garantizar resultados determinísticos e idénticos
-a la versión original ONTbarcoder2.py, mientras se mantiene la
-paralelización para máximo rendimiento.
+Modifications to guarantee deterministic results identical
+to the original ONTbarcoder2.py, while keeping the
+parallelization for maximum performance.
 """
 
 # ============================================================
-# IMPORTS COMPLETOS
+# FULL IMPORTS
 # ============================================================
 import sys
 import os
@@ -33,62 +33,62 @@ import edlib
 from Bio.Seq import Seq
 from PyQt5 import QtCore
 
-# Probabilidad de error por valor ASCII de calidad (Phred+33). Se usa para el
-# filtro opcional de calidad por-read: la calidad media de un read ONT se calcula
-# como -10*log10(media de probabilidades de error), no como media aritmética de Q.
+# Error probability per quality ASCII value (Phred+33). Used for the
+# optional per-read quality filter: the mean quality of an ONT read is calculated
+# as -10*log10(mean of error probabilities), not as the arithmetic mean of Q.
 _PHRED_ERR = [10.0 ** (-(q - 33) / 10.0) for q in range(256)]
-# Acceso ligado a nivel de módulo: permite sumar las probabilidades de error
-# iterando los bytes de la línea de calidad con map()/sum() a velocidad de C,
-# ~8x más rápido que un bucle Python con ord() por carácter.
+# Module-level bound access: allows summing the error probabilities
+# by iterating the bytes of the quality line with map()/sum() at C speed,
+# ~8x faster than a Python loop with ord() per character.
 _PHRED_ERR_GET = _PHRED_ERR.__getitem__
 
 # ============================================================
-# FUNCIONES AUXILIARES PARA DETERMINISMO
+# HELPER FUNCTIONS FOR DETERMINISM
 # ============================================================
 
 def deterministic_sort(items):
     """
-    Ordena cualquier colección de forma determinística.
-    Garantiza que el orden sea reproducible entre ejecuciones.
+    Sorts any collection deterministically.
+    Guarantees that the order is reproducible across runs.
     """
     if not items:
         return items
-    # Convertir a string para ordenamiento consistente
+    # Convert to string for consistent sorting
     return sorted(items, key=lambda x: str(x) if x is not None else "")
 
 
 
 def resolve_ties_by_name(items):
     """
-    Resuelve empates en listas de tuplas (item, score) ordenando
-    alfabéticamente por el nombre del item cuando los scores son iguales.
+    Resolves ties in lists of (item, score) tuples by sorting
+    alphabetically by item name when scores are equal.
     """
     if not items or len(items) <= 1:
         return items
-    
+
     result = []
     last_score = None
     group = []
-    
+
     for item, score in items:
         if score != last_score:
             if group:
-                # Ordenar el grupo alfabéticamente por nombre
+                # Sort the group alphabetically by name
                 group.sort(key=lambda x: str(x[0]))
                 result.extend(group)
                 group = []
             last_score = score
         group.append((item, score))
-    
+
     if group:
         group.sort(key=lambda x: str(x[0]))
         result.extend(group)
-    
+
     return result
 
 
 # ============================================================
-# CONSTANTES GLOBALES
+# GLOBAL CONSTANTS
 # ============================================================
 
 AMBIGUITY_CODES = [
@@ -99,7 +99,7 @@ AMBIGUITY_CODES = [
     ("N", "A"), ("N", "G"), ("N", "C"), ("N", "T"),
 ]
 
-# Configuración de rutas
+# Path configuration
 def _get_base_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
@@ -111,45 +111,46 @@ parfilepath = os.path.join(SCRIPT_DIR, "_mafftfiles", "parfile")
 disttbpath  = os.path.join(SCRIPT_DIR, "_mafftfiles", "disttbfast.exe")
 MAFFT_DIR   = os.path.join(SCRIPT_DIR, "_mafftfiles")
 
-# Número de hilos (puede ser sobreescrito por la GUI)
+# Number of threads (can be overridden by the GUI)
 N_THREADS = 4
 
-# En Windows, shell=True crea cmd.exe como intermediario.
-# Con 20+ workers simultáneos, 20 cmd.exe peleando por el console host de Windows
-# bloquea el SO. CREATE_NO_WINDOW + shell=False elimina ese intermediario.
+# On Windows, shell=True creates cmd.exe as an intermediary.
+# With 20+ concurrent workers, 20 cmd.exe processes fighting over the Windows console host
+# stalls the OS. CREATE_NO_WINDOW + shell=False removes that intermediary.
 _CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
 def set_threads(n):
-    """Actualiza N_THREADS."""
+    """Updates N_THREADS."""
     global N_THREADS
     N_THREADS = max(1, n)
 
 
 _PHYSICAL_CORES = None
 
-# Directorio de trabajo reutilizable POR HILO.
-# disttbfast deposita archivos de nombre fijo (conflicts, pre, trace, order) en su cwd.
-# En lugar de mkdtemp+copy(_aamtx)+rmtree por llamada, se crea el dir una sola vez al
-# primer uso del hilo y se limpian solo esos archivos entre invocaciones.
+# Reusable working directory PER THREAD.
+# disttbfast drops fixed-name files (conflicts, pre, trace, order) into its cwd.
+# Instead of mkdtemp+copy(_aamtx)+rmtree on every call, the dir is created once on
+# the thread's first use, and only those files are cleaned up between invocations.
 #
-# IMPORTANTE: runconsensusparts/runtoptwenty ejecutan los workers con ThreadPool
-# (varios hilos en el MISMO proceso), no con procesos. Un único directorio global
-# compartido provocaría una condición de carrera: _reset_worker_tmpdir de un hilo
-# borraría los archivos de nombre fijo que otro hilo está usando en el mismo cwd.
-# Por eso el directorio es thread-local: cada hilo trabaja en su propio cwd aislado.
+# IMPORTANT: runconsensusparts/runtoptwenty run the workers with a ThreadPool
+# (several threads in the SAME process), not with separate processes. A single
+# shared global directory would cause a race condition: one thread's
+# _reset_worker_tmpdir would delete the fixed-name files another thread is using
+# in that same cwd. That's why the directory is thread-local: each thread works
+# in its own isolated cwd.
 _worker_tls = threading.local()
 
-# Registro global (thread-safe) de TODOS los directorios temporales creados, para
-# poder borrarlos. Como el dir es thread-local, no se puede alcanzar el TLS de cada
-# hilo desde fuera; este registro permite limpiarlos en bloque al terminar un
-# pipeline (cleanup_worker_tmpdirs) y, como red de seguridad, al salir (atexit).
+# Global (thread-safe) registry of ALL temp directories created, so they can be
+# deleted later. Since the dir is thread-local, each thread's TLS entry can't be
+# reached from outside; this registry allows bulk cleanup at the end of a
+# pipeline (cleanup_worker_tmpdirs) and, as a safety net, on exit (atexit).
 _worker_dirs = []
 _worker_dirs_lock = threading.Lock()
 
 
 def _get_worker_tmpdir():
-    """Crea (o recupera) el directorio temporal aislado de ESTE hilo."""
+    """Creates (or retrieves) THIS thread's isolated temp directory."""
     work_dir = getattr(_worker_tls, "dir", None)
     if work_dir is None or not os.path.isdir(work_dir):
         work_dir = tempfile.mkdtemp(prefix="ontbc_mafft_")
@@ -163,19 +164,19 @@ def _get_worker_tmpdir():
 
 
 def cleanup_worker_tmpdirs():
-    """Borra todos los directorios temporales de workers MAFFT creados hasta ahora.
+    """Deletes all MAFFT worker temp directories created so far.
 
-    Seguro de llamar entre fases/pipelines: cada fase de consenso abre un ThreadPool
-    con hilos nuevos (TLS nuevo), así que los directorios de fases previas ya no están
-    en uso. También se registra con atexit como red de seguridad al cerrar la app.
-    Tras la limpieza, el siguiente hilo que llame a _get_worker_tmpdir creará uno nuevo.
+    Safe to call between phases/pipelines: each consensus phase opens a ThreadPool
+    with new threads (fresh TLS), so previous phases' directories are no longer in
+    use. Also registered with atexit as a safety net when the app closes.
+    After cleanup, the next thread that calls _get_worker_tmpdir will create a new one.
     """
     with _worker_dirs_lock:
         for d in _worker_dirs:
             shutil.rmtree(d, ignore_errors=True)
         _worker_dirs.clear()
-    # Olvidar la referencia TLS del hilo actual (su dir ya fue borrado); cualquier
-    # otro hilo revalida con os.path.isdir() en _get_worker_tmpdir y recreará el suyo.
+    # Forget the current thread's TLS reference (its dir was already deleted); any
+    # other thread revalidates with os.path.isdir() in _get_worker_tmpdir and recreates its own.
     if getattr(_worker_tls, "dir", None) is not None:
         _worker_tls.dir = None
 
@@ -185,8 +186,8 @@ atexit.register(cleanup_worker_tmpdirs)
 
 def _reset_worker_tmpdir(work_dir):
     """
-    Elimina todos los archivos del directorio de trabajo excepto _aamtx.
-    Equivalente a crear un directorio nuevo desde el punto de vista de disttbfast.
+    Removes all files from the working directory except _aamtx.
+    Equivalent to creating a fresh directory from disttbfast's point of view.
     """
     try:
         for entry in os.scandir(work_dir):
@@ -205,12 +206,12 @@ def _reset_worker_tmpdir(work_dir):
 
 def physical_core_count():
     """
-    Núcleos FÍSICOS (best-effort, cacheado). El trabajo pesado son procesos
-    disttbfast.exe forzados a 1 hilo (-C 1-1); su concurrencia óptima ≈ núcleos
-    físicos. Superarlos sobre-suscribe la CPU y ralentiza (p.ej. 20 workers en
-    16 físicos / 24 lógicos rinde peor que 12). En Windows se consulta la API
-    GetLogicalProcessorInformation; si falla, se cae a la mitad de los lógicos
-    (heurística conservadora para CPUs con hyperthreading).
+    PHYSICAL core count (best-effort, cached). The heavy work is disttbfast.exe
+    processes forced to 1 thread (-C 1-1); their optimal concurrency ≈ physical
+    cores. Exceeding it oversubscribes the CPU and slows things down (e.g. 20
+    workers on 16 physical / 24 logical cores performs worse than 12). On Windows,
+    the GetLogicalProcessorInformation API is queried; if it fails, falls back to
+    half the logical cores (a conservative heuristic for hyperthreaded CPUs).
     """
     global _PHYSICAL_CORES
     if _PHYSICAL_CORES is not None:
@@ -229,7 +230,7 @@ def physical_core_count():
 
             glpi = ctypes.windll.kernel32.GetLogicalProcessorInformation
             length = wintypes.DWORD(0)
-            glpi(None, ctypes.byref(length))  # 1ra llamada: obtiene el tamaño
+            glpi(None, ctypes.byref(length))  # 1st call: gets the size
             n = length.value // ctypes.sizeof(_SLPI)
             if n > 0:
                 buf = (_SLPI * n)()
@@ -244,8 +245,8 @@ def physical_core_count():
 
 
 def optimal_worker_count(requested=None):
-    """Concurrencia recomendada: nunca por encima de los núcleos físicos.
-    Sin argumento devuelve el óptimo; con `requested` lo limita a ese tope."""
+    """Recommended concurrency: never above the physical core count.
+    With no argument, returns the optimum; with `requested`, caps it at that limit."""
     phys = physical_core_count()
     if requested is None:
         return phys
@@ -254,11 +255,11 @@ def optimal_worker_count(requested=None):
 
 def _run_disttbfast(cmd_args, timeout=120):
     """
-    Ejecuta disttbfast.exe en el directorio de trabajo de este worker-proceso.
-    disttbfast crea archivos con nombres fijos (conflicts, pre, trace, order) en su
-    cwd. _reset_worker_tmpdir los elimina antes de cada invocación, garantizando un
-    cwd limpio sin el coste de mkdtemp+copy(_aamtx)+rmtree por llamada.
-    Reintenta ante fallos transitorios; TimeoutExpired se propaga sin reintento.
+    Runs disttbfast.exe in this worker's working directory.
+    disttbfast creates fixed-name files (conflicts, pre, trace, order) in its
+    cwd. _reset_worker_tmpdir deletes them before each invocation, guaranteeing a
+    clean cwd without the cost of mkdtemp+copy(_aamtx)+rmtree on every call.
+    Retries on transient failures; TimeoutExpired propagates without retrying.
     """
     work_dir = _get_worker_tmpdir()
     last_exc = None
@@ -281,11 +282,11 @@ def _run_disttbfast(cmd_args, timeout=120):
 
 
 # ============================================================
-# FUNCIONES UTILITARIAS
+# UTILITY FUNCTIONS
 # ============================================================
 
 def revcomp(seq: str) -> str:
-    """Calcula el reverse complement de una secuencia de ADN."""
+    """Computes the reverse complement of a DNA sequence."""
     seq = seq.upper()
     comp_table = str.maketrans(
         "ACGTRYMKSWBDHVN",
@@ -295,14 +296,14 @@ def revcomp(seq: str) -> str:
 
 
 def resource_path(relative_path):
-    """Obtiene la ruta correcta para recursos (compatible con PyInstaller)."""
+    """Gets the correct path for resources (PyInstaller-compatible)."""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
 
 
 # ============================================================
-# CLASE: prepdemultiplex
+# CLASS: prepdemultiplex
 # ============================================================
 
 class prepdemultiplex(QtCore.QThread):
@@ -321,10 +322,10 @@ class prepdemultiplex(QtCore.QThread):
         self.demlen = demlen
         self.logfile = logfile
         self.start_id = start_id
-        # Filtro opcional de calidad media por-read (Q). 0 = desactivado.
+        # Optional per-read mean quality (Q) filter. 0 = disabled.
         self.minq = minq
-        # Nº de errores (sustitución/indel) tolerados en los tags al demultiplexar:
-        # genera los mutantes de tag hasta esta profundidad (0 = solo exacto).
+        # Number of errors (substitution/indel) tolerated in tags when demultiplexing:
+        # generates tag mutants up to this depth (0 = exact match only).
         self.tagmm = tagmm
 
     def run(self):
@@ -435,7 +436,7 @@ class prepdemultiplex(QtCore.QThread):
                 self.sampleids[each.split(',')[0]] = ''
             first_cols = [c.strip() for c in demullines[0].rstrip('\n').split(',')]
             self.taglen = len(first_cols[1])
-            # Pares de primers desde columna 3: (primer_f, primer_r), (primer_f2, primer_r2)...
+            # Primer pairs from column 3: (primer_f, primer_r), (primer_f2, primer_r2)...
             self.primerfset = []
             self.primerrset = []
             i = 3
@@ -454,11 +455,11 @@ class prepdemultiplex(QtCore.QThread):
         self.nseqsfailqual = 0
         self.logfile.write("<br><br>Read demultiplexing file. There are " + str("{:,}".format(len(self.sampleids))) + " in your experiment.\n")
 
-        # ── PASADA ÚNICA: las tres fases originales (filtro → split → chunk)
-        # se fusionan en un solo recorrido del FASTQ para evitar tres lecturas
-        # secuenciales de disco. Los reads se clasifican y acumulan en memoria
-        # por lotes de CHUNK_LINES líneas antes de escribir, reduciendo las
-        # llamadas a write() sin aumentar el uso de RAM de forma significativa.
+        # ── SINGLE PASS: the three original phases (filter → split → chunk)
+        # are merged into a single FASTQ traversal to avoid three sequential
+        # disk reads. Reads are classified and buffered in memory in batches
+        # of CHUNK_LINES lines before writing, reducing write() calls without
+        # significantly increasing RAM usage.
         # ────────────────────────────────────────────────────────────────────
         self.nseqsfordemultiplexingpresplit1 = 0
         self.nseqsfordemultiplexingpresplit2 = 0
@@ -466,21 +467,21 @@ class prepdemultiplex(QtCore.QThread):
         self.nseqsfordemultiplexing = 0
         self.maxid = 0
 
-        CHUNK_LINES = 80000          # 40 000 reads × 2 líneas por read (id + seq)
-        SPLIT_CHUNK = 40000          # líneas por archivo de partición (igual que antes)
+        CHUNK_LINES = 80000          # 40,000 reads × 2 lines per read (id + seq)
+        SPLIT_CHUNK = 40000          # lines per partition file (same as before)
 
-        # Buffers en memoria para los dos destinos principales
-        buf_1pdt = []                # reads de longitud correcta (un barcode)
-        buf_2pdt = []                # reads de longitud doble (dos barcodes ligados)
-        buf_write_threshold = 4096   # líneas acumuladas antes de flush parcial
+        # In-memory buffers for the two main destinations
+        buf_1pdt = []                # reads of correct length (one barcode)
+        buf_2pdt = []                # double-length reads (two ligated barcodes)
+        buf_write_threshold = 4096   # lines accumulated before a partial flush
 
-        # Contadores de chunk para los archivos particionados
+        # Chunk counters for the partitioned files
         chunk_1pdt_lines = 0
         chunk_1pdt_idx   = 1
         chunk_2pdt_lines = 0
         chunk_2pdt_idx   = 1
 
-        # Límites de longitud calculados una sola vez
+        # Length limits computed once
         len_1pdt_max = self.explen + self.taglen * 2 + primerlensum + self.demlen
         len_2pdt_min = (self.explen + self.taglen * 2 + primerlensum) * 2 - self.demlen
         len_2pdt_max = (self.explen + self.taglen * 2 + primerlensum + self.demlen) * 2
@@ -500,7 +501,7 @@ class prepdemultiplex(QtCore.QThread):
             return _open_chunks[key]
 
         def _flush_chunk(prefix, lines_buf, idx_ref, lines_ref):
-            """Escribe líneas al chunk actual; abre el siguiente si se llena."""
+            """Writes lines to the current chunk; opens the next one if it fills up."""
             fh = _get_chunk(prefix, idx_ref[0])
             pos = 0
             while pos < len(lines_buf):
@@ -510,7 +511,7 @@ class prepdemultiplex(QtCore.QThread):
                 lines_ref[0] += len(batch)
                 pos += len(batch)
                 if lines_ref[0] >= SPLIT_CHUNK and pos < len(lines_buf):
-                    # Solo abrir el siguiente chunk si aún quedan líneas por escribir
+                    # Only open the next chunk if there are still lines left to write
                     fh.flush()
                     idx_ref[0] += 1
                     lines_ref[0] = 0
@@ -521,8 +522,8 @@ class prepdemultiplex(QtCore.QThread):
         idx2_ref   = [chunk_2pdt_idx]
         lines2_ref = [chunk_2pdt_lines]
 
-        # Leer el FASTQ con un buffer de I/O grande (8 MB) para minimizar
-        # las llamadas al sistema operativo en archivos de varios GB.
+        # Read the FASTQ with a large I/O buffer (8 MB) to minimize
+        # system calls on multi-GB files.
         with open(self.infastq, buffering=8 * 1024 * 1024) as infile:
             for line1, line2, line3, line4 in zip_longest(*[infile] * 4):
                 if not line1 or not line1.strip():
@@ -535,10 +536,10 @@ class prepdemultiplex(QtCore.QThread):
                     self.totalseqs += 1
                     continue
 
-                # Filtro opcional de calidad: descarta reads cuya calidad media
-                # ONT (-10*log10(media de prob. de error)) cae por debajo de minq.
-                # Se itera sobre los bytes de la línea de calidad con sum()/map()
-                # (velocidad de C) para minimizar el overhead en archivos grandes.
+                # Optional quality filter: discards reads whose mean ONT quality
+                # (-10*log10(mean error probability)) falls below minq.
+                # Iterates over the quality line's bytes with sum()/map()
+                # (C speed) to minimize overhead on large files.
                 if self.minq > 0 and line4:
                     qb = line4.strip().encode()
                     if qb:
@@ -556,14 +557,14 @@ class prepdemultiplex(QtCore.QThread):
                 self.totalseqs += 1
 
                 if slen < len_1pdt_max:
-                    # Producto simple (un barcode)
+                    # Simple product (one barcode)
                     buf_1pdt.append(seqid)
                     buf_1pdt.append(line2 if line2.endswith("\n") else line2 + "\n")
                     self.nseqsfordemultiplexing += 1
                     self.nseqsfordemultiplexingpresplit1 += 1
 
                 elif len_2pdt_min < slen < len_2pdt_max:
-                    # Producto doble (dos barcodes ligados): dividir en dos
+                    # Double product (two ligated barcodes): split into two
                     cut = self.explen + self.taglen * 2 + primerlensum + self.demlen
                     ovlp = self.explen + self.taglen * 2 + primerlensum - self.demlen
                     buf_2pdt.append(seqid.strip() + "p1\n")
@@ -576,7 +577,7 @@ class prepdemultiplex(QtCore.QThread):
                 else:
                     self.nwronglengthwindow += 1
 
-                # Flush parcial cuando los buffers crecen mucho
+                # Partial flush when the buffers grow too large
                 if len(buf_1pdt) >= buf_write_threshold:
                     _flush_chunk("reformat_out_1pdt", buf_1pdt, idx1_ref, lines1_ref)
                     buf_1pdt = []
@@ -584,23 +585,23 @@ class prepdemultiplex(QtCore.QThread):
                     _flush_chunk("reformat_out_2pdt", buf_2pdt, idx2_ref, lines2_ref)
                     buf_2pdt = []
 
-        # Flush final de los buffers restantes
+        # Final flush of the remaining buffers
         if buf_1pdt:
             _flush_chunk("reformat_out_1pdt", buf_1pdt, idx1_ref, lines1_ref)
         if buf_2pdt:
             _flush_chunk("reformat_out_2pdt", buf_2pdt, idx2_ref, lines2_ref)
 
-        # Cerrar todos los file handles abiertos
+        # Close all open file handles
         for fh in _open_chunks.values():
             try:
                 fh.close()
             except Exception:
                 pass
 
-        # maxid = nombre del último chunk _1pdt escrito.
-        # Si lines1_ref[0] > 0: el último chunk activo es idx1_ref[0].
-        # Si lines1_ref[0] == 0: el último chunk lleno fue idx1_ref[0] (puede haber
-        #   llegado exactamente a SPLIT_CHUNK sin abrir uno nuevo).
+        # maxid = name of the last _1pdt chunk written.
+        # If lines1_ref[0] > 0: the last active chunk is idx1_ref[0].
+        # If lines1_ref[0] == 0: the last full chunk was idx1_ref[0] (it may have
+        #   landed exactly on SPLIT_CHUNK without opening a new one).
         last_1pdt_idx = idx1_ref[0]
         self.maxid = f"{basename}_reformat_out_1pdt_p{last_1pdt_idx * SPLIT_CHUNK}"
 
@@ -614,12 +615,12 @@ class prepdemultiplex(QtCore.QThread):
                 str(round(time.time())) + ": Quality filter Q>=" + str(self.minq)
                 + " removed " + "{:,}".format(self.nseqsfailqual) + " reads.\n")
         self.logfile.write(str(round(time.time())) + ": Split files into correct product length. There are " + str("{:,}".format(self.nseqspasslen)) + " single product sequences.\n")
-        # Reads en el último chunk _1pdt. Cada chunk tiene SPLIT_CHUNK líneas
-        # (= SPLIT_CHUNK/2 reads, 2 líneas por read). lines1_ref[0] es el nº de
-        # líneas escritas en el chunk actual (el último); vale SPLIT_CHUNK si se
-        # llenó exacto. rundemultiplex suma maxv (este valor) para el chunk máximo
-        # y SPLIT_CHUNK//2 para el resto, así que maxv debe estar en READS — no en
-        # líneas ni sobre nseqspasslen (que incluye 2pdt y ventana incorrecta).
+        # Reads in the last _1pdt chunk. Each chunk has SPLIT_CHUNK lines
+        # (= SPLIT_CHUNK/2 reads, 2 lines per read). lines1_ref[0] is the number of
+        # lines written in the current (last) chunk; it equals SPLIT_CHUNK if it
+        # filled exactly. rundemultiplex adds maxv (this value) for the max chunk
+        # and SPLIT_CHUNK//2 for the rest, so maxv must be in READS — not in
+        # lines nor over nseqspasslen (which includes 2pdt and the wrong-length window).
         _last_1pdt_lines = lines1_ref[0] if lines1_ref[0] > 0 else SPLIT_CHUNK
         self.lastbitn = _last_1pdt_lines // 2
 
@@ -629,7 +630,7 @@ class prepdemultiplex(QtCore.QThread):
 
 
 # ============================================================
-# CLASE: mergedemfiles
+# CLASS: mergedemfiles
 # ============================================================
 
 class mergedemfiles(QtCore.QThread):
@@ -655,7 +656,7 @@ class mergedemfiles(QtCore.QThread):
             return nseqs
 
         c = 1
-        # Ordenar claves para determinismo
+        # Sort keys for determinism
         sample_keys = deterministic_sort(list(self.sampleids.keys()))
 
         for each in sample_keys:
@@ -675,7 +676,7 @@ class mergedemfiles(QtCore.QThread):
 
 
 # ============================================================
-# CLASE: calculatecoverage
+# CLASS: calculatecoverage
 # ============================================================
 
 class calculatecoverage(QtCore.QThread):
@@ -710,10 +711,10 @@ class calculatecoverage(QtCore.QThread):
 
 
 # ============================================================
-# FUNCIONES PARA MULTIPROCESSING (con ordenamiento determinístico)
+# FUNCTIONS FOR MULTIPROCESSING (with deterministic ordering)
 # ============================================================
 
-# Variables globales para colas de progreso (usadas por pool_init)
+# Global variables for progress queues (used by pool_init)
 _queue_for_progress = None
 
 
@@ -733,10 +734,10 @@ def pool_init2(queue):
 
 
 def _consensus_columns(seqs, perc_thresh):
-    """Consenso por mayoría de columna (alineado, conserva gaps/Ns) para una
-    lista de secuencias alineadas de igual longitud. Replica la lógica de la
-    función interna `consensus()` del worker, para reutilizarla en el resolutor
-    de haplotipo dominante."""
+    """Column-majority consensus (aligned, preserves gaps/Ns) for a
+    list of equal-length aligned sequences. Replicates the logic of the
+    worker's internal `consensus()` function, so it can be reused in the
+    dominant-haplotype resolver."""
     out = []
     n = len(seqs)
     if n == 0:
@@ -758,40 +759,42 @@ def _consensus_columns(seqs, perc_thresh):
 def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
                         tolerance=0.10):
     """
-    Resolutor de variantes intra-muestra (marca-agnóstico) para las reads
-    MSA-alineadas de UNA muestra. A partir de las columnas polimórficas agrupa los
-    reads en N haplotipos por clustering greedy por abundancia (no asume sólo dos
-    templates) y devuelve el consenso del haplotipo DOMINANTE (el más abundante)
-    junto con el desglose de TODOS los clusters. Esto evita que una mayoría única
-    "voltee" con los parámetros cuando coexisten varios templates co-abundantes
-    (contaminación cruzada, parálogo/numt, variantes alélicas, mezcla de muestras).
+    Intra-sample variant resolver (marker-agnostic) for the MSA-aligned
+    reads of ONE sample. From the polymorphic columns, it groups the
+    reads into N haplotypes via greedy abundance-based clustering (it does not
+    assume only two templates) and returns the consensus of the DOMINANT
+    haplotype (the most abundant one) along with the breakdown of ALL clusters.
+    This prevents a simple majority from "flipping" with the parameters when
+    several co-abundant templates coexist (cross-contamination, paralog/NUMT,
+    allelic variants, sample mixture).
 
-    No depende de traducción ni de longitud: opera solo sobre las columnas del
-    alineamiento, así que sirve igual para Coding y no-Coding. La traducción (Coding) se
-    puede usar aparte como desempate cuando hay clusters co-abundantes.
+    Does not depend on translation or length: it operates only on the columns
+    of the alignment, so it works equally for Coding and non-Coding markers.
+    Translation (Coding) can be used separately as a tie-break when there are
+    co-abundant clusters.
 
-    Parámetros:
-      minor_thresh: frecuencia mínima del segundo alelo para considerar una
-                    columna 'polimórfica' (filtra el ruido aleatorio de ONT, que
-                    reparte <~5% por alternativa).
-      min_secondary_frac: fracción mínima de un cluster para considerarlo un
-                    haplotipo 'real' (y para marcar la muestra como 'mixta').
-      tolerance:    fracción de las columnas polimórficas en que un read puede
-                    discrepar del centroide de su cluster y aún pertenecer a él.
-                    Absorbe el error de secuenciación / variación intrínseca para
-                    no fragmentar un mismo haplotipo en muchos clusters espurios.
+    Parameters:
+      minor_thresh: minimum frequency of the second allele for a column to be
+                    considered 'polymorphic' (filters out random ONT noise,
+                    which typically spreads <~5% per alternative).
+      min_secondary_frac: minimum fraction of a cluster for it to be
+                    considered a 'real' haplotype (and to flag the sample as 'mixed').
+      tolerance:    fraction of the polymorphic columns in which a read may
+                    disagree with its cluster's centroid and still belong to it.
+                    Absorbs sequencing error / intrinsic variation so as not to
+                    fragment a single haplotype into many spurious clusters.
 
-    Devuelve dict:
-      mixed:               bool   (≥2 clusters reales)
-      dominant_frac:       float  (proporción del haplotipo dominante)
-      n_poly:              int    (nº de columnas que distinguen los haplotipos)
-      dominant_consensus:  str|None  (consenso alineado del elegido, con gaps)
-      secondary_consensus: str|None  (back-compat: top secundario, con gaps)
-      n_clusters:          int    (nº de clusters reales)
-      n_noise:             int    (reads en clusters sub-umbral)
-      clusters:            list de dicts ordenados desc. por tamaño:
-                           {rank, size, frac, consensus(alineado), translates(None),
-                            role ∈ {dominant, secondary, noise}}
+    Returns dict:
+      mixed:               bool   (>=2 real clusters)
+      dominant_frac:       float  (proportion of the dominant haplotype)
+      n_poly:              int    (number of columns distinguishing the haplotypes)
+      dominant_consensus:  str|None  (aligned consensus of the chosen one, with gaps)
+      secondary_consensus: str|None  (back-compat: top secondary, with gaps)
+      n_clusters:          int    (number of real clusters)
+      n_noise:             int    (reads in sub-threshold clusters)
+      clusters:            list of dicts sorted desc. by size:
+                           {rank, size, frac, consensus(aligned), translates(None),
+                            role in {dominant, secondary, noise}}
     """
     seqs = list(aligned_seqs)
     n = len(seqs)
@@ -802,9 +805,9 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
         return _none
     L = len(seqs[0])
 
-    # 1) Columnas polimórficas: las que tienen un segundo alelo (no gap/N) por
-    #    encima de minor_thresh. En una muestra de un solo template no hay (o casi).
-    poly_cols = []  # índices de columna
+    # 1) Polymorphic columns: those with a second allele (not gap/N) above
+    #    minor_thresh. In a single-template sample there are none (or almost none).
+    poly_cols = []  # column indices
     for j in range(L):
         cnt = Counter(s[j] for s in seqs)
         cnt.pop('-', None)
@@ -817,17 +820,17 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
         if mf >= minor_thresh:
             poly_cols.append(j)
     n_poly = len(poly_cols)
-    # Guarda anti-hotspot: una única columna diagnóstica no se puede fasear, así
-    # que un hotspot de error ONT reproducible (p. ej. junto a un homopolímero)
-    # podría fabricar un "cluster" con errores correlacionados en UN solo sitio.
-    # Se exigen ≥2 columnas polimórficas ligadas para declarar mezcla. Las
-    # mezclas coespecíficas de 1 SNP se ignoran a propósito: son indistinguibles
-    # de heteroplasmia/error y el haplotipo dominante identifica la misma especie.
+    # Anti-hotspot guard: a single diagnostic column cannot be phased, so a
+    # reproducible ONT error hotspot (e.g. next to a homopolymer) could
+    # fabricate a "cluster" with correlated errors at just ONE site.
+    # At least 2 linked polymorphic columns are required to declare a mixture.
+    # 1-SNP conspecific mixtures are deliberately ignored: they are indistinguishable
+    # from heteroplasmia/error, and the dominant haplotype still identifies the same species.
     if n_poly < 2:
         return _none
 
-    # 2) Firma por read = bases en las columnas polimórficas. N/'-' = comodín:
-    #    no cuentan como discrepancia en la distancia (errores/cobertura parcial).
+    # 2) Per-read signature = bases at the polymorphic columns. N/'-' = wildcard:
+    #    they don't count as a mismatch in the distance (errors/partial coverage).
     _WILD = ('-', 'N')
 
     def _sig(s):
@@ -844,15 +847,15 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
 
     tol_pos = int(round(max(0.0, float(tolerance)) * n_poly))
 
-    # Firmas únicas ordenadas por (frecuencia desc, firma) → determinístico.
+    # Unique signatures sorted by (frequency desc, signature) -> deterministic.
     sig_counts = Counter(_sig(s) for s in seqs)
     ordered_sigs = sorted(sig_counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
-    # 3) Clustering greedy por abundancia: la firma más frecuente no asignada se
-    #    vuelve semilla; absorbe toda firma a distancia ≤ tol_pos; se refina el
-    #    centroide a la base mayoritaria por columna (una pasada).
-    assigned = set()                # firmas ya asignadas
-    cluster_members = []            # lista de listas de reads (secuencias alineadas)
+    # 3) Greedy abundance-based clustering: the most frequent unassigned signature
+    #    becomes a seed; it absorbs every signature at distance <= tol_pos; the
+    #    centroid is refined to the per-column majority base (one pass).
+    assigned = set()                # signatures already assigned
+    cluster_members = []            # list of lists of reads (aligned sequences)
     reads_by_sig = {}
     for s in seqs:
         reads_by_sig.setdefault(_sig(s), []).append(s)
@@ -865,7 +868,7 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
         if not members_sigs:
             continue
         assigned.update(members_sigs)
-        # Refinar centroide y reasignar firmas aún libres más cercanas a él.
+        # Refine the centroid and reassign still-free signatures closest to it.
         member_reads = [r for sig in members_sigs for r in reads_by_sig[sig]]
         centroid = tuple(_consensus_columns([_sig(r) for r in member_reads], 0.5))
         extra = [sig for sig, _ in ordered_sigs
@@ -875,19 +878,19 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
             member_reads += [r for sig in extra for r in reads_by_sig[sig]]
         cluster_members.append(member_reads)
 
-    # 4) Ordenar clusters por tamaño (desempate determinístico por consenso).
+    # 4) Sort clusters by size (deterministic tie-break by consensus).
     cluster_members.sort(key=lambda m: (-len(m), ''.join(_consensus_columns(m, 0.5))))
 
-    # Clusters reales = fracción ≥ min_secondary_frac Y tamaño absoluto ≥ 3
-    # reads (a cobertura baja, 2 reads compartiendo un error correlacionado no
-    # son evidencia suficiente de un haplotipo real); el resto es ruido.
+    # Real clusters = fraction >= min_secondary_frac AND absolute size >= 3
+    # reads (at low coverage, 2 reads sharing a correlated error are not
+    # sufficient evidence of a real haplotype); the rest is noise.
     real, noise_reads = [], []
     for m in cluster_members:
         if len(m) / n >= min_secondary_frac and len(m) >= 3:
             real.append(m)
         else:
             noise_reads.extend(m)
-    if not real:                       # nada supera el umbral: todo es un cluster
+    if not real:                       # nothing clears the threshold: treat it all as one cluster
         real = [cluster_members[0]] if cluster_members else [seqs]
         noise_reads = []
 
@@ -898,12 +901,12 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
             "size": len(m),
             "frac": len(m) / n,
             "consensus": ''.join(_consensus_columns(m, 0.5)),
-            "translates": None,        # lo rellena callconsensus en modo Coding
+            "translates": None,        # filled in by callconsensus in Coding mode
             "role": "dominant" if rank == 0 else "secondary",
-            # Reads alineadas del cluster (con gaps). Se usan localmente en
-            # callconsensus para volcar las reads por cluster a disco y poder
-            # recuperar las variantes secundarias (re-consenso 2a + Fase 3). NO se
-            # propaga en el dict 'mix' que vuelve al hilo principal (sería pesado).
+            # Aligned reads of the cluster (with gaps). Used locally in
+            # callconsensus to dump the per-cluster reads to disk so that
+            # secondary variants can be recovered (re-consensus 2a + Phase 3). NOT
+            # propagated in the 'mix' dict returned to the main thread (would be heavy).
             "members": m,
         })
 
@@ -924,10 +927,10 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
 
 def _runconsensusparts_fn(inlist):
     """
-    Función worker para consenso por partes.
-    Modificada: ordena la lista de entrada deterministicamente.
+    Worker function for partial consensus calling.
+    Modified: sorts the input list deterministically.
     """
-    # --- PATCH DETERMINISTA: ordenar lista de archivos ---
+    # --- DETERMINISTIC PATCH: sort file list ---
     inlist1 = inlist[0]
     if isinstance(inlist1, list):
         inlist1 = deterministic_sort(inlist1)
@@ -948,9 +951,9 @@ def _runconsensusparts_fn(inlist):
     rangefreq = inlist[12]
     stepsize = float(inlist[13])
     ingencode = int(inlist[14])
-    # Código genético POR MUESTRA (multiplexado de vertebrados/invertebrados en un
-    # mismo FASTQ): {sample_id: tabla_NCBI}. Las muestras sin entrada usan el código
-    # global ``ingencode``. Backwards-compatible (len<=16 → dict vacío).
+    # PER-SAMPLE genetic code (vertebrates/invertebrates multiplexed in the
+    # same FASTQ): {sample_id: NCBI table}. Samples without an entry use the
+    # global ``ingencode``. Backwards-compatible (len<=16 -> empty dict).
     gencode_by_sample = inlist[16] if len(inlist) > 16 else {}
     # QC length tolerance (± bp) for coding markers: a consensus is length-
     # eligible when |len(conseq) - plen| <= qclentol. 0 (default) reproduces the
@@ -965,30 +968,30 @@ def _runconsensusparts_fn(inlist):
         qclentol = 0
 
     def gencode_for(name):
-        """Resuelve la tabla de traducción para una muestra a partir de su nombre
-        de archivo (``<sample>_all.fa``), con ``ingencode`` como respaldo.
-        La clave es el nombre COMPLETO de la muestra (puede contener puntos)."""
+        """Resolves the translation table for a sample from its file name
+        (``<sample>_all.fa``), falling back to ``ingencode``.
+        The key is the FULL sample name (may contain dots)."""
         sid = name.split("_all.fa")[0]
         return gencode_by_sample.get(sid, ingencode)
 
-    # Config de resolución de mezcla/contaminación (haplotipo dominante).
-    # Marca-agnóstica: aplica a Coding y no-Coding. Backwards-compatible (len<=15).
+    # Mixture/contamination resolution config (dominant haplotype).
+    # Marker-agnostic: applies to Coding and non-Coding. Backwards-compatible (len<=15).
     resolve_cfg = inlist[15] if len(inlist) > 15 else {}
     _resolve_on = bool(resolve_cfg.get("enabled"))
     _resolve_minor = float(resolve_cfg.get("minor_thresh", 0.2))
     _resolve_secfrac = float(resolve_cfg.get("min_secondary_frac", 0.2))
     _resolve_tol = float(resolve_cfg.get("tolerance", 0.10))
-    # Recuperación de variantes secundarias (2a-consenso + Fase 3): siempre activa
-    # cuando la detección está encendida. Se guardan las reads de cada cluster
-    # secundario elegible (< _resolve_maxn Ns en su consenso) para re-procesarlas,
-    # con un tope de _resolve_maxvar por muestra (las más abundantes).
+    # Secondary-variant recovery (2a-consensus + Phase 3): always active
+    # when detection is turned on. The reads of each eligible secondary
+    # cluster (< _resolve_maxn Ns in its consensus) are saved for reprocessing,
+    # capped at _resolve_maxvar per sample (the most abundant ones).
     _resolve_recover = bool(resolve_cfg.get("recover_secondaries", True))
     _resolve_maxvar = int(resolve_cfg.get("max_variants", 3))
     _resolve_maxn = int(resolve_cfg.get("max_variant_Ns", 5))
-    # Divergencia dominante↔secundaria que fuerza 'needs review'. Por debajo
-    # del umbral (~variación coespecífica: otro individuo de la misma especie,
-    # heteroplasmia, alelos) la mezcla es informativa; por encima (nivel
-    # heteroespecífico) sugiere contaminación cruzada o mezcla de muestras.
+    # Dominant<->secondary divergence that forces 'needs review'. Below
+    # the threshold (~conspecific variation: another individual of the same
+    # species, heteroplasmia, alleles) the mixture is informative; above it
+    # (heterospecific level) it suggests cross-contamination or sample mixing.
     _resolve_divrev = float(resolve_cfg.get("divergence_review", 0.03))
 
     def consensus(indict, perc_thresh, abs_thresh):
@@ -1012,10 +1015,10 @@ def _runconsensusparts_fn(inlist):
         return ''.join(sequence)
 
     def _seq_divergence(a, b):
-        """Fracción de divergencia entre dos consensos (sin gaps): distancia de
-        edición global / longitud del mayor. Robusta a longitudes distintas.
-        Los códigos IUPAC (incl. N) cuentan como coincidencia — los Ns son
-        incertidumbre del consenso, no divergencia biológica."""
+        """Divergence fraction between two consensuses (gap-free): global edit
+        distance / length of the longer one. Robust to differing lengths.
+        IUPAC codes (incl. N) count as a match — Ns are consensus
+        uncertainty, not biological divergence."""
         a = a.replace("-", "").upper()
         b = b.replace("-", "").upper()
         if not a or not b:
@@ -1071,19 +1074,20 @@ def _runconsensusparts_fn(inlist):
                 corframe = i + 1
         return corframe
 
-    # Cobertura mínima del ORF limpio respecto al amplicón para aceptar el barcode
-    # tras recortar el codón de paro terminal del gen. ≥0.95 conserva COI intacto
-    # (sin paro interno → no se recorta) y CytB de longitud completa (paro a ~97%),
-    # y sigue descartando NUMTs/pseudogenes (paros dispersos tempranos → ORF corto).
+    # Minimum coverage of the clean ORF relative to the amplicon for the barcode to
+    # be accepted after trimming the gene's terminal stop codon. >=0.95 keeps COI intact
+    # (no internal stop -> not trimmed) and full-length CytB (stop at ~97%),
+    # while still rejecting NUMTs/pseudogenes (scattered early stops -> short ORF).
     ORF_MIN_COVERAGE = 0.95
 
     def orf_trim(seq, gencode):
-        """Devuelve (seq_recortada, n_aa): el ORF en marco más largo SIN codones de
-        paro internos. Si la secuencia ya traduce sin paro interno (fragmento Folmer
-        de COI) se devuelve intacta. Si contiene un paro interno seguido de cola 3'
-        no codificante (p. ej. un amplicón que abarca el codón de terminación del gen
-        y arrastra parte del tRNA siguiente, como CytB completo) se recorta el paro y
-        todo lo 3' de él, dejando un barcode que traduce limpio y es válido para BOLD."""
+        """Returns (trimmed_seq, n_aa): the longest in-frame ORF WITHOUT internal
+        stop codons. If the sequence already translates without an internal stop
+        (COI Folmer fragment) it is returned intact. If it contains an internal stop
+        followed by a non-coding 3' tail (e.g. an amplicon that spans the gene's
+        termination codon and carries part of the following tRNA, like full-length
+        CytB) the stop and everything 3' of it is trimmed off, leaving a barcode
+        that translates cleanly and is valid for BOLD."""
         s = seq.replace("-", "")
         if not s:
             return "", 0
@@ -1096,11 +1100,11 @@ def _runconsensusparts_fn(inlist):
             aa = Seq(fs).translate(table=gencode, to_stop=True).__str__()
             if len(aa) > best_aa:
                 best_aa, best_fs = len(aa), fs
-        # Sin paro interno (a lo sumo un codón parcial al final): no recortar, para
-        # preservar la longitud convencional del barcode (p. ej. COI 658 bp).
+        # No internal stop (at most one partial codon at the end): don't trim, to
+        # preserve the conventional barcode length (e.g. COI 658 bp).
         if best_aa * 3 >= len(s) - 2:
             return s, best_aa
-        # Paro interno + cola: recortar al ORF limpio (quita el paro y el extremo 3').
+        # Internal stop + tail: trim to the clean ORF (removes the stop and the 3' end).
         return best_fs[:best_aa * 3], best_aa
 
     def parse_aln_fasta(path):
@@ -1127,7 +1131,7 @@ def _runconsensusparts_fn(inlist):
 
     def callconsensus(i, perc_thresh, abs_thresh, name, _seqdict=None):
         seqdict = _seqdict if _seqdict is not None else parse_aln_fasta(i)
-        # Código genético de ESTA muestra (vert=2 / invert=5 / 0=no-Coding...).
+        # Genetic code for THIS sample (vert=2 / invert=5 / 0=no-Coding...).
         _gc = gencode_for(name)
         conseq_aln = consensus(seqdict, perc_thresh, abs_thresh)
         conseq = conseq_aln.replace("-", "")
@@ -1136,39 +1140,41 @@ def _runconsensusparts_fn(inlist):
         if conseq:
             coverage = len(seqdict)
 
-            # --- Resolución de mezcla / contaminación (marca-agnóstica) ---
-            # Si la muestra tiene dos haplotipos co-abundantes, se sustituye el
-            # consenso por el del haplotipo DOMINANTE (evita que "voltee" con los
-            # parámetros). Desempate: en Coding se prefiere el haplotipo que traduce
-            # limpio (descarta numts/pseudogenes); en no-Coding se usa el dominante.
+            # --- Mixture / contamination resolution (marker-agnostic) ---
+            # If the sample has two co-abundant haplotypes, the consensus is
+            # replaced with that of the DOMINANT haplotype (prevents it from
+            # "flipping" with the parameters). Tie-break: in Coding markers the
+            # haplotype that translates cleanly is preferred (discards numts/
+            # pseudogenes); in non-Coding markers the dominant one is used.
             if _resolve_on:
                 _r = _dominant_haplotype(list(seqdict.values()),
                                          _resolve_minor, _resolve_secfrac,
                                          _resolve_tol)
                 if _r["mixed"] and _r["clusters"]:
                     cl = _r["clusters"]
-                    # Longitud (sin gaps) y nº de ambigüedades (Ns) por cluster.
+                    # Length (gap-free) and number of ambiguities (Ns) per cluster.
                     for c in cl:
                         _seq = c["consensus"].replace("-", "")
                         c["len"] = len(_seq)
                         c["nN"] = _seq.count("N")
-                    # Selección con rigor de barcoding: la ABUNDANCIA es una señal
-                    # débil (PCR/secuenciación sobre-amplifican el template
-                    # equivocado), así que prima la calidad/validez del consenso.
-                    #   Coding: TRADUCE LIMPIO → MENOS Ns → LONGITUD más cercana a
-                    #            plen → ABUNDANCIA.
-                    #   no-Coding:  MENOS Ns → ABUNDANCIA (la aceptación no-Coding es por
-                    #            ausencia de Ns; la longitud puede variar).
-                    # Así, una variante minoritaria que traduce, limpia (0 Ns) y de
-                    # longitud canónica le gana a un dominante con Ns o de longitud
-                    # incorrecta (numt / contaminante / parálogo).
+                    # Selection with barcoding rigor: ABUNDANCE is a weak signal
+                    # (PCR/sequencing can over-amplify the wrong template),
+                    # so consensus quality/validity takes priority.
+                    #   Coding: TRANSLATES CLEANLY -> FEWER Ns -> LENGTH closer to
+                    #            plen -> ABUNDANCE.
+                    #   non-Coding: FEWER Ns -> ABUNDANCE (non-Coding acceptance is by
+                    #            absence of Ns; length may vary).
+                    # This way, a minority variant that translates, is clean (0 Ns) and
+                    # of canonical length beats a dominant one with Ns or incorrect
+                    # length (numt / contaminant / paralog).
                     if _gc != 0:
                         for c in cl:
-                            # "Traduce" = traduce limpio TRAS recortar el codón de paro
-                            # terminal del gen + cola 3' (mismo criterio que el QC
-                            # principal). Así un haplotipo real con paro terminal (p. ej.
-                            # CytB completo) se reconoce como válido y se distingue de un
-                            # NUMT/parálogo (paros tempranos → ORF corto → no traduce).
+                            # "Translates" = translates cleanly AFTER trimming the
+                            # gene's terminal stop codon + 3' tail (same criterion as
+                            # the main QC). This way a real haplotype with a terminal
+                            # stop (e.g. full-length CytB) is recognized as valid and
+                            # is distinguished from a NUMT/paralog (early stops -> short
+                            # ORF -> doesn't translate).
                             _cs = c["consensus"].replace("-", "")
                             _orf_c, _aa_c = orf_trim(_cs, _gc)
                             c["translates"] = bool(_cs) and (
@@ -1185,31 +1191,31 @@ def _runconsensusparts_fn(inlist):
                         chosen_idx = min(
                             range(len(cl)),
                             key=lambda i: (cl[i]["nN"], -cl[i]["size"]))
-                    # 'needs review': el elegido NO es el más abundante (cl[0]) — se
-                    # priorizó calidad sobre abundancia — o varios clusters pasan el
-                    # QC de barcode (traduce + longitud dentro de ventana + 0 Ns):
-                    # posibles variantes alélicas reales que conviene inspeccionar.
+                    # 'needs review': the chosen one is NOT the most abundant (cl[0])
+                    # — quality was prioritized over abundance — or several clusters
+                    # pass barcode QC (translates + length within window + 0 Ns):
+                    # possible real allelic variants worth inspecting.
                     def _passes_qc(c):
                         if c.get("nN", 0) > 0:
                             return False
                         if _gc == 0:
-                            # no-Coding: aceptación por 0 Ns; la longitud puede variar
-                            # entre especies (ITS, etc.), no se exige len≈plen.
+                            # non-Coding: accepted by 0 Ns; length may vary
+                            # between species (ITS, etc.), len~=plen is not required.
                             return True
                         return (c.get("translates")
                                 and abs(c["len"] - plen) <= postdemlen)
                     _n_pass = sum(1 for c in cl if _passes_qc(c))
                     needs_review = (chosen_idx != 0) or (_n_pass > 1)
-                    # Reasignar roles: el elegido es 'dominant', el resto 'secondary'.
+                    # Reassign roles: the chosen one is 'dominant', the rest 'secondary'.
                     for i, c in enumerate(cl):
                         c["role"] = "dominant" if i == chosen_idx else "secondary"
                     conseq_aln = cl[chosen_idx]["consensus"]
                     conseq = conseq_aln.replace("-", "")
-                    # Divergencia de cada cluster respecto al dominante elegido:
-                    # el discriminador clave en placas con muchas muestras
-                    # coespecíficas. <~2% ≈ otro individuo de la misma especie /
-                    # heteroplasmia (inocuo); nivel heteroespecífico sugiere
-                    # contaminación o mezcla de muestras.
+                    # Divergence of each cluster relative to the chosen dominant one:
+                    # the key discriminator on plates with many conspecific
+                    # samples. <~2% ~= another individual of the same species /
+                    # heteroplasmia (harmless); heterospecific level suggests
+                    # contamination or sample mixing.
                     _dom_seq = cl[chosen_idx]["consensus"].replace("-", "")
                     for i, c in enumerate(cl):
                         c["divergence"] = (0.0 if i == chosen_idx else
@@ -1237,7 +1243,7 @@ def _runconsensusparts_fn(inlist):
                         "n_pass_qc": _n_pass,
                         "max_divergence": _max_div,
                         "review_divergence": _div_review,
-                        # back-compat: 'secondary' = top secundario (cadena).
+                        # back-compat: 'secondary' = top secondary (string).
                         "secondary": (_secs[0]["seq"] if _secs else ""),
                         "secondaries": _secs,
                         "clusters": [{"rank": c["rank"], "size": c["size"],
@@ -1247,11 +1253,11 @@ def _runconsensusparts_fn(inlist):
                                       "role": c["role"]} for c in cl],
                     }
 
-                    # ── Guardar reads de los clusters secundarios elegibles ──
-                    # para la recuperación posterior (re-consenso 2a + Fase 3).
-                    # Elegibles = secundarios con < _resolve_maxn Ns en su consenso;
-                    # se guardan los _resolve_maxvar más abundantes y se registra
-                    # cuántos quedaron fuera (para avisar al usuario).
+                    # ── Save reads of the eligible secondary clusters ──
+                    # for later recovery (2a-consensus + Phase 3).
+                    # Eligible = secondaries with < _resolve_maxn Ns in their consensus;
+                    # the _resolve_maxvar most abundant ones are saved, and the number
+                    # left out is recorded (to notify the user).
                     if _resolve_recover:
                         _skey = name.split("_all.fa")[0]
                         _secs_cl = [c for i, c in enumerate(cl) if i != chosen_idx]
@@ -1278,25 +1284,25 @@ def _runconsensusparts_fn(inlist):
                             mix["n_variants_extra"] = 0
 
             if _gc == 0:
-                # Modo Marcador no-Coding: la aceptación es por AUSENCIA DE Ns; la
-                # longitud del consenso puede variar entre especies (p. ej. ITS),
-                # por eso NO se exige len==plen aquí (la GUI acepta por 0 Ns).
+                # non-Coding marker mode: acceptance is by ABSENCE OF Ns; the
+                # consensus length may vary between species (e.g. ITS),
+                # so len==plen is NOT required here (the GUI accepts by 0 Ns).
                 transcheck = "non-Coding"
                 if conseq.count("N") == 0:
                     if len(conseq) == plen:
                         flag = True
                     if mix is not None:
-                        # Mezcla resuelta explícitamente al haplotipo dominante.
+                        # Mixture explicitly resolved to the dominant haplotype.
                         transcheck = "non-Coding-mixed"
             else:
-                # Marcador codificante. Se valida que el consenso COMPLETO mida plen
-                # (± qclentol; 0 = longitud exacta, comportamiento clásico) y no
-                # tenga Ns; luego se recorta al ORF limpio (elimina el codón de paro
-                # del gen + cola 3' no codificante) y se exige que ese ORF cubra
-                # ≥ORF_MIN_COVERAGE del propio consenso. El barcode de salida es el
-                # ORF recortado, que traduce sin paro (válido BOLD). La traducción
-                # sigue siendo obligatoria: una desviación de longitud por indel de
-                # error produce frameshift y NO pasa.
+                # Coding marker. Validates that the FULL consensus is plen long
+                # (± qclentol; 0 = exact length, classic behavior) and has no
+                # Ns; it is then trimmed to the clean ORF (removes the gene's
+                # stop codon + non-coding 3' tail) and that ORF is required to
+                # cover >=ORF_MIN_COVERAGE of the consensus itself. The output
+                # barcode is the trimmed ORF, which translates without a stop
+                # (BOLD-valid). Translation remains mandatory: a length deviation
+                # caused by an indel ERROR produces a frameshift and does NOT pass.
                 if abs(len(conseq) - plen) <= qclentol and conseq.count("N") == 0:
                     _orf, _aalen = orf_trim(conseq, _gc)
                     if _aalen * 3 >= len(conseq) * ORF_MIN_COVERAGE:
@@ -1313,13 +1319,13 @@ def _runconsensusparts_fn(inlist):
         return transcheck, conseq, flag, coverage, mix
 
     def subset_bylength(infile, outfile, n, plen, windowlen):
-        """Selecciona las n reads más cercanas a plen. Además examina la
-        distribución de longitudes de TODAS las reads de la muestra (antes del
-        filtro de ventana): una segunda moda separada ≥30 bp con ≥20% de las
-        reads sugiere una mezcla de productos de distinta longitud (posible
-        contaminación heteroespecífica) que el submuestreo por cercanía a plen
-        ocultaría al resolutor de haplotipos. Devuelve (n_reads_total, lenwarn)
-        con lenwarn = None o (moda1_bp, moda2_bp, fraccion_moda2)."""
+        """Selects the n reads closest to plen. Also examines the length
+        distribution of ALL reads in the sample (before the window filter):
+        a second mode separated by >=30 bp with >=20% of the reads suggests
+        a mixture of products of different length (possible heterospecific
+        contamination) that subsampling by closeness to plen would hide from
+        the haplotype resolver. Returns (n_reads_total, lenwarn) with
+        lenwarn = None or (mode1_bp, mode2_bp, mode2_fraction)."""
         samplesize = 0
         entries = []
         len_hist = {}
@@ -1369,11 +1375,11 @@ def _runconsensusparts_fn(inlist):
             l = parfile.readlines()
             parstring = l[0].strip() if l else ''
     except (FileNotFoundError, OSError):
-        pass  # parstring queda '', subprocess fallará y será capturado por el try-except interno
+        pass  # parstring stays '', subprocess will fail and be caught by the inner try-except
 
-    # En contexto de pool paralelo cada worker usa 1 hilo de disttbfast.
-    # La paralelización la gestiona el Pool; multiplicar hilos internos
-    # de disttbfast por el número de workers satura la CPU.
+    # In the parallel-pool context, each worker uses 1 disttbfast thread.
+    # The Pool handles the parallelization; multiplying disttbfast's internal
+    # threads by the number of workers would saturate the CPU.
     parstring = re.sub(r'-C\s+\d+-\d+', '-C 1-1', parstring)
 
     for c, name in enumerate(inlist1):
@@ -1418,9 +1424,9 @@ def _runconsensusparts_fn(inlist):
                 if cov != "NA":
                     coverages[name.split("_all.fa")[0]] = cov
             elif mixeach is not None:
-                # Mezcla resuelta al haplotipo dominante: NO se corre el fallback
-                # de umbrales (re-derivaría sobre el set completo y reintroduciría
-                # la mezcla). El bloque final almacena el consenso dominante.
+                # Mixture resolved to the dominant haplotype: do NOT run the
+                # threshold fallback (it would re-derive over the full set and
+                # reintroduce the mixture). The final block stores the dominant consensus.
                 pass
             else:
                 seqs_for_col = list(_sd.values())
@@ -1454,7 +1460,7 @@ def _runconsensusparts_fn(inlist):
                                     if abs(len(conseq2) - plen) <= qclentol and conseq2.count("N") == 0:
                                         _orf2, _aal2 = orf_trim(conseq2, gencode_for(name))
                                         if _aal2 * 3 >= len(conseq2) * ORF_MIN_COVERAGE:
-                                            conseq2 = _orf2   # barcode = ORF recortado
+                                            conseq2 = _orf2   # barcode = trimmed ORF
                                             flag2 = True
                                 if flag2 and conseq2 not in otherconseqs:
                                     otherconseqs.append(conseq2)
@@ -1480,7 +1486,7 @@ def _runconsensusparts_fn(inlist):
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as _exc:
             _key = name.split("_all.fa")[0]
             import sys as _sys
-            print(f"[ONTbarcoder DEBUG] fase 2a — barcode {_key} falló: "
+            print(f"[ONTbarcoder DEBUG] phase 2a — barcode {_key} failed: "
                   f"{type(_exc).__name__}: {_exc}", file=_sys.stderr)
             transcheck[_key] = "NA"
             conseqs[_key] = ""
@@ -1494,15 +1500,15 @@ def _runconsensusparts_fn(inlist):
 
 def _runtoptwenty_worker(args):
     """
-    Worker para runtoptwenty con ordenamiento determinístico.
-    Resuelve empates por nombre cuando las distancias son iguales.
+    Worker for runtoptwenty with deterministic ordering.
+    Resolves ties by name when distances are equal.
     """
     i, each, seq_info, refseqdict, outpath = args
 
-    # El orden de iteración no afecta el resultado: 'dists' es un dict y más abajo
-    # se re-ordena de forma determinista con sorted() + resolve_ties_by_name().
-    # Por eso se itera refseqdict directamente, sin ordenar las claves (lo que
-    # ahorra un sort O(R log R) por cada secuencia query).
+    # Iteration order does not affect the result: 'dists' is a dict and below
+    # it is deterministically re-sorted with sorted() + resolve_ties_by_name().
+    # That's why refseqdict is iterated directly, without sorting the keys (which
+    # saves an O(R log R) sort per query sequence).
     ambiguity_codes = AMBIGUITY_CODES
     dists = {}
 
@@ -1514,7 +1520,7 @@ def _runtoptwenty_worker(args):
     
     sorted_d = sorted(dists.items(), key=lambda x: x[1])
     
-    # --- PATCH DETERMINISTA: resolver empates por nombre ---
+    # --- DETERMINISTIC PATCH: resolve ties by name ---
     sorted_d = resolve_ties_by_name(sorted_d)
     
     outfile_path = os.path.join(outpath, seq_info[0].split(";")[0])
@@ -1539,7 +1545,7 @@ def _runtoptwenty_worker(args):
             handle.write(stdout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as _exc:
         import sys as _sys
-        print(f"[ONTbarcoder DEBUG] fase 3 — {os.path.basename(outfile_path)} falló: "
+        print(f"[ONTbarcoder DEBUG] phase 3 — {os.path.basename(outfile_path)} failed: "
               f"{type(_exc).__name__}: {_exc}", file=_sys.stderr)
         try:
             open(outfile_path + "_aln.fa", 'wb').close()
@@ -1550,18 +1556,18 @@ def _runtoptwenty_worker(args):
 
 
 def _runconsensusparts_indexed(args):
-    """Wrapper para runconsensusparts con índice."""
+    """Wrapper for runconsensusparts with an index."""
     idx, job = args
     return idx, _runconsensusparts_fn(job)
 
 
 def rundemultiplex(inlist):
     """
-    Función worker para demultiplexado.
-    Modificada: ordena la lista de entrada y todas las iteraciones sobre diccionarios
-    para garantizar resultados idénticos en cada ejecución.
+    Worker function for demultiplexing.
+    Modified: sorts the input list and all dictionary iterations
+    to guarantee identical results on every run.
     """
-    # --- 1. Ordenar lista de archivos de entrada (determinista) ---
+    # --- 1. Sort the input file list (deterministic) ---
     inlist1 = inlist[0]
     inlist1 = deterministic_sort(inlist1)
     
@@ -1577,16 +1583,16 @@ def rundemultiplex(inlist):
     maxid = inlist[10]
     maxv = inlist[11]
     typelist = inlist[12]
-    # Máx. distancia de edición tolerada al localizar un primer (forward/reverse)
-    # dentro de la ventana de búsqueda. Antes estaba fijado a 10; ahora viene de la
-    # GUI ("Primer mismatches allowed"). Fallback 10 por retrocompatibilidad.
+    # Max. edit distance tolerated when locating a primer (forward/reverse)
+    # within the search window. Used to be hardcoded to 10; now comes from the
+    # GUI ("Primer mismatches allowed"). Falls back to 10 for backward compatibility.
     primermm = inlist[13] if len(inlist) > 13 else 10
 
-    # --- 2. Definición de findmatch_m2 con iteración ordenada ---
+    # --- 2. Definition of findmatch_m2 with ordered iteration ---
     def findmatch_m2(taglist, muttags_fr, indict, seqdict, sampledict, typedict, num_row):
         buffer = defaultdict(list)
         n_match = 0
-        # Ordenar las claves del diccionario 'indict' para recorrido determinista
+        # Sort the 'indict' dictionary's keys for deterministic traversal
         for each in sorted(indict.keys()):
             try:
                 idcomb = (taglist[indict[each][0]], taglist[indict[each][1]])
@@ -1599,12 +1605,12 @@ def rundemultiplex(inlist):
             except KeyError:
                 pass
         out_dir = os.path.join(outpath, str(num_row))
-        # Escribir las muestras en orden alfabético para mayor determinismo
+        # Write samples in alphabetical order for stronger determinism
         for sample in sorted(buffer.keys()):
             with open(os.path.join(out_dir, sample + "_all.fa"), 'a') as fh:
                 fh.writelines(buffer[sample])
 
-    # --- 3. Funciones auxiliares internas (sin cambios) ---
+    # --- 3. Internal helper functions (unchanged) ---
     def readprimertagfasta(filef, filer):
         indict2, indict1, indict = {}, {}, {}
         with open(filef) as infile1:
@@ -1644,7 +1650,7 @@ def rundemultiplex(inlist):
                 del indict[each]
         findmatch_m2(tagdict, muttags_fr, indict, seqdict, sampledict, typedict, num_row)
 
-    # --- 4. Cálculo de nseqs (sin cambios) ---
+    # --- 4. nseqs calculation (unchanged) ---
     labeltext = ""
     c = 0
     nseqs = 0
@@ -1658,24 +1664,24 @@ def rundemultiplex(inlist):
     for each in typelist:
         typedict2[each[0]] = each[1]
 
-    # --- 5. Bucle principal sobre cada archivo parcial ---
+    # --- 5. Main loop over each partial file ---
     for infile in inlist1:
         ambiguity_codes = AMBIGUITY_CODES
         inputseqs = builddict_sequences(os.path.join(outpath, infile))
 
-        # --- 5a. Ordenar las claves del diccionario de secuencias (determinista) ---
+        # --- 5a. Sort the sequence dictionary's keys (deterministic) ---
         sorted_seq_keys = sorted(inputseqs.keys())
 
         with open(os.path.join(outpath, infile + "_all_glsearch1.parsed.lencutoff5parsed_f"), 'w') as tagfoutfile:
             with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5parsed_r", 'w') as tagroutfile:
                 with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5endr", 'w') as fprimercleanfile:
-                    # Pre-computar reverse complements de todos los primers reverse (una sola vez)
+                    # Pre-compute reverse complements of all reverse primers (once)
                     primerrset_rc = [revcomp(pr) for pr in primerrset]
 
-                    # Best-match por lectura: para cada secuencia probar todas las
-                    # combinaciones (pf × pr) y conservar la de menor distancia total.
-                    # Garantiza que cada lectura se escribe exactamente una vez,
-                    # evitando duplicados cuando hay múltiples primers en el cocktail.
+                    # Best match per read: for each sequence, try every
+                    # (pf x pr) combination and keep the one with the lowest total distance.
+                    # Guarantees each read is written exactly once,
+                    # avoiding duplicates when the cocktail has multiple primers.
                     for n, inseq in enumerate(sorted_seq_keys):
                         c += 1
                         if n % 1000 == 0:
@@ -1687,7 +1693,7 @@ def rundemultiplex(inlist):
                         best_tag_f  = None
                         best_tag_r  = None
                         best_clean  = None
-                        compseq     = None  # se calcula una sola vez por lectura si hace falta
+                        compseq     = None  # computed once per read, only if needed
 
                         for pf in primerfset:
                             k1 = edlib.align(pf, inputseqs[inseq][:typedict2[infile]], mode='HW', task='locations', additionalEqualities=ambiguity_codes)
@@ -1739,13 +1745,13 @@ def rundemultiplex(inlist):
                                     # only extract when a full taglen window is
                                     # available, otherwise the slice wraps around.
                                     _rt = startpoint + loc[1] + 1
-                                    # Inicio del segmento limpio (todo lo previo al primer
-                                    # reverse). En reads más cortos que la ventana de
-                                    # búsqueda startpoint es negativo y clean_end puede
-                                    # quedar < 0 aunque _rt sea válido (loc[0] <= loc[1]);
-                                    # entonces revseq[:clean_end] recortaría desde el final
-                                    # dando una secuencia limpia errónea, así que se exige
-                                    # clean_end >= 0 para aceptar el candidato.
+                                    # Start of the clean segment (everything before the reverse
+                                    # primer). On reads shorter than the search window,
+                                    # startpoint is negative and clean_end can end up
+                                    # < 0 even when _rt is valid (loc[0] <= loc[1]);
+                                    # in that case revseq[:clean_end] would trim from the end,
+                                    # yielding a wrong clean sequence, so clean_end >= 0
+                                    # is required to accept the candidate.
                                     clean_end = startpoint + loc[0]
                                     tag_r = (revcomp(revseq[_rt:_rt+taglen])
                                              if (0 <= _rt and _rt + taglen <= len(revseq)
@@ -1766,25 +1772,25 @@ def rundemultiplex(inlist):
                             if best_dist == 0:
                                 break
 
-                        # Escribir solo si se encontró la combinación óptima completa
+                        # Only write if the full optimal combination was found
                         if best_tag_f is not None:
                             tagfoutfile.write(">" + inseq + '\n' + best_tag_f + '\n')
                             tagroutfile.write(">" + inseq + '\n' + best_tag_r + '\n')
                             fprimercleanfile.write(">" + inseq + '\n' + best_clean + '\n')
 
-        # --- 5b. Segundo pase: demultiplexfunc con entrada ordenada ---
+        # --- 5b. Second pass: demultiplexfunc with sorted input ---
         inputseqs2 = builddict_sequences(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5endr")
         demultiplexfunc(outpath + "/" + infile + "_all_glsearch1.parsed.lencutoff5parsed_f",
                        outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5parsed_r",
                        inputseqs2, tagdict, muttags_fr, sampledict, typedict, num_row)
 
-    # --- 6. Notificar fin del procesamiento de este lote ---
+    # --- 6. Notify completion of this batch ---
     if _queue_for_progress:
         _queue_for_progress.put((num_row, nseqs, labeltext))
 
 
 # ============================================================
-# CLASE: runconsensusparts (QThread)
+# CLASS: runconsensusparts (QThread)
 # ============================================================
 
 class runconsensusparts(QtCore.QThread):
@@ -1808,7 +1814,7 @@ class runconsensusparts(QtCore.QThread):
         outpath = inlist[1]
         indir = inlist[2]
 
-        # --- PATCH DETERMINISTA: ordenar lista de archivos ---
+        # --- DETERMINISTIC PATCH: sort file list ---
         inlist1_sorted = deterministic_sort(inlist1)
         
         _resolve = inlist[15] if len(inlist) > 15 else {}
@@ -1851,7 +1857,7 @@ class runconsensusparts(QtCore.QThread):
                         completed += 1
                         self.notifyProgress.emit(completed)
             except Exception:
-                # Pool falló (exe compilado sin consola, worker crash, etc.) → modo serie
+                # Pool failed (console-less compiled exe, worker crash, etc.) -> serial mode
                 _use_serial = True
                 self.transcheck = {}
                 self.conseqs = {}
@@ -2052,13 +2058,13 @@ class MSAcheck(QtCore.QThread):
 
         ngoodbarcodes = 0
         
-        # --- PATCH DETERMINISTA: ordenar listas para iteración ---
+        # --- DETERMINISTIC PATCH: sort lists for iteration ---
         tocorlist_sorted = deterministic_sort(self.tocorlist) if self.tocorlist else []
-        
+
         with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.prefix + "_predgood_barcodes.fa"), 'w') as gfile:
             with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile), 'a') as bfile:
                 if self.ngood >= 3:
-                    # Ordenar claves del diccionario seqdict
+                    # Sort the seqdict dictionary's keys
                     seqdict_keys = deterministic_sort(list(seqdict.keys()))
                     
                     for n, each in enumerate(seqdict_keys):
@@ -2129,12 +2135,12 @@ class MSAcheck(QtCore.QThread):
                             except KeyError:
                                 pass
 
-                        # Desempate determinista: por distancia, luego por la
-                        # secuencia y el id. Sin esto, las lecturas que empatan en
-                        # distancia justo en el límite de truncado (n90subset) se
-                        # seleccionaban según el orden del archivo demultiplexado,
-                        # que depende del número de hilos -> el conteo de barcodes
-                        # 2b variaba con N_THREADS. (Fase 3 ya usa resolve_ties_by_name.)
+                        # Deterministic tie-break: by distance, then by the
+                        # sequence and the id. Without this, reads tied in
+                        # distance right at the truncation cutoff (n90subset) were
+                        # selected based on the demultiplexed file's order,
+                        # which depends on the number of threads -> the 2b barcode
+                        # count varied with N_THREADS. (Phase 3 already uses resolve_ties_by_name.)
                         sorted_d = sorted(ddict.items(),
                                           key=lambda x: (x[1], seqdict[x[0]], x[0]))
                         outfile2.write(f + '\t' + str(len(sorted_d)) + '\n')

@@ -255,16 +255,16 @@ class BlastPanel(QtWidgets.QWidget):
         self.installEventFilter(self)
     
     def eventFilter(self, obj, event):
-        """Detectar cuando el panel cambia de tamaño para ajustar el log."""
+        """Detect when the panel is resized to adjust the log height."""
         if obj == self and event.type() == QtCore.QEvent.Resize:
             self._adjust_log_height()
         return super().eventFilter(obj, event)
-    
+
     def _adjust_log_height(self):
-        """Ajustar la altura del log al 30% del panel."""
+        """Set the log height to 30% of the panel."""
         if self._log.isVisible():
-            target_height = int(self.height() * 0.3)  # 30% del panel
-            # Respetar altura mínima
+            target_height = int(self.height() * 0.3)  # 30% of the panel
+            # Enforce minimum height
             target_height = max(target_height, 200)
             self._log.setFixedHeight(target_height)
     
@@ -1394,8 +1394,8 @@ class _BlastWorker(QtCore.QThread):
                 )
                 self._interruptible_sleep(0.5)
         else:
-            # Sin la cabecera no tiene sentido lanzar las consultas BLAST (red):
-            # se produciría un TSV sin encabezado. Abortar limpiamente.
+            # Without the header there's no point issuing the BLAST queries (network):
+            # it would produce a TSV with no header. Abort cleanly.
             self.taskError.emit(
                 f"Could not write output file (locked/permission denied):\n{tsv_path}"
             )
