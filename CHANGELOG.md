@@ -15,6 +15,94 @@ repository):
 
 ---
 
+## [3.2b] — 2026-09
+
+Reliability release plus targeted analysis features. Default parameters
+reproduce 3.1b results exactly; the new behaviours are opt-in or advisory.
+
+### Added
+
+#### QC length tolerance for coding markers
+- New **"QC length tolerance ± (bp)"** parameter (Consensus tab, default `0` =
+  classic exact-length rule). Admits legitimate in-frame length variation
+  between taxa for coding markers such as rbcL or matK. Translation validation
+  still applies unchanged, so lengths shifted by sequencing errors
+  (frameshifts) are rejected regardless. Saved in parameter profiles, written
+  to `log.txt` and the HTML report; disabled in non-Coding mode.
+
+#### Intra-sample variant detection (contamination / sample-mix triage)
+- **Dominant↔secondary divergence** computed per haplotype cluster (edlib,
+  IUPAC-aware) and reported in the run log, in `secondary_variants.fa` /
+  `secondary_variants_recovered.fa` headers (`div=…%`) and in a new
+  **"Divergence vs dominant (%)"** column of the *Intra-sample variants*
+  sheet. Divergence ≥ 3 % (heterospecific level) now forces **NEEDS REVIEW**
+  with an explicit reason — conspecific-level mixes stay informational.
+- **Anti-hotspot guard:** a mixture is only declared with ≥ 2 linked
+  polymorphic columns and secondary clusters of ≥ 3 reads. Single-SNP
+  conspecific mixtures are ignored by design (indistinguishable from
+  heteroplasmy; same species identification either way).
+- New **"Identical to N other barcodes"** column: how many *other* samples
+  carry a final barcode identical to each secondary variant. With many
+  conspecific samples per run, a high count means a common haplotype of the
+  species; count = 1 combined with high divergence flags a cross-contamination
+  candidate.
+- **Bimodal read-length warning**, computed on *all* demultiplexed reads of a
+  sample **before** the by-length subsampling (which could hide a
+  different-length contaminant from the haplotype resolver): second length
+  mode ≥ 30 bp away holding ≥ 20 % of reads is logged 🟠 and listed in the
+  variants sheet.
+
+### Fixed
+
+#### Real-Time mode (data integrity)
+- **Stability gate for MinKNOW FASTQs and POD5s:** a file is only consumed
+  once its (size, mtime) is unchanged between two consecutive polls.
+  Previously a half-written file could be concatenated partially and marked
+  as known forever — silently losing every read written afterwards and
+  possibly corrupting the 4-line FASTQ frame of the accumulated file.
+- The accumulated FASTQ is always normalized to complete 4-line records
+  (both cycle concatenation and the finalize rebuild drop a truncated
+  trailing record with a warning).
+- **Dorado batches are no longer lost:** POD5s are marked as known only after
+  a successful launch; a failed batch (launch error or non-zero exit)
+  requeues its POD5s and discards the partial FASTQ, so reads are neither
+  lost nor duplicated.
+- No concatenation happens while a cycle may be reading the accumulated
+  FASTQ (torn-record race); the Dorado path defers with a retry.
+- A pending next cycle is triggered right after a cycle completes instead of
+  waiting for the next new file to arrive.
+- **Canceling RT finalization resumes monitoring** (poll timers restarted,
+  bookkeeping synced with the rebuilt accumulated file) instead of leaving a
+  silently dead session.
+- Demultiplexing worker failures are now reported prominently instead of
+  being swallowed.
+- `totalseqs` is no longer overwritten by `prepdemultiplex` in RT mode.
+
+#### Biological logic
+- **Sample names containing dots are no longer truncated** in the consensus
+  worker (`BC.01` kept its full identity; previously `X.1` and `X.2`
+  collided into one key, and per-sample genetic codes silently fell back to
+  the global code).
+- Per-sample genetic codes are validated against **existing NCBI tables**:
+  7, 8, 17–20, 32 and 0 are rejected at *Start analysis* with a clear
+  message instead of crashing inside Biopython per sample.
+- Coding QC ORF-coverage check now measures against the consensus's own
+  length (identical at tolerance 0; correct when the tolerance admits other
+  lengths).
+
+#### UI / reporting
+- "Please select a non-empty folder" message corrected to *empty*.
+- Folder-organization log now says `intermediate_files/` (the real folder).
+- Removed the duplicate Chart.js `<script>` include in the HTML report.
+- Progress log capped at 5 000 blocks so multi-day RT runs don't slow the
+  GUI (full log always in `log.txt`).
+- Floating-window / per-sample-chart buttons show "Hide…" while open.
+- Empty or invalid phase-2a coverage list is validated at *Start analysis*.
+- Non-Coding checkbox tooltip now states the actual acceptance criterion
+  (absence of ambiguous bases; length not enforced).
+
+---
+
 ## [3.1b] — 2026 · "base version"
 
 Full rewrite of the desktop application. The barcoding algorithm and its

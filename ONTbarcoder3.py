@@ -853,7 +853,7 @@ class AboutDialog(QtWidgets.QDialog):
 
         layout.addSpacing(4)
 
-        ver_lbl = make_label("Version 3.1b", size=16, color=TEXT_SEC)
+        ver_lbl = make_label("Version 3.2b", size=16, color=TEXT_SEC)
         ver_lbl.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(ver_lbl)
 
@@ -984,7 +984,7 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
-        badge = QtWidgets.QLabel("v3.1b")
+        badge = QtWidgets.QLabel("v3.2b")
         badge.setObjectName("topbar_badge")
 
         layout.addWidget(logo)
@@ -8635,7 +8635,7 @@ class MainWindow(QtWidgets.QMainWindow):
 </nav>
 
 <header class="hero">
-  <div class="hero-eyebrow">ONTbarcoder v3.1b · Analysis report</div>
+  <div class="hero-eyebrow">ONTbarcoder v3.2b · Analysis report</div>
   <h1>Run <span>{run_name}</span></h1>
   <div class="hero-meta">
     <span>📅 <strong>{ts_now}</strong></span>
@@ -8740,7 +8740,7 @@ class MainWindow(QtWidgets.QMainWindow):
         {samples_section}
 
 <footer>
-  <span>ONTbarcoder v3.1b — generated {ts_now}</span>
+  <span>ONTbarcoder v3.2b — generated {ts_now}</span>
   <span>{outpath}</span>
 </footer>
 
@@ -10816,7 +10816,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(STYLESHEET)
         app.setApplicationName("ONTbarcoder")
-        app.setApplicationVersion("3.1b")
+        app.setApplicationVersion("3.2b")
 
         icon = QtGui.QIcon()
         for icon_name in ("icon.ico",):
