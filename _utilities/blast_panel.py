@@ -370,11 +370,11 @@ class BlastPanel(QtWidgets.QWidget):
 
     def _open_output_folder(self):
         if self._last_outdir and os.path.isdir(self._last_outdir):
-            os.startfile(self._last_outdir)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_outdir))
 
     def _open_results_file(self):
         if self._last_tsv and os.path.isfile(self._last_tsv):
-            os.startfile(self._last_tsv)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_tsv))
 
     def _reset(self):
         self._drop.clear()

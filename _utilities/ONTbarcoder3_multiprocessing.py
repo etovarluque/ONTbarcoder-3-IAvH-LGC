@@ -108,7 +108,11 @@ def _get_base_dir():
 
 SCRIPT_DIR = _get_base_dir()
 parfilepath = os.path.join(SCRIPT_DIR, "_mafftfiles", "parfile")
-disttbpath  = os.path.join(SCRIPT_DIR, "_mafftfiles", "disttbfast.exe")
+# The bundled binary is "disttbfast.exe" on Windows and "disttbfast" (no
+# extension) on Linux — see build_linux.sh, which ships the Linux binary
+# under that name.
+_DISTTBFAST_NAME = "disttbfast.exe" if sys.platform == "win32" else "disttbfast"
+disttbpath  = os.path.join(SCRIPT_DIR, "_mafftfiles", _DISTTBFAST_NAME)
 MAFFT_DIR   = os.path.join(SCRIPT_DIR, "_mafftfiles")
 
 # Number of threads (can be overridden by the GUI)

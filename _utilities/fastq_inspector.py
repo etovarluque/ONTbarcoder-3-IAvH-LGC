@@ -1067,7 +1067,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
     def _on_pdf_clicked(self):
         if self._pdf_ready and self._last_pdf:
-            os.startfile(self._last_pdf)
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_pdf))
         else:
             self._export_pdf()
 

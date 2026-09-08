@@ -48,6 +48,13 @@ def _compute_ui_scale_factor() -> float:
     cannot be read we fall back to applying UI_SCALE verbatim."""
     if not UI_FIT_SCREEN:
         return UI_SCALE
+    # The screen-fit math below relies on the Windows-only ctypes.windll API.
+    # On Linux/macOS Qt's own High-DPI scaling already sizes fonts and widgets
+    # to the desktop; overriding QT_SCALE_FACTOR here would only shrink the whole
+    # UI (the 1280x920 design canvas fits any modern screen at 1.0). Return the
+    # design baseline so the caller skips the QT_SCALE_FACTOR override entirely.
+    if os.name != "nt":
+        return UI_MAX_SCALE
     try:
         import ctypes
         # Become DPI-aware so the pixel/size queries return physical values,
