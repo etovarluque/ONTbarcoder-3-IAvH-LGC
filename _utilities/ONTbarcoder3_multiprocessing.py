@@ -701,9 +701,9 @@ class calculatecoverage(QtCore.QThread):
                 for i, j in enumerate(l):
                     if ">" in j:
                         try:
-                            self.counter[fname.split("_all.fa")[0].split(".")[0]] += 1
+                            self.counter[fname.split("_all.fa")[0]] += 1
                         except KeyError:
-                            self.counter[fname.split("_all.fa")[0].split(".")[0]] = 1
+                            self.counter[fname.split("_all.fa")[0]] = 1
             self.notifyProgress.emit(c+1)
         
         self.taskFinished.emit(0)
@@ -817,7 +817,13 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
         if mf >= minor_thresh:
             poly_cols.append(j)
     n_poly = len(poly_cols)
-    if not poly_cols:
+    # Guarda anti-hotspot: una única columna diagnóstica no se puede fasear, así
+    # que un hotspot de error ONT reproducible (p. ej. junto a un homopolímero)
+    # podría fabricar un "cluster" con errores correlacionados en UN solo sitio.
+    # Se exigen ≥2 columnas polimórficas ligadas para declarar mezcla. Las
+    # mezclas coespecíficas de 1 SNP se ignoran a propósito: son indistinguibles
+    # de heteroplasmia/error y el haplotipo dominante identifica la misma especie.
+    if n_poly < 2:
         return _none
 
     # 2) Firma por read = bases en las columnas polimórficas. N/'-' = comodín:
@@ -872,10 +878,12 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
     # 4) Ordenar clusters por tamaño (desempate determinístico por consenso).
     cluster_members.sort(key=lambda m: (-len(m), ''.join(_consensus_columns(m, 0.5))))
 
-    # Clusters reales = fracción ≥ min_secondary_frac; el resto es ruido.
+    # Clusters reales = fracción ≥ min_secondary_frac Y tamaño absoluto ≥ 3
+    # reads (a cobertura baja, 2 reads compartiendo un error correlacionado no
+    # son evidencia suficiente de un haplotipo real); el resto es ruido.
     real, noise_reads = [], []
     for m in cluster_members:
-        if len(m) / n >= min_secondary_frac:
+        if len(m) / n >= min_secondary_frac and len(m) >= 3:
             real.append(m)
         else:
             noise_reads.extend(m)
@@ -944,11 +952,23 @@ def _runconsensusparts_fn(inlist):
     # mismo FASTQ): {sample_id: tabla_NCBI}. Las muestras sin entrada usan el código
     # global ``ingencode``. Backwards-compatible (len<=16 → dict vacío).
     gencode_by_sample = inlist[16] if len(inlist) > 16 else {}
+    # QC length tolerance (± bp) for coding markers: a consensus is length-
+    # eligible when |len(conseq) - plen| <= qclentol. 0 (default) reproduces the
+    # classic exact-length rule (right for COI, whose 658 bp are invariant).
+    # Translation validation applies unchanged afterwards, so an off-length
+    # consensus caused by an indel ERROR still fails (frameshift -> early stop ->
+    # short ORF); only legitimate in-frame length variants can pass.
+    # Backwards-compatible: absent (len<=17) -> 0.
+    try:
+        qclentol = int(inlist[17]) if len(inlist) > 17 else 0
+    except (TypeError, ValueError):
+        qclentol = 0
 
     def gencode_for(name):
         """Resuelve la tabla de traducción para una muestra a partir de su nombre
-        de archivo (``<sample>_all.fa``), con ``ingencode`` como respaldo."""
-        sid = name.split("_all.fa")[0].split(".")[0]
+        de archivo (``<sample>_all.fa``), con ``ingencode`` como respaldo.
+        La clave es el nombre COMPLETO de la muestra (puede contener puntos)."""
+        sid = name.split("_all.fa")[0]
         return gencode_by_sample.get(sid, ingencode)
 
     # Config de resolución de mezcla/contaminación (haplotipo dominante).
@@ -965,6 +985,11 @@ def _runconsensusparts_fn(inlist):
     _resolve_recover = bool(resolve_cfg.get("recover_secondaries", True))
     _resolve_maxvar = int(resolve_cfg.get("max_variants", 3))
     _resolve_maxn = int(resolve_cfg.get("max_variant_Ns", 5))
+    # Divergencia dominante↔secundaria que fuerza 'needs review'. Por debajo
+    # del umbral (~variación coespecífica: otro individuo de la misma especie,
+    # heteroplasmia, alelos) la mezcla es informativa; por encima (nivel
+    # heteroespecífico) sugiere contaminación cruzada o mezcla de muestras.
+    _resolve_divrev = float(resolve_cfg.get("divergence_review", 0.03))
 
     def consensus(indict, perc_thresh, abs_thresh):
         seqs = list(indict.values())
@@ -985,6 +1010,22 @@ def _runconsensusparts_fn(inlist):
                 bp = next(iter(baseset)) if len(baseset) == 1 else 'N'
             sequence.append(bp)
         return ''.join(sequence)
+
+    def _seq_divergence(a, b):
+        """Fracción de divergencia entre dos consensos (sin gaps): distancia de
+        edición global / longitud del mayor. Robusta a longitudes distintas.
+        Los códigos IUPAC (incl. N) cuentan como coincidencia — los Ns son
+        incertidumbre del consenso, no divergencia biológica."""
+        a = a.replace("-", "").upper()
+        b = b.replace("-", "").upper()
+        if not a or not b:
+            return 0.0
+        try:
+            d = edlib.align(a, b, mode="NW", task="distance",
+                            additionalEqualities=AMBIGUITY_CODES)["editDistance"]
+        except Exception:
+            d = sum(1 for x, y in zip(a, b) if x != y) + abs(len(a) - len(b))
+        return d / float(max(len(a), len(b)))
 
     def translate_corframe(seq, gencode):
         each = seq
@@ -1164,11 +1205,26 @@ def _runconsensusparts_fn(inlist):
                         c["role"] = "dominant" if i == chosen_idx else "secondary"
                     conseq_aln = cl[chosen_idx]["consensus"]
                     conseq = conseq_aln.replace("-", "")
+                    # Divergencia de cada cluster respecto al dominante elegido:
+                    # el discriminador clave en placas con muchas muestras
+                    # coespecíficas. <~2% ≈ otro individuo de la misma especie /
+                    # heteroplasmia (inocuo); nivel heteroespecífico sugiere
+                    # contaminación o mezcla de muestras.
+                    _dom_seq = cl[chosen_idx]["consensus"].replace("-", "")
+                    for i, c in enumerate(cl):
+                        c["divergence"] = (0.0 if i == chosen_idx else
+                                           _seq_divergence(_dom_seq,
+                                                           c["consensus"]))
+                    _max_div = max((c["divergence"] for c in cl), default=0.0)
+                    _div_review = _max_div >= _resolve_divrev
+                    needs_review = needs_review or _div_review
                     # Secundarios (todos los no elegidos) en orden de abundancia.
-                    _secs = [{"frac": c["frac"],
+                    _secs = [{"rank": c["rank"],
+                              "frac": c["frac"],
                               "size": c["size"],
                               "seq": c["consensus"].replace("-", ""),
-                              "translates": c["translates"]}
+                              "translates": c["translates"],
+                              "divergence": c["divergence"]}
                              for i, c in enumerate(cl) if i != chosen_idx]
                     mix = {
                         "frac": cl[chosen_idx]["frac"],
@@ -1179,12 +1235,15 @@ def _runconsensusparts_fn(inlist):
                         "needs_review": needs_review,
                         "chosen_by_abundance": (chosen_idx == 0),
                         "n_pass_qc": _n_pass,
+                        "max_divergence": _max_div,
+                        "review_divergence": _div_review,
                         # back-compat: 'secondary' = top secundario (cadena).
                         "secondary": (_secs[0]["seq"] if _secs else ""),
                         "secondaries": _secs,
                         "clusters": [{"rank": c["rank"], "size": c["size"],
                                       "frac": c["frac"], "len": c["len"],
                                       "nN": c["nN"], "translates": c["translates"],
+                                      "divergence": c["divergence"],
                                       "role": c["role"]} for c in cl],
                     }
 
@@ -1194,7 +1253,7 @@ def _runconsensusparts_fn(inlist):
                     # se guardan los _resolve_maxvar más abundantes y se registra
                     # cuántos quedaron fuera (para avisar al usuario).
                     if _resolve_recover:
-                        _skey = name.split("_all.fa")[0].split(".")[0]
+                        _skey = name.split("_all.fa")[0]
                         _secs_cl = [c for i, c in enumerate(cl) if i != chosen_idx]
                         _eligible = [c for c in _secs_cl if c["nN"] < _resolve_maxn]
                         _to_save = _eligible[:_resolve_maxvar]
@@ -1231,13 +1290,16 @@ def _runconsensusparts_fn(inlist):
                         transcheck = "non-Coding-mixed"
             else:
                 # Marcador codificante. Se valida que el consenso COMPLETO mida plen
-                # (producto correcto) y no tenga Ns; luego se recorta al ORF limpio
-                # (elimina el codón de paro del gen + cola 3' no codificante) y se
-                # exige que ese ORF cubra ≥ORF_MIN_COVERAGE del amplicón. El barcode
-                # de salida es el ORF recortado, que traduce sin paro (válido BOLD).
-                if len(conseq) == plen and conseq.count("N") == 0:
+                # (± qclentol; 0 = longitud exacta, comportamiento clásico) y no
+                # tenga Ns; luego se recorta al ORF limpio (elimina el codón de paro
+                # del gen + cola 3' no codificante) y se exige que ese ORF cubra
+                # ≥ORF_MIN_COVERAGE del propio consenso. El barcode de salida es el
+                # ORF recortado, que traduce sin paro (válido BOLD). La traducción
+                # sigue siendo obligatoria: una desviación de longitud por indel de
+                # error produce frameshift y NO pasa.
+                if abs(len(conseq) - plen) <= qclentol and conseq.count("N") == 0:
                     _orf, _aalen = orf_trim(conseq, _gc)
-                    if _aalen * 3 >= plen * ORF_MIN_COVERAGE:
+                    if _aalen * 3 >= len(conseq) * ORF_MIN_COVERAGE:
                         conseq = _orf
                         transcheck = "1"
                         flag = True
@@ -1251,8 +1313,16 @@ def _runconsensusparts_fn(inlist):
         return transcheck, conseq, flag, coverage, mix
 
     def subset_bylength(infile, outfile, n, plen, windowlen):
+        """Selecciona las n reads más cercanas a plen. Además examina la
+        distribución de longitudes de TODAS las reads de la muestra (antes del
+        filtro de ventana): una segunda moda separada ≥30 bp con ≥20% de las
+        reads sugiere una mezcla de productos de distinta longitud (posible
+        contaminación heteroespecífica) que el submuestreo por cercanía a plen
+        ocultaría al resolutor de haplotipos. Devuelve (n_reads_total, lenwarn)
+        con lenwarn = None o (moda1_bp, moda2_bp, fraccion_moda2)."""
         samplesize = 0
         entries = []
+        len_hist = {}
         current_header = None
         with open(infile) as fulldata:
             for line in fulldata:
@@ -1262,6 +1332,8 @@ def _runconsensusparts_fn(inlist):
                     samplesize += 1
                 elif current_header is not None:
                     seq = line
+                    _bin = len(seq) // 10
+                    len_hist[_bin] = len_hist.get(_bin, 0) + 1
                     dev = abs(plen - len(seq))
                     if dev <= windowlen:
                         seq_hash = hashlib.md5(seq.encode()).hexdigest()
@@ -1272,7 +1344,16 @@ def _runconsensusparts_fn(inlist):
         with open(outfile, 'w') as subsetdata:
             for k in range(ntosubset):
                 subsetdata.write(entries[k][1] + '\n' + entries[k][3] + '\n')
-        return samplesize
+        lenwarn = None
+        if samplesize >= 10 and len_hist:
+            b1 = max(len_hist, key=lambda b: (len_hist[b], -b))
+            far = {b: c for b, c in len_hist.items() if abs(b - b1) >= 3}
+            if far:
+                b2 = max(far, key=lambda b: (far[b], -b))
+                frac2 = far[b2] / float(samplesize)
+                if frac2 >= 0.2:
+                    lenwarn = (b1 * 10, b2 * 10, frac2)
+        return samplesize, lenwarn
 
     transcheck = {}
     conseqs = {}
@@ -1280,6 +1361,7 @@ def _runconsensusparts_fn(inlist):
     coverages = {}
     sampleids = {}
     mixinfo = {}
+    lenwarns = {}
     parstring = ''
 
     try:
@@ -1298,16 +1380,23 @@ def _runconsensusparts_fn(inlist):
         cov = "NA"
         try:
             if subsetval != 0:
+                _skey_sub = name.split("_all.fa")[0]
                 if v == 0:
-                    sampleids[name.split("_all.fa")[0].split(".")[0]] = subset_bylength(
+                    _ss, _lw = subset_bylength(
                         os.path.join(outpath, indir, name),
                         os.path.join(outpath, indir2, name),
                         subsetval, plen, postdemlen)
+                    sampleids[_skey_sub] = _ss
+                    if _lw:
+                        lenwarns[_skey_sub] = _lw
                 if v == 1:
-                    sampleids[name.split("_all.fa")[0].split(".")[0]] = subset_bylength(
+                    _ss, _lw = subset_bylength(
                         os.path.join(indir, name),
                         os.path.join(outpath, indir2, name),
                         subsetval, plen, postdemlen)
+                    sampleids[_skey_sub] = _ss
+                    if _lw:
+                        lenwarns[_skey_sub] = _lw
             cmd_args = [disttbpath] + parstring.split() + ['-i', os.path.join(outpath, indir2, name)]
 
             stdout = _run_disttbfast(cmd_args)
@@ -1319,15 +1408,15 @@ def _runconsensusparts_fn(inlist):
             _sd = parse_aln_fasta(aln_path)
             transcheckeach, conseq, flag, cov, mixeach = callconsensus(aln_path, fixthresh, 5, name, _seqdict=_sd)
             if mixeach is not None:
-                mixinfo[name.split("_all.fa")[0].split(".")[0]] = mixeach
+                mixinfo[name.split("_all.fa")[0]] = mixeach
             otherconseqs = []
 
             if flag:
-                transcheck[name.split("_all.fa")[0].split(".")[0]] = transcheckeach
-                conseqs[name.split("_all.fa")[0].split(".")[0]] = conseq
-                flags[name.split("_all.fa")[0].split(".")[0]] = flag
+                transcheck[name.split("_all.fa")[0]] = transcheckeach
+                conseqs[name.split("_all.fa")[0]] = conseq
+                flags[name.split("_all.fa")[0]] = flag
                 if cov != "NA":
-                    coverages[name.split("_all.fa")[0].split(".")[0]] = cov
+                    coverages[name.split("_all.fa")[0]] = cov
             elif mixeach is not None:
                 # Mezcla resuelta al haplotipo dominante: NO se corre el fallback
                 # de umbrales (re-derivaría sobre el set completo y reintroduciría
@@ -1362,9 +1451,9 @@ def _runconsensusparts_fn(inlist):
                                     flag2 = len(conseq2) == plen and conseq2.count("N") == 0
                                 else:
                                     flag2 = False
-                                    if len(conseq2) == plen and conseq2.count("N") == 0:
+                                    if abs(len(conseq2) - plen) <= qclentol and conseq2.count("N") == 0:
                                         _orf2, _aal2 = orf_trim(conseq2, gencode_for(name))
-                                        if _aal2 * 3 >= plen * ORF_MIN_COVERAGE:
+                                        if _aal2 * 3 >= len(conseq2) * ORF_MIN_COVERAGE:
                                             conseq2 = _orf2   # barcode = ORF recortado
                                             flag2 = True
                                 if flag2 and conseq2 not in otherconseqs:
@@ -1376,20 +1465,20 @@ def _runconsensusparts_fn(inlist):
                     _t = "non-Coding"
                 else:
                     _t = "1"
-                transcheck[name.split("_all.fa")[0].split(".")[0]] = _t
-                conseqs[name.split("_all.fa")[0].split(".")[0]] = otherconseqs[0]
-                flags[name.split("_all.fa")[0].split(".")[0]] = True
+                transcheck[name.split("_all.fa")[0]] = _t
+                conseqs[name.split("_all.fa")[0]] = otherconseqs[0]
+                flags[name.split("_all.fa")[0]] = True
                 if cov != "NA":
-                    coverages[name.split("_all.fa")[0].split(".")[0]] = cov
+                    coverages[name.split("_all.fa")[0]] = cov
             else:
-                transcheck[name.split("_all.fa")[0].split(".")[0]] = transcheckeach
-                conseqs[name.split("_all.fa")[0].split(".")[0]] = conseq
-                flags[name.split("_all.fa")[0].split(".")[0]] = flag
+                transcheck[name.split("_all.fa")[0]] = transcheckeach
+                conseqs[name.split("_all.fa")[0]] = conseq
+                flags[name.split("_all.fa")[0]] = flag
                 if cov != "NA":
-                    coverages[name.split("_all.fa")[0].split(".")[0]] = cov
+                    coverages[name.split("_all.fa")[0]] = cov
                     
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, Exception) as _exc:
-            _key = name.split("_all.fa")[0].split(".")[0]
+            _key = name.split("_all.fa")[0]
             import sys as _sys
             print(f"[ONTbarcoder DEBUG] fase 2a — barcode {_key} falló: "
                   f"{type(_exc).__name__}: {_exc}", file=_sys.stderr)
@@ -1399,7 +1488,7 @@ def _runconsensusparts_fn(inlist):
             if cov != 'NA':
                 coverages[_key] = "NA"
 
-    result = [transcheck, conseqs, flags, coverages, mixinfo]
+    result = [transcheck, conseqs, flags, coverages, mixinfo, lenwarns]
     return result
 
 
@@ -1711,6 +1800,7 @@ class runconsensusparts(QtCore.QThread):
         self.coverages = {}
         self.sampleids = {}
         self.mixinfo = {}
+        self.lenwarns = {}
 
     def run(self):
         inlist = self.inlist
@@ -1723,11 +1813,12 @@ class runconsensusparts(QtCore.QThread):
         
         _resolve = inlist[15] if len(inlist) > 15 else {}
         _gencode_by_sample = inlist[16] if len(inlist) > 16 else {}
+        _qclentol = inlist[17] if len(inlist) > 17 else 0
         jobs = [
             [[fname], inlist[1], inlist[2], inlist[3], inlist[4],
              inlist[5], inlist[6], inlist[7], inlist[8], inlist[9],
              inlist[10], inlist[11], inlist[12], inlist[13], inlist[14],
-             _resolve, _gencode_by_sample]
+             _resolve, _gencode_by_sample, _qclentol]
             for fname in inlist1_sorted
         ]
 
@@ -1747,8 +1838,10 @@ class runconsensusparts(QtCore.QThread):
                         self.coverages.update(res[3])
                         if len(res) > 4:
                             self.mixinfo.update(res[4])
+                        if len(res) > 5:
+                            self.lenwarns.update(res[5])
                         fname = inlist1_sorted[orig_i]
-                        key = fname.split('_all.fa')[0].split('.')[0]
+                        key = fname.split('_all.fa')[0]
                         fa = os.path.join(outpath, indir, fname)
                         try:
                             with open(fa) as f:
@@ -1766,6 +1859,7 @@ class runconsensusparts(QtCore.QThread):
                 self.coverages = {}
                 self.sampleids = {}
                 self.mixinfo = {}
+                self.lenwarns = {}
 
         if _use_serial:
             for i, job in enumerate(jobs):
@@ -1779,8 +1873,10 @@ class runconsensusparts(QtCore.QThread):
                 self.coverages.update(res[3])
                 if len(res) > 4:
                     self.mixinfo.update(res[4])
+                if len(res) > 5:
+                    self.lenwarns.update(res[5])
                 fname = inlist1_sorted[i]
-                key = fname.split('_all.fa')[0].split('.')[0]
+                key = fname.split('_all.fa')[0]
                 fa = os.path.join(outpath, indir, fname)
                 try:
                     with open(fa) as f:

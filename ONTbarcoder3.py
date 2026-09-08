@@ -214,6 +214,12 @@ def set_language(lang, panels=None):
             )
 
 
+# NCBI translation tables that actually exist (and are supported by Biopython).
+# Tables 7, 8, 17-20 and 32 do not exist; 0 is not a table (internally it means
+# "non-coding"). Used to validate the optional per-sample genetic code column.
+_VALID_NCBI_TABLES = {1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 16,
+                      21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 33}
+
 # ── Color palette ──────────────────────────────────────────────────────
 BLUE = "#185FA5"
 BLUE_LIGHT = "#E6F1FB"
@@ -2112,6 +2118,7 @@ class ParamsPanel(BasePanel):
         "mincoverage":         5,
         "coveragelist":        "25, 50, 100, 200",
         "lendev":              50,
+        "qclentol":            0,
         "minq":                0,
         "coverage2b":          100,
         "n_threads":           4,   # overridden at runtime with physical cores
@@ -2405,6 +2412,29 @@ class ParamsPanel(BasePanel):
         )
         layout.addWidget(_freq_row)
 
+        # QC length tolerance for coding markers. 0 = exact barcode length
+        # (classic rule, right for COI); >0 admits legitimate in-frame length
+        # variation (rbcL, matK...). Translation validation still applies, so
+        # frameshifted lengths caused by indel errors are rejected regardless.
+        self._tip_qclentol = (
+            "Coding markers only. A consensus is accepted when its length is\n"
+            "within ± this many bp of the barcode length.\n"
+            "0 (default) keeps the classic exact-length rule — recommended for\n"
+            "COI, whose 658 bp are invariant.\n"
+            "Increase it for coding markers with legitimate length variation\n"
+            "between taxa (e.g. rbcL, matK). Translation validation still\n"
+            "applies unchanged, so lengths shifted by sequencing errors\n"
+            "(frameshifts) are rejected; real coding-length variation comes in\n"
+            "multiples of 3.\n"
+            "Ignored in non-Coding mode (length is not enforced there).")
+        self.p_qclentol = _spin(0, 300, d["qclentol"])
+        self.p_qclentol.setSingleStep(3)
+        layout.addWidget(_grid(
+            self._tf(ctx, "QC length tolerance ± (bp, 0 = exact length)",
+                     self.p_qclentol, tooltip=self._tip_qclentol),
+            cols=1,
+        ))
+
         layout.addWidget(hline())
         self._lbl_cons_by_len = make_label("Consensus by length", size=17, bold=True)
         layout.addWidget(self._lbl_cons_by_len)
@@ -2557,8 +2587,9 @@ class ParamsPanel(BasePanel):
         self.p_non_coi.setStyleSheet("font-size:17px; font-weight:bold;")
         self.p_non_coi.setToolTip(
             "Activate this mode for non-coding markers (ITS, trnL, 16S, 12S, etc.).\n"
-            "Genetic code validation is omitted; barcodes are accepted\n"
-            "solely by correct length and absence of ambiguous bases.\n"
+            "Genetic code validation is omitted; barcodes are accepted solely by\n"
+            "absence of ambiguous bases (N). Consensus length may vary between\n"
+            "taxa, so no exact length is enforced.\n"
             "Only Phase 1 and Phase 2a are executed. Phases 2b and 3 are disabled\n"
             "automatically because they require translation validation."
         )
@@ -2709,6 +2740,7 @@ class ParamsPanel(BasePanel):
                 "mincoverage":     self.p_mincov.value(),
                 "coveragelist":    self.p_covlist.text(),
                 "lendev":          self.p_lendev.value(),
+                "qclentol":        self.p_qclentol.value(),
                 "minq":            self.p_minq.value(),
                 "coverage2b":      self.p_cov2b.value(),
                 "n_threads":       self.p_nthreads.value(),
@@ -2752,7 +2784,7 @@ class ParamsPanel(BasePanel):
             for w in (self.p_non_coi, self.p_gencode, self.p_minlen, self.p_explen,
                       self.p_demlen, self.p_searchlen, self.p_primermm, self.p_tagmm,
                       self.p_consfreq, self.p_consrange, self.p_consstep,
-                      self.p_mincov, self.p_covlist, self.p_lendev, self.p_minq,
+                      self.p_mincov, self.p_covlist, self.p_lendev, self.p_qclentol, self.p_minq,
                       self.p_cov2b, self.p_nthreads):
                 w.blockSignals(True)
 
@@ -2770,6 +2802,7 @@ class ParamsPanel(BasePanel):
             self.p_mincov.setValue(profile.get("mincoverage", d["mincoverage"]))
             self.p_covlist.setText(profile.get("coveragelist", d["coveragelist"]))
             self.p_lendev.setValue(profile.get("lendev", d["lendev"]))
+            self.p_qclentol.setValue(profile.get("qclentol", d["qclentol"]))
             self.p_minq.setValue(profile.get("minq", d["minq"]))
             self.p_cov2b.setValue(profile.get("coverage2b", d["coverage2b"]))
             self.p_nthreads.setValue(profile.get("n_threads", d["n_threads"]))
@@ -2777,7 +2810,7 @@ class ParamsPanel(BasePanel):
             for w in (self.p_non_coi, self.p_gencode, self.p_minlen, self.p_explen,
                       self.p_demlen, self.p_searchlen, self.p_primermm, self.p_tagmm,
                       self.p_consfreq, self.p_consrange, self.p_consstep,
-                      self.p_mincov, self.p_covlist, self.p_lendev, self.p_minq,
+                      self.p_mincov, self.p_covlist, self.p_lendev, self.p_qclentol, self.p_minq,
                       self.p_cov2b, self.p_nthreads):
                 w.blockSignals(False)
 
@@ -2820,7 +2853,7 @@ class ParamsPanel(BasePanel):
         for w in (self.p_non_coi, self.p_gencode, self.p_minlen, self.p_explen,
                   self.p_demlen, self.p_searchlen, self.p_primermm, self.p_tagmm,
                   self.p_consfreq, self.p_consrange, self.p_consstep,
-                  self.p_mincov, self.p_covlist, self.p_lendev, self.p_minq,
+                  self.p_mincov, self.p_covlist, self.p_lendev, self.p_qclentol, self.p_minq,
                   self.p_cov2b, self.p_nthreads):
             w.blockSignals(True)
 
@@ -2838,6 +2871,7 @@ class ParamsPanel(BasePanel):
         self.p_mincov.setValue(d["mincoverage"])
         self.p_covlist.setText(d["coveragelist"])
         self.p_lendev.setValue(d["lendev"])
+        self.p_qclentol.setValue(d["qclentol"])
         self.p_minq.setValue(d["minq"])
         self.p_cov2b.setValue(d["coverage2b"])
         self.p_nthreads.setValue(d["n_threads"])
@@ -2845,7 +2879,7 @@ class ParamsPanel(BasePanel):
         for w in (self.p_non_coi, self.p_gencode, self.p_minlen, self.p_explen,
                   self.p_demlen, self.p_searchlen, self.p_primermm, self.p_tagmm,
                   self.p_consfreq, self.p_consrange, self.p_consstep,
-                  self.p_mincov, self.p_covlist, self.p_lendev, self.p_minq,
+                  self.p_mincov, self.p_covlist, self.p_lendev, self.p_qclentol, self.p_minq,
                   self.p_cov2b, self.p_nthreads):
             w.blockSignals(False)
 
@@ -3001,6 +3035,16 @@ class ParamsPanel(BasePanel):
                 "Disabled in non-Coding marker mode." if non_coi else ""
             )
 
+        # QC length tolerance only applies to coding markers (non-Coding
+        # acceptance does not enforce length at all).
+        if hasattr(self, 'p_qclentol'):
+            self.p_qclentol.setEnabled(not non_coi)
+            self.p_qclentol.setStyleSheet(_disabled_style if non_coi else "")
+            self.p_qclentol.setToolTip(
+                "Disabled in non-Coding marker mode (length is not enforced)."
+                if non_coi else self._tip_qclentol
+            )
+
         for key in ("phase2b", "phase3"):
             cb = self._step_checks.get(key)
             if cb is None:
@@ -3123,6 +3167,7 @@ class ParamsPanel(BasePanel):
             # call translate_corframe (that's why there is no Biopython exception).
             "gencode": 0 if non_coi else gencode_map.get(self.p_gencode.currentIndex(), 5),
             "lendev": self.p_lendev.value(),
+            "qclentol": self.p_qclentol.value(),
             "maxcoverage": self.p_maxcov.value(),
             "minq": (self.p_minq.value()
                      if getattr(self, 'p_minq', None) is not None else 0),
@@ -3140,6 +3185,12 @@ class ParamsPanel(BasePanel):
                 "min_secondary_frac": _resolve_secfrac,
                 "minor_thresh": min(0.20, _resolve_secfrac),
                 "tolerance": _resolve_tol,
+                # Dominant↔secondary divergence that forces 'needs review':
+                # below it (≈ conspecific variation: another individual of the
+                # same species, heteroplasmy, alleles) the mix is informative;
+                # above it (heterospecific level) it suggests cross-
+                # contamination or a sample mix-up.
+                "divergence_review": 0.03,
             },
             "run_phase1": self._step_checks["phase1"].isChecked(),
             "run_phase2a": self._step_checks["phase2a"].isChecked(),
@@ -3174,6 +3225,25 @@ class ParamsPanel(BasePanel):
                 "The barcode length depends on the marker, so it must be set "
                 "explicitly (no COI default is assumed in non-Coding mode)."
             ).format(fields=", ".join(_missing)))
+            dlg.setIcon(QtWidgets.QMessageBox.Warning)
+            dlg.setStyleSheet(
+                f"QMessageBox {{ background-color: {GRAY_CARD}; }} "
+                f"QLabel {{ color: {TEXT_PRI}; }}")
+            dlg.exec_()
+            return
+        # Phase 2a needs at least one valid coverage value.
+        try:
+            _covs = [int(x.strip()) for x in self.p_covlist.text().split(",")
+                     if x.strip()]
+        except ValueError:
+            _covs = []
+        if self._step_checks["phase2a"].isChecked() and not _covs:
+            dlg = QtWidgets.QMessageBox(self)
+            dlg.setWindowTitle(_tr("ParamsPanel", "Missing information"))
+            dlg.setText(_tr(
+                "ParamsPanel",
+                "The coverage list for phase 2a is empty or invalid.\n"
+                "Enter comma-separated integers (e.g. 25, 50, 100, 200)."))
             dlg.setIcon(QtWidgets.QMessageBox.Warning)
             dlg.setStyleSheet(
                 f"QMessageBox {{ background-color: {GRAY_CARD}; }} "
@@ -3464,6 +3534,10 @@ class ProgressPanel(QtWidgets.QWidget):
         self._log = QtWidgets.QTextEdit()
         self._log.setObjectName("log_area")
         self._log.setReadOnly(True)
+        # Cap the in-panel log so multi-day RT runs with thousands of samples
+        # don't grow the QTextEdit unboundedly and slow the GUI down; the full
+        # log is always preserved in log.txt.
+        self._log.document().setMaximumBlockCount(5000)
         self._log.setMinimumHeight(200)
         self._log.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
@@ -4487,7 +4561,7 @@ class LiveChartPanel(BasePanel):
             self._detach_window.sync_from(self._chart_reads, self._chart_ok)
             self._detach_window.show()
             self._detach_window.raise_()
-            self._btn_detach.setText("⧉ Floating window")
+            self._btn_detach.setText("⧉ Hide window")
 
     def _toggle_bar_window(self):
         """Show or hide the bar chart floating window per sample."""
@@ -4502,7 +4576,7 @@ class LiveChartPanel(BasePanel):
             self._bar_window.set_data(self._bar_chart_widget._data)
             self._bar_window.show()
             self._bar_window.raise_()
-            self._btn_bar_chart.setText("📊 Reads per sample")
+            self._btn_bar_chart.setText("📊 Hide chart")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4819,6 +4893,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.con200length = {}
         self.con200barcodes = {}
         self.mixinfo_all = {}
+        self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
         self.ngoodbarcodescounter = 0
@@ -5126,6 +5201,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # in non-Coding mode (translation validation is disabled there).
         if not params.get("non_coi", False):
             _gc = self._scan_demfile_gencodes()
+            if _gc["invalid"]:
+                _inv = _gc["invalid"]
+                _shown = ", ".join(f"{n} (table {c})"
+                                   for n, c in sorted(_inv.items())[:10])
+                _shown += "…" if len(_inv) > 10 else ""
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    _tr("MainWindow", "Invalid genetic codes"),
+                    _tr("MainWindow",
+                        "The CSV assigns genetic codes that are not valid NCBI "
+                        "translation tables (tables 7, 8, 17–20 and 32 do not "
+                        "exist, and 0 is not a table):\n\n{names}\n\n"
+                        "Correct those values in the last column of the CSV "
+                        "before starting the analysis.").format(names=_shown),
+                )
+                self._analysis_active = False
+                return
             if _gc["has_any"] and _gc["missing"]:
                 _miss = _gc["missing"]
                 _shown = ", ".join(_miss[:10]) + ("…" if len(_miss) > 10 else "")
@@ -5295,7 +5387,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if os.listdir(outpath):
                 QtWidgets.QMessageBox.warning(
                     self, _tr("MainWindow", "Folder not empty"),
-                    _tr("MainWindow", "Please select a non-empty folder to avoid conflicts.")
+                    _tr("MainWindow", "Please select an empty folder to avoid conflicts.")
                 )
                 return
         self._outpath = outpath
@@ -5365,6 +5457,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.con200length = {}
         self.con200barcodes = {}
         self.mixinfo_all = {}
+        self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
         self.n90trans = {}
@@ -5417,6 +5510,8 @@ class MainWindow(QtWidgets.QMainWindow):
             logfile.write(f"    · min secondary variant fraction: {_rm.get('min_secondary_frac', '?')} "
                           f"(derived per-column polymorphism threshold: {_rm.get('minor_thresh', '?')})\n")
             logfile.write(f"    · variant tolerance: {_rm.get('tolerance', '?')}\n")
+            logfile.write(f"    · divergence review threshold: "
+                          f"{_rm.get('divergence_review', 0.03)}\n")
         if not params.get("non_coi", False):
             _gcs = self._scan_demfile_gencodes()
             if _gcs["has_any"]:
@@ -5427,6 +5522,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 logfile.write(f"  Genetic code: {params.get('gencode', 5)} (global)\n")
         logfile.write(f"  Minimum length (bp): {params.get('minlen', '?')}\n")
         logfile.write(f"  Barcode length (bp): {params.get('explen', '?')}\n")
+        logfile.write(f"  QC length tolerance ± (bp): {params.get('qclentol', 0)}"
+                      f"{' (exact length)' if not params.get('qclentol', 0) else ''}\n")
         logfile.write(f"  Window of barcode length ± (bp): {params.get('demlen', '?')}\n")
         logfile.write(f"  Maximum read length deviation from barcode length: {params.get('lendev', '?')}\n")
         logfile.write(f"  Read quality filter (min mean Q): "
@@ -5493,6 +5590,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Path to accumulated FASTQ that grows with each cycle
         self._live_accumulated_fastq = os.path.join(outpath, "live_accumulated.fastq")
         self._live_known_fastqs = set()
+        self._live_fastq_pending = {}     # stability gate (MinKNOW FASTQs)
+        self._live_pod5_pending = {}      # stability gate (POD5s, Dorado mode)
+        self._live_dorado_batches = {}    # out_fastq -> POD5 set, for retries
         self._live_consensus_running = False
         self._live_finalizing = False
         self._live_cycle_in_progress = False
@@ -5618,7 +5718,14 @@ class MainWindow(QtWidgets.QMainWindow):
         """Detects new FASTQs, concatenates them to the accumulated one and triggers a cycle if appropriate."""
         if self._live_finalizing:
             return
-            
+        # While a cycle is running, prepdemultiplex may be reading the
+        # accumulated FASTQ; appending to it concurrently could hand the reader
+        # a torn record. New files simply stay unknown/pending and are
+        # concatenated on the first polls after the cycle ends (seconds later).
+        if getattr(self, "_live_consensus_running", False):
+            return
+
+
         try:
             current = set(
                 f for f in os.listdir(self._live_fastq_dir)
@@ -5631,6 +5738,33 @@ class MainWindow(QtWidgets.QMainWindow):
         new_files = sorted(current - self._live_known_fastqs)
         if not new_files:
             return
+
+        # Stability gate: MinKNOW writes each FASTQ progressively, so a file
+        # that just appeared may still be growing. Concatenating it right away
+        # would freeze a partial copy (the file gets marked as known and is
+        # never re-read), losing every read written afterwards and possibly
+        # splitting a 4-line record, which misaligns the accumulated FASTQ.
+        # Only files whose (size, mtime) is unchanged between two consecutive
+        # polls are processed; the rest stay pending and are re-checked on the
+        # next poll. The Dorado path bypasses this gate on purpose: it has its
+        # own completion check in _live_dorado_fastq_ready.
+        pending = getattr(self, "_live_fastq_pending", {})
+        stable_files = []
+        for fname in new_files:
+            fpath = os.path.join(self._live_fastq_dir, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            sig = (st.st_size, st.st_mtime)
+            if st.st_size > 0 and pending.get(fname) == sig:
+                stable_files.append(fname)
+            else:
+                pending[fname] = sig
+        self._live_fastq_pending = pending
+        if not stable_files:
+            return
+        new_files = stable_files
 
         # IMPORTANT: update _live_known_fastqs AFTER concatenating,
         # and only for files that were actually processed successfully.
@@ -5645,6 +5779,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if processed is None:
             processed = set(new_files)
         self._live_known_fastqs |= processed
+        # Drop processed files from the stability-pending map (memory hygiene).
+        for f in processed:
+            self._live_fastq_pending.pop(f, None)
         if n_reads_added > 0:
             self._panel_progress.append_log(
                 f"  +{len(new_files)} FASTQ file(s) — {n_reads_added:,} new reads "
@@ -5693,18 +5830,32 @@ class MainWindow(QtWidgets.QMainWindow):
                         with open(fpath, "rb") as fh:
                             data = fh.read()
 
-                    # Remove ALL trailing \ns and add exactly one.
-                    # This avoids empty lines between files that would misalign
-                    # the zip_longest(*[infile]*4) of prepdemultiplex.
-                    data = data.rstrip(b"\n") + b"\n"
+                    # Normalize before appending so the accumulated file stays
+                    # perfectly aligned to 4-line records (zip_longest support):
+                    # 1. strip ALL trailing \ns (no blank lines between files);
+                    # 2. keep only COMPLETE 4-line records — if a truncated file
+                    #    slips through the stability gate, dropping its partial
+                    #    tail record protects every read appended afterwards.
+                    lines = data.rstrip(b"\n").split(b"\n")
+                    n_complete = (len(lines) // 4) * 4
+                    if n_complete == 0:
+                        # Stable but unusable content (< 1 full record): mark as
+                        # processed to avoid retrying it forever.
+                        processed.add(fname)
+                        self._panel_progress.append_log(
+                            f"    Skipped {fname}: no complete FASTQ record", "warn")
+                        continue
+                    if n_complete < len(lines):
+                        self._panel_progress.append_log(
+                            f"    {fname}: dropped incomplete trailing record "
+                            f"({len(lines) - n_complete} line(s))", "warn")
+                        lines = lines[:n_complete]
+                    data = b"\n".join(lines) + b"\n"
 
                     out_fh.write(data)
                     processed.add(fname)
 
                     # Count reads per file (offset always from 0)
-                    lines = data.split(b"\n")
-                    if lines and lines[-1] == b"":
-                        lines = lines[:-1]
                     file_reads = sum(
                         1 for i, ln in enumerate(lines)
                         if i % 4 == 0 and ln.startswith(b"@")
@@ -5739,21 +5890,41 @@ class MainWindow(QtWidgets.QMainWindow):
         if not new_files:
             return
 
+        # Stability gate: MinKNOW also writes POD5 files progressively. Handing
+        # Dorado a half-written POD5 fails or truncates the whole batch, so only
+        # files whose (size, mtime) is unchanged between two consecutive polls
+        # are batched; the rest stay pending and are re-checked next poll.
+        pending = getattr(self, "_live_pod5_pending", {})
+        stable = []
+        for fname in sorted(new_files):
+            fpath = os.path.join(self._live_pod5_dir, fname)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            sig = (st.st_size, st.st_mtime)
+            if st.st_size > 0 and pending.get(fname) == sig:
+                stable.append(fname)
+            else:
+                pending[fname] = sig
+        self._live_pod5_pending = pending
+        if not stable:
+            return
+
         # Guard: don't launch a new batch if one is still running
         active_proc = getattr(self, "_live_dorado_proc", None)
         if active_proc is not None and active_proc.poll() is None:
             self._panel_progress.append_log(
-                f"  Dorado still running — {len(new_files)} new POD5 file(s) queued for next batch.",
+                f"  Dorado still running — {len(stable)} new POD5 file(s) queued for next batch.",
                 "info"
             )
             return
 
-        self._live_known_pod5s = current
         self._live_dorado_iternum = getattr(self, "_live_dorado_iternum", 0)
         iternum = self._live_dorado_iternum
         self._live_dorado_iternum += 1
         out_fastq = os.path.join(self._live_fastq_dir, f"batch_{iternum}.fastq")
-        new_paths = [os.path.join(self._live_pod5_dir, f) for f in sorted(new_files)]
+        new_paths = [os.path.join(self._live_pod5_dir, f) for f in stable]
         cmd = [
             self._live_dorado_exe, "basecaller", "--emit-fastq",
             "--device", "cuda:all", "--chunksize", "10000", "--overlap", "500",
@@ -5761,23 +5932,34 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         self._panel_progress.append_log(
             f"Dorado basecalling — batch {iternum} "
-            f"({len(new_files)} new POD5 file{'s' if len(new_files) != 1 else ''} detected) …",
+            f"({len(stable)} new POD5 file{'s' if len(stable) != 1 else ''} detected) …",
             "info"
         )
         try:
             with open(out_fastq, "wb") as fh:
                 proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.PIPE)
-            self._live_dorado_proc = proc
-            threading.Thread(
-                target=self._live_dorado_stream_stderr,
-                args=(proc, iternum),
-                daemon=True,
-            ).start()
-            QtCore.QTimer.singleShot(
-                10000, lambda p=out_fastq, pr=proc: self._live_dorado_fastq_ready(p, pr)
-            )
         except Exception as e:
+            # Launch failed: the POD5s stay unknown and are retried next poll.
             self._panel_progress.append_log(f"Error launching Dorado: {e}", "error")
+            return
+        # Mark the batch's POD5s as known only once Dorado is actually running,
+        # and remember which files belong to this batch so a failed run can put
+        # them back for a retry instead of silently losing their reads.
+        batch_set = set(stable)
+        self._live_known_pod5s |= batch_set
+        for f in batch_set:
+            pending.pop(f, None)
+        self._live_dorado_batches = getattr(self, "_live_dorado_batches", {})
+        self._live_dorado_batches[out_fastq] = batch_set
+        self._live_dorado_proc = proc
+        threading.Thread(
+            target=self._live_dorado_stream_stderr,
+            args=(proc, iternum),
+            daemon=True,
+        ).start()
+        QtCore.QTimer.singleShot(
+            10000, lambda p=out_fastq, pr=proc: self._live_dorado_fastq_ready(p, pr)
+        )
 
     def _kill_dorado_proc(self, proc):
         """Kill a Dorado process and its entire child tree (e.g. dorado_basecalling_server)."""
@@ -5841,6 +6023,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 30000, lambda p=fastq_path, pr=proc: self._live_dorado_fastq_ready(p, pr)
             )
             return
+        if proc is not None and proc.returncode != 0:
+            # Failed batch: requeue its POD5s so they are re-basecalled, and
+            # discard the partial FASTQ so its reads are neither lost nor
+            # duplicated when the retried batch produces them again.
+            batch = getattr(self, "_live_dorado_batches", {}).pop(fastq_path, set())
+            if batch:
+                self._live_known_pod5s -= batch
+            try:
+                if os.path.isfile(fastq_path):
+                    os.remove(fastq_path)
+            except OSError:
+                pass
+            self._panel_progress.append_log(
+                f"  Dorado failed (exit {proc.returncode}) — "
+                f"{len(batch)} POD5 file(s) requeued for the next batch.", "warn")
+            return
+        # Defer while a cycle may be reading the accumulated FASTQ (appending
+        # concurrently could hand prepdemultiplex a torn record). The batch
+        # file is complete and static, so retrying shortly loses nothing.
+        if getattr(self, "_live_consensus_running", False):
+            QtCore.QTimer.singleShot(
+                5000, lambda p=fastq_path, pr=proc: self._live_dorado_fastq_ready(p, pr)
+            )
+            return
+        getattr(self, "_live_dorado_batches", {}).pop(fastq_path, None)
         if os.path.isfile(fastq_path) and os.path.getsize(fastq_path) > 0:
             n = self._live_concatenate_fastqs([os.path.basename(fastq_path)])
             if n > 0:
@@ -6069,7 +6276,8 @@ class MainWindow(QtWidgets.QMainWindow):
         taglen = self.worker_prep.taglen
         maxid = self.worker_prep.maxid
         lastbitn = self.worker_prep.lastbitn
-        self.totalseqs = self.worker_prep.totalseqs
+        # NOTE: totalseqs is only taken from prepdemultiplex in conventional
+        # mode (see the branch below); in RT it belongs to _live_total_reads.
         self.nseqspasslen = self.worker_prep.nseqspasslen
         self.nseqsfordemultiplexing = self.worker_prep.nseqsfordemultiplexing
         self.sampleids = self.worker_prep.sampleids
@@ -6171,6 +6379,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.pool.terminate()
                 self.pool = None
             self._panel_progress.update_phase_progress("1", self.nseqsfordemultiplexing, self.nseqsfordemultiplexing)
+            if getattr(self, "_dem_errors", None):
+                self._panel_progress.append_log(
+                    f"  ⚠ {len(self._dem_errors)} of {self._n_dem_jobs} demultiplexing "
+                    f"worker(s) failed — results below are INCOMPLETE (some reads "
+                    f"were not demultiplexed).", "error")
             self._panel_progress.append_log("Demultiplexing completed — merging files...", "ok")
 
             self.mymergedatasets = mergedemfiles(
@@ -6261,7 +6474,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if getattr(self, "_gencode_scan_cache", None) is not None:
             return self._gencode_scan_cache
-        codes, missing = {}, []
+        codes, missing, invalid = {}, [], {}
         total_named = 0
         n_with_code = 0
         by_table = Counter()
@@ -6282,11 +6495,18 @@ class MainWindow(QtWidgets.QMainWindow):
                         name_counts[name] += 1
                         last = cols[-1] if len(cols) >= 6 else ""
                         # An integer in the NCBI table range is a genetic code; a
-                        # primer (IUPAC string) never is.
+                        # primer (IUPAC string) never is. Codes naming tables that
+                        # do not exist (7, 8, 17-20, 32) or 0 are recorded as
+                        # invalid so the run can be blocked with a clear message
+                        # instead of crashing inside Biopython per-sample.
                         if last.isdigit() and 0 <= int(last) <= 33:
-                            n_with_code += 1
-                            by_table[int(last)] += 1
-                            codes[name] = int(last)
+                            code = int(last)
+                            if code in _VALID_NCBI_TABLES:
+                                n_with_code += 1
+                                by_table[code] += 1
+                                codes[name] = code
+                            else:
+                                invalid[name] = code
                         else:
                             missing.append(name)
             except Exception:
@@ -6294,10 +6514,11 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = {
             "codes": codes,
             "missing": missing,
+            "invalid": invalid,
             "total_named": total_named,
             "n_with_code": n_with_code,
             "by_table": dict(by_table),
-            "has_any": bool(codes),
+            "has_any": bool(codes) or bool(invalid),
             "duplicates": {n: c for n, c in name_counts.items() if c > 1},
         }
         self._gencode_scan_cache = summary
@@ -6402,6 +6623,7 @@ class MainWindow(QtWidgets.QMainWindow):
             params["gencode"],
             params.get("resolve_mixed", {}),
             self._gencode_by_sample(),
+            params.get("qclentol", 0),
         ]
 
         self.myconsensus1 = runconsensusparts(job)
@@ -6447,20 +6669,50 @@ class MainWindow(QtWidgets.QMainWindow):
                 _extra = _mv.get("n_variants_extra", 0)
                 _extra_txt = (f"; {_extra} more variant(s) beyond cap not recovered"
                               if _extra else "")
+                _div = float(_mv.get("max_divergence", 0.0)) * 100.0
+                _div_txt = f"; max divergence {_div:.1f}%" if _div > 0 else ""
                 if _mv.get("needs_review"):
-                    _why = ("chosen barcode is not the most abundant variant"
-                            if not _mv.get("chosen_by_abundance", True)
-                            else f"{_mv.get('n_pass_qc', 2)} variants pass QC")
+                    _reasons = []
+                    if _mv.get("review_divergence"):
+                        _reasons.append(
+                            f"secondary at {_div:.1f}% divergence — "
+                            f"heterospecific level, possible contamination or "
+                            f"sample mix-up")
+                    if not _mv.get("chosen_by_abundance", True):
+                        _reasons.append(
+                            "chosen barcode is not the most abundant variant")
+                    if _mv.get("n_pass_qc", 0) > 1:
+                        _reasons.append(
+                            f"{_mv.get('n_pass_qc')} variants pass QC")
+                    _why = "; ".join(_reasons) or "review flagged"
                     self._panel_progress.append_log(
                         f"  🔶 {_mk} — {_ncl} variants, NEEDS REVIEW ({_why}); "
                         f"kept variant at {_frac:.0f}%{_extra_txt}", "warn")
                 else:
                     self._panel_progress.append_log(
                         f"  🟣 {_mk} — {_ncl} variants: kept dominant haplotype "
-                        f"({_frac:.0f}%), secondary variant(s) exported{_extra_txt}",
+                        f"({_frac:.0f}%), secondary variant(s) exported"
+                        f"{_div_txt} (conspecific level){_extra_txt}",
                         "warn")
             except Exception:
                 pass
+
+        # Length-bimodality warnings (computed on ALL demultiplexed reads,
+        # BEFORE the by-length subsampling that could hide a different-length
+        # contaminant from the haplotype resolver). Advisory only; reported
+        # once per run (first coverage level) and only when intra-sample
+        # variant detection is enabled.
+        if (params.get("resolve_mixed", {}).get("enabled", False)
+                and self.selectlenscounter == 0):
+            for _lk, _lv in (getattr(self.myconsensus1, 'lenwarns', {}) or {}).items():
+                self._len_bimodal[_lk] = _lv
+                try:
+                    self._panel_progress.append_log(
+                        f"  🟠 {_lk} — bimodal read lengths: main mode ~{_lv[0]} bp, "
+                        f"second mode ~{_lv[1]} bp ({_lv[2]*100:.0f}% of reads) — "
+                        f"possible mixture of different-length products.", "warn")
+                except Exception:
+                    pass
         if self.selectlenscounter == 0:
             self.sampleids = self.myconsensus1.sampleids
 
@@ -6655,9 +6907,13 @@ class MainWindow(QtWidgets.QMainWindow):
                             _tr = s.get("translates")
                             _tr_tag = ("yes" if _tr is True
                                        else "no" if _tr is False else "NA")
+                            _dv = s.get("divergence")
+                            _dv_tag = (f"{float(_dv)*100:.1f}%"
+                                       if _dv is not None else "NA")
                             cf.write(
                                 f">{k}_var{_i};frac={float(s.get('frac',0))*100:.0f}%;"
-                                f"len={len(seq)};translates={_tr_tag}\n{seq}\n")
+                                f"len={len(seq)};div={_dv_tag};"
+                                f"translates={_tr_tag}\n{seq}\n")
                             _n_written += 1
                 # "Recovered" = mixed samples that became QC-compliant barcodes
                 # thanks to resolution (they would otherwise fail on Ns / frame).
@@ -6935,6 +7191,7 @@ class MainWindow(QtWidgets.QMainWindow):
             params["gencode"],
             params.get("resolve_mixed", {}),
             self._gencode_by_sample(),
+            params.get("qclentol", 0),
         ]
 
         self.myconsensus2 = runconsensusparts(job)
@@ -7975,7 +8232,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 pointRadius: 4, fill: true, tension: 0 }}
             ], 'QC barcodes');
             </script>
-            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
             """
         elif b64_reads or b64_ok:
             # Conventional or RT mode without data: show PNGs if they exist
@@ -8047,6 +8303,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<tr><td>Genetic code</td><td>{gc_lbl}</td></tr>"
                 f"<tr><td>Minimum length (bp)</td><td>{p.get('minlen','?')}</td></tr>"
                 f"<tr><td>Barcode length (bp)</td><td>{p.get('explen','?')}</td></tr>"
+                f"<tr><td>QC length tolerance ± (bp)</td><td>{p.get('qclentol', 0) or 'Exact length'}</td></tr>"
                 f"<tr><td>Window of barcode length ± (bp)</td><td>{p.get('demlen','?')}</td></tr>"
                 f"<tr><td>Maximum read length deviation from barcode length</td><td>{p.get('lendev','?')}</td></tr>"
                 f"<tr><td>Read quality filter (min mean Q)</td><td>{('Q ≥ ' + str(p.get('minq'))) if p.get('minq') else 'Off'}</td></tr>"
@@ -8561,7 +8818,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Delete the original folder after successfully compressing
                 shutil.rmtree(folder_path, ignore_errors=True)
                 self._panel_progress.append_log(
-                    f"  Compressed: {folder_name}.zip → analysis/", "info")
+                    f"  Compressed: {folder_name}.zip → intermediate_files/", "info")
             except Exception as e:
                 self._panel_progress.append_log(
                     f"  Warning compressing {folder_name}: {e}", "warn")
@@ -8578,16 +8835,31 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         mixed = {k: v for k, v in getattr(self, "mixinfo_all", {}).items()
                  if k in getattr(self, "con200barcodes", {}) and v.get("secondary")}
-        if not mixed:
+        len_bimodal = dict(getattr(self, "_len_bimodal", {}) or {})
+        if not mixed and not len_bimodal:
             return
         try:
             ws = self.wb.add_worksheet("Intra-sample variants")
             hdrs = ["Sample", "#variants", "#noise reads", "Needs review",
                     "Variants beyond cap (not recovered)",
                     "Cluster rank", "Reads", "Fraction (%)", "Length (bp)",
-                    "Ns", "Translates (Coding)", "Role"]
+                    "Ns", "Translates (Coding)", "Role",
+                    "Divergence vs dominant (%)",
+                    "Identical to N other barcodes"]
             for c, h in enumerate(hdrs):
                 ws.write(0, c, h)
+            # Barcode sequence -> samples carrying it, to report how many OTHER
+            # samples share each secondary variant. Interpretation with many
+            # conspecific samples: a high count = common haplotype of the
+            # species (weak signal); count 1 combined with high divergence vs
+            # the own dominant = strong cross-contamination candidate.
+            _bc_by_seq = {}
+            for _bcmap in (getattr(self, "con200barcodes", {}) or {},
+                           getattr(self, "n90barcodes", {}) or {}):
+                for _bs, _bseq in _bcmap.items():
+                    if _bseq:
+                        _bc_by_seq.setdefault(
+                            _bseq.replace("-", "").upper(), set()).add(_bs)
             r = 1
             for k in sorted(mixed.keys()):
                 v = mixed[k]
@@ -8598,6 +8870,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 n_noise = v.get("n_noise", 0)
                 review_txt = "yes" if v.get("needs_review") else "no"
                 n_extra = v.get("n_variants_extra", 0)
+                _sec_by_rank = {s.get("rank"): s
+                                for s in (v.get("secondaries") or [])
+                                if s.get("rank") is not None}
                 for ci, c in enumerate(clusters):
                     _tr = c.get("translates")
                     tr_txt = ("yes" if _tr is True
@@ -8620,7 +8895,29 @@ class MainWindow(QtWidgets.QMainWindow):
                     ws.write(r, 9, c.get("nN", ""))
                     ws.write(r, 10, tr_txt)
                     ws.write(r, 11, c.get("role", ""))
+                    _dv = c.get("divergence")
+                    ws.write(r, 12, round(float(_dv) * 100, 2)
+                             if _dv is not None else "")
+                    if c.get("role") == "dominant":
+                        ws.write(r, 13, "")
+                    else:
+                        _sec = _sec_by_rank.get(c.get("rank", ci + 1), {})
+                        _sseq = (_sec.get("seq") or "").replace("-", "").upper()
+                        ws.write(r, 13,
+                                 len(_bc_by_seq.get(_sseq, set()) - {k})
+                                 if _sseq else "")
                     r += 1
+            # Samples with a bimodal read-length distribution (possible mixture
+            # of different-length products that the by-length subsampling would
+            # hide from the haplotype resolver). Advisory rows.
+            for k in sorted(len_bimodal.keys()):
+                _m1, _m2, _fr2 = len_bimodal[k]
+                ws.write(r, 0, k)
+                ws.write(r, 11,
+                         f"length-bimodal: ~{_m1} bp / ~{_m2} bp "
+                         f"({_fr2*100:.0f}% of reads in second mode) — "
+                         f"possible mixture of different-length products")
+                r += 1
         except Exception as e:
             self._panel_progress.append_log(
                 f"Warning Excel Intra-sample variants: {e}", "warn")
@@ -8663,6 +8960,7 @@ class MainWindow(QtWidgets.QMainWindow):
             candidates = []  # (varname, seq)
             cov_map = {}      # varname -> size (nº reads = cobertura del cluster)
             frac_map = {}     # varname -> frac (proporción del cluster, 0..1)
+            div_map = {}      # varname -> divergencia vs dominante (0..1)
             for k, v in getattr(self, "mixinfo_all", {}).items():
                 if k not in getattr(self, "con200barcodes", {}):
                     continue
@@ -8676,6 +8974,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     candidates.append((vname, s["seq"].replace("-", "").upper()))
                     cov_map[vname] = s.get("size")
                     frac_map[vname] = s.get("frac")
+                    div_map[vname] = s.get("divergence")
             candidates = [(n, s) for n, s in candidates if s]
             if not candidates:
                 return
@@ -8882,7 +9181,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     _frac = frac_map.get(vname)
                     frac_tag = (f"{float(_frac) * 100:.0f}%"
                                 if _frac is not None else "NA")
-                    of.write(f">{vname};frac={frac_tag};len={len(seq)};"
+                    _dvv = div_map.get(vname)
+                    div_tag = (f"{float(_dvv) * 100:.1f}%"
+                               if _dvv is not None else "NA")
+                    of.write(f">{vname};frac={frac_tag};div={div_tag};"
+                             f"len={len(seq)};"
                              f"coverage={cov_val};"
                              f"translates={tr_tag};"
                              f"fixed_indels={gaps};Ns={seq.count('N')}\n{seq}\n")
@@ -8950,6 +9253,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_progress.append_log(
                 f"  Cycle duration #{n}: {ch:02d}:{cm:02d}:{cs:02d}", "info")
             self._panel_progress.set_phase("1", "Waiting new FASTQs…")
+            # Reads that piled up while this cycle was running may already meet
+            # the next-cycle threshold; check right away instead of waiting for
+            # the next new file to arrive. (Internally guarded: no-op unless
+            # the configured conditions are actually met.)
+            QtCore.QTimer.singleShot(100, self._live_maybe_run_consensus)
             return
 
         # ── Final analysis (conventional or completed RT) ────────────────────
@@ -9199,6 +9507,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._finalize_wait_timer.stop()
         self._finalize_run_final()
 
+    def _finalize_resume_rt(self, reason: str):
+        """The user backed out of RT finalization (or it could not proceed):
+        restart the monitoring timers so the RT session keeps running instead of
+        being left silently dead with the poll stopped."""
+        self._live_finalizing = False
+        t = getattr(self, "_live_dem_poll_timer", None)
+        if t is not None:
+            try:
+                t.start(3000)
+            except Exception:
+                pass
+        t = getattr(self, "_live_consensus_timer", None)
+        if t is not None and getattr(self, "_CONSENSUS_EVERY_MIN", None):
+            try:
+                t.start(self._CONSENSUS_EVERY_MIN * 60 * 1000)
+            except Exception:
+                pass
+        self._panel_progress.append_log(
+            f"  {reason} — real-time monitoring resumed.", "warn")
+        self._panel_progress.set_phase("1", "Waiting new FASTQs…")
+
     def _finalize_run_final(self):
         """
         RT completion logic:
@@ -9229,6 +9558,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"  Rebuilding accumulated since {len(all_fastqs)} FASTQ file(s)…", "info")
                 import gzip as _gzip
                 n_total = 0
+                _rebuilt = set()
                 with open(self._live_accumulated_fastq, "wb") as out_fh:
                     for fname in all_fastqs:
                         fpath = os.path.join(self._live_fastq_dir, fname)
@@ -9241,13 +9571,23 @@ class MainWindow(QtWidgets.QMainWindow):
                             else:
                                 with open(fpath, "rb") as fh:
                                     data = fh.read()
-                            # Remove all trailing \ns and add exactly one
-                            # so that zip_longest(*[infile]*4) does not lose the offset.
-                            data = data.rstrip(b"\n") + b"\n"
+                            # Remove all trailing \ns and keep only complete
+                            # 4-line records so that zip_longest(*[infile]*4)
+                            # does not lose the offset (a file may still be
+                            # being written if the run was finalized early).
+                            lines = data.rstrip(b"\n").split(b"\n")
+                            n_complete = (len(lines) // 4) * 4
+                            if n_complete == 0:
+                                continue
+                            if n_complete < len(lines):
+                                self._panel_progress.append_log(
+                                    f"    {fname}: dropped incomplete trailing "
+                                    f"record ({len(lines) - n_complete} line(s))",
+                                    "warn")
+                                lines = lines[:n_complete]
+                            data = b"\n".join(lines) + b"\n"
                             out_fh.write(data)
-                            lines = data.split(b"\n")
-                            if lines and lines[-1] == b"":
-                                lines = lines[:-1]
+                            _rebuilt.add(fname)
                             n_file = sum(
                                 1 for i, ln in enumerate(lines)
                                 if i % 4 == 0 and ln.startswith(b"@")
@@ -9258,6 +9598,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         except Exception as e:
                             self._panel_progress.append_log(
                                 f"    Error reading {fname}: {e}", "warn")
+                # Sync the RT bookkeeping with the rebuilt accumulated file.
+                # Needed both for consistency here and so that, if the user
+                # cancels one of the dialogs below and RT monitoring resumes,
+                # the poll does not re-concatenate files already in the rebuild
+                # (duplicates) nor skip ones that failed to read (still unknown).
+                self._live_known_fastqs = _rebuilt
+                self._live_fastq_pending = {}
+                self._live_total_reads = n_total
+                self.totalseqs = n_total
+                self._panel_progress.stat_total.update_value(f"{n_total:,}")
                 self._panel_progress.append_log(
                     f"  Reconstructed cumulative: {n_total:,} reads ✓", "ok")
         except Exception as e:
@@ -9267,6 +9617,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 os.path.getsize(self._live_accumulated_fastq) == 0:
             self._panel_progress.append_log(
                 "  No accumulated data — cannot run final analysis.", "error")
+            self._finalize_resume_rt("Finalization aborted (no data yet)")
             return
 
         # Copy input files to input_files/inside the RT outpath
@@ -9282,6 +9633,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"  Input files saved in: input_files/", "info")
         except Exception as e:
             self._panel_progress.append_log(f"  Warning copying input_files: {e}", "warn")
+            self._finalize_resume_rt("Finalization aborted (could not copy input files)")
             return
 
         # ── Ask the user where to save the final conventional analysis ──
@@ -9360,6 +9712,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             self._panel_progress.append_log(
                 "  Final conventional analysis canceled by user.", "warn")
+            self._finalize_resume_rt("Finalization canceled")
             return
 
         if radio_default.isChecked():
@@ -9372,12 +9725,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if not new_outpath:
                 self._panel_progress.append_log(
                     "  Final conventional analysis canceled — no folder selected.", "warn")
+                self._finalize_resume_rt("Finalization canceled")
                 return
             if os.listdir(new_outpath):
                 QtWidgets.QMessageBox.warning(
                     self, _tr("MainWindow", "Non-empty directory"),
                     _tr("MainWindow", "Please select an empty directory to avoid conflicts.")
                 )
+                self._finalize_resume_rt("Finalization canceled (folder not empty)")
                 return
 
         # ── Terminate all active RT workers and processes ───────────────
@@ -9522,6 +9877,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.con200length = {}
         self.con200barcodes = {}
         self.mixinfo_all = {}
+        self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
         self.n90trans = {}
@@ -9609,6 +9965,8 @@ class MainWindow(QtWidgets.QMainWindow):
             logfile.write(f"    · min secondary variant fraction: {_rm.get('min_secondary_frac', '?')} "
                           f"(derived per-column polymorphism threshold: {_rm.get('minor_thresh', '?')})\n")
             logfile.write(f"    · variant tolerance: {_rm.get('tolerance', '?')}\n")
+            logfile.write(f"    · divergence review threshold: "
+                          f"{_rm.get('divergence_review', 0.03)}\n")
         if not params.get("non_coi", False):
             _gcs = self._scan_demfile_gencodes()
             if _gcs["has_any"]:
@@ -9619,6 +9977,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 logfile.write(f"  Genetic code: {params.get('gencode', 5)} (global)\n")
         logfile.write(f"  Minimum length (bp): {params.get('minlen', '?')}\n")
         logfile.write(f"  Barcode length (bp): {params.get('explen', '?')}\n")
+        logfile.write(f"  QC length tolerance ± (bp): {params.get('qclentol', 0)}"
+                      f"{' (exact length)' if not params.get('qclentol', 0) else ''}\n")
         logfile.write(f"  Window of barcode length ± (bp): {params.get('demlen', '?')}\n")
         logfile.write(f"  Maximum read length deviation from barcode length: {params.get('lendev', '?')}\n")
         logfile.write(f"  Read quality filter (min mean Q): "
