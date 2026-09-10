@@ -44,14 +44,67 @@ exactly.
   columns are rejected in the drop zone before the run starts. Hits shorter than
   the configurable minimum alignment length (default 100 bp) are discarded as
   spurious.
-- Outputs a TSV + formatted XLSX decision report (with `Flag` column:
-  `no_blast_hit`, `low_taxonomic_support`, `near_tie`, `missing_in_N_run(s)`,
-  `ambs=N`), a run log, and three single-line FASTA files that preserve the
+- Outputs a TSV + formatted XLSX decision report, a run log, and three
+  single-line FASTA files that preserve the
   original headers verbatim: `_all`, plus a disjoint split into `_identified`
   (best hit concordant at some rank) and `_no_tax_hit` (no rank matched). The
   split is decided by taxonomy alone: a sequence identical in every run is a
   reproducible consensus, not a verified identification, so without a taxonomic
   hit it lands in `_no_tax_hit` for review like any other.
+- The decision report carries the expected taxonomy and the taxonomy of the best
+  hit **side by side, rank by rank** (`Query_Order/Family/Genus/organism` vs.
+  `Hit_Order/Family/Genus/organism`), so a mismatch shows at which rank it breaks
+  — the information needed to tell a distant relative from a contamination.
+  Taxon names keep their original spelling (*Epidendrum fimbriatum*, not
+  `epidendrum_fimbriatum`); the concordance test stays case-insensitive.
+- The `Query_*` columns are read from the BLAST table independently of the hits,
+  so the expected taxonomy is still reported for a sample whose hits were all
+  filtered out. `N_hits` (hits that passed the minimum-alignment filter) is
+  reported next to `N_hits_raw` (rows present before filtering).
+- `Flag` values name the actual situation: **`tax_mismatch`** (hits passed the
+  filter but none matches the expected taxonomy — the contamination /
+  mislabelling candidate), `low_taxonomic_support` (now only for a hit reaching
+  order level), **`hits_below_min_aln`** (hits exist but all too short),
+  `no_blast_hit` (nothing in the table at all), `near_tie`,
+  `missing_in_N_run(s)` and `ambs=N`. The run log prints a one-line meaning next
+  to each count.
+- `Decision` = **`resolved_by_score`** (was `blast_selected`) for the samples
+  whose runs disagreed: the name no longer implies BLAST settled it, since
+  sequences with no usable hit are decided by length, reads and ambiguities.
+
+#### Best Sequence: single-run classification mode
+- The panel now accepts **one** FASTA + BLAST table pair, not just two or more.
+  With a single run there is nothing to select between, so every sequence is
+  kept and the module works as a classifier: the report and the
+  `_identified` / `_no_tax_hit` split are produced exactly the same, which is
+  the quick way to triage one BLAST run and pull out the sequences with a
+  taxonomic match (and spot the `tax_mismatch` ones) without processing the
+  library twice.
+- `Decision` = **`single_run`** on those rows, instead of misreporting them as
+  `identical_in_all_runs` — with one run there is nothing to be identical to.
+  Progress messages, the final summary and the run log switch to classification
+  wording, and the drop zone states which mode will run.
+
+#### Worker module renamed
+- `_utilities/ONTbarcoder3_multiprocessing.py` → **`_utilities/pipeline.py`**
+  (imports updated in `ONTbarcoder3.py`; PyInstaller picks it up automatically
+  through `collect_submodules('_utilities')`). Shorter and descriptive, with no
+  behaviour change.
+- The module docstring now warns that this file must never be named after a
+  standard-library module. `_utilities` is inserted at the front of `sys.path`,
+  so a file called `multiprocessing.py` there would shadow the real package:
+  the parent process might survive on import order alone, but every spawned
+  worker dies with `No module named 'multiprocessing.context'` and the Pool
+  retries forever, turning a run into a process storm.
+
+#### BLAST utility saves the queried sequences
+- A run now also writes `blast-<ts>.fa` next to `blast-<ts>.tsv` / `.xlsx`,
+  holding the sequences submitted in the normalised single-line form actually
+  sent to NCBI, so its headers are exactly the `Query_name` values of the table.
+  Sharing the base name is what lets the Best Sequence utility pair a run's
+  sequences with its BLAST table, so no renaming is needed between the two
+  panels. It is written before the first query (it survives a run stopped half
+  way) and a failure to write it never aborts the BLAST run.
 
 ### Documentation
 - Manual brought up to date (`guide/MANUAL.html`): new **§14 Utility — Best

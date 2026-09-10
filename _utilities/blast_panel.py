@@ -47,7 +47,9 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_desc = make_label(
             "BLAST sequences in NCBI. "
             "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta).\n"
-            "Optional: results might include organism and taxonomic classification from NCBI Taxonomy.",
+            "Optional: results might include organism and taxonomic classification from NCBI Taxonomy.\n"
+            "The queried sequences are saved as a FASTA named after the results, "
+            "ready to use as a pair in Best Sequence.",
             color=TEXT_SEC
         )
         self._lbl_desc.setWordWrap(True)
@@ -317,7 +319,8 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_desc.setText(_tr(ctx,
             "BLAST multiFASTA sequences against NCBI. "
             "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta). "
-            "Results include top hits with organism and taxonomic classification."))
+            "Results include top hits with organism and taxonomic classification, "
+            "plus a FASTA of the queried sequences named after the results."))
         self._settings_box.setTitle(_tr(ctx, "BLAST Settings"))
         self._lbl_api.setText(_tr(ctx, "NCBI API Key:"))
         self._lbl_api_warn.setText(_tr(ctx,
@@ -1380,6 +1383,23 @@ class _BlastWorker(QtCore.QThread):
         # be filtered by rank (e.g. Hit_rank == 1 keeps only each sample's top hit).
         headings = "Hit_rank\t" + headings
 
+        # ── Save the sequences that were queried ──
+        # Same base name as the results, so the pair (FASTA + table) is what the
+        # Best Sequence utility expects: it matches a run's sequences to its
+        # BLAST table by file name. The text written is the normalised FASTA
+        # actually submitted, so its headers are the Query_name values of the
+        # table. It is written before the queries start, so it is there even if
+        # the run is stopped half way.
+        fasta_path = os.path.join(output_dir, f"blast-{mydate}.fa")
+        try:
+            with open(fasta_path, "w", encoding="utf-8") as fa_fh:
+                fa_fh.write(fasta + "\n")
+        except Exception as e:
+            # Auxiliary output: a failure here must not abort the BLAST run.
+            fasta_path = ""
+            self.statusUpdated.emit(
+                "result", f"FASTA skip │ could not write sequences: {e}")
+
         # ── Open TSV for incremental writing ──
         tsv_path = os.path.join(output_dir, f"blast-{mydate}.tsv")
         for _attempt in range(10):
@@ -1654,6 +1674,8 @@ class _BlastWorker(QtCore.QThread):
             f"  Output folder     : {output_dir}",
             f"  TSV file          : {os.path.basename(tsv_path)}",
             f"  XLSX file         : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
+            f"  FASTA file        : {os.path.basename(fasta_path) if fasta_path else 'N/A'}"
+            f"  (queried sequences, pairs with the table for Best Sequence)",
         ]
         if miss_msg:
             log_lines.append(f"  Missing seqs      : {miss_msg}")

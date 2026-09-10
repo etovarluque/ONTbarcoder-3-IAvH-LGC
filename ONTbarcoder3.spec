@@ -31,6 +31,14 @@ try:
 except Exception:
     hidden += ['openpyxl']
 
+# Pillow is never imported by this project. It only gets pulled in because
+# collect_submodules('openpyxl') above reaches openpyxl.drawing.image, which
+# imports PIL inside a try/except and falls back to PILImage = False. That path
+# is only used to embed images into a workbook, which no panel does — we write
+# cells, styles and filters. Excluding it keeps ~10 MB out of the bundle and is
+# safe even if Pillow is installed in the build environment.
+excluded = ['PIL', 'PIL.Image', 'Pillow']
+
 a = Analysis(
     ['ONTbarcoder3.py'],
     pathex=['.'],
@@ -40,7 +48,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=excluded,
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

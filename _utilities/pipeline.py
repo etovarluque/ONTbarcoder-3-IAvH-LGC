@@ -1,11 +1,18 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 """
-ONTbarcoder_multiprocessing.py - PATCHED VERSION
-==================================================
+pipeline.py - worker pipeline (was ONTbarcoder3_multiprocessing.py)
+==================================================================
+Demultiplexing, consensus calling and barcode-comparison workers run by
+the process Pool of ONTbarcoder3.py.
+
 Modifications to guarantee deterministic results identical
 to the original ONTbarcoder2.py, while keeping the
 parallelization for maximum performance.
+
+NOTE: this module must never be named after a standard-library module
+(multiprocessing, queue, types...): _utilities is placed at the front of
+sys.path, so such a name would shadow the real one and break the Pool.
 """
 
 # ============================================================

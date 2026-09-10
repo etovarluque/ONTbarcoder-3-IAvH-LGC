@@ -47,7 +47,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib', 'numpy.testing'],
+    # Pillow is never imported by this project; it only arrives through
+    # collect_submodules('openpyxl') -> openpyxl.drawing.image, whose PIL import
+    # is guarded and only needed to embed images into a workbook. Excluding it
+    # keeps ~10 MB out of the bundle (same exclusion as the Windows spec).
+    excludes=['tkinter', 'matplotlib', 'numpy.testing',
+              'PIL', 'PIL.Image', 'Pillow'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

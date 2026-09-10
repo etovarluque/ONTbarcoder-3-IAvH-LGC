@@ -43,6 +43,7 @@
   h2:first-child{margin-top:0;}
   h3{font-size:22px; color:var(--blue); margin-top:38px;}
   h4{font-size:17px; color:var(--text); margin-top:26px; margin-bottom:6px;}
+  h5{font-size:15px; color:var(--blue); margin-top:22px; margin-bottom:5px;}
   p{margin:10px 0;}
   code{background:#EEEDE9; padding:1.5px 6px; border-radius:4px; font-size:14px;
     font-family:'Cascadia Code','Consolas',monospace; color:#9B2C2C;}
@@ -123,6 +124,7 @@
     <a href="#inputs">4. Input files</a>
     <a href="#modes">5. Analysis modes</a>
     <a href="#params">6. Parameters reference</a>
+    <a href="#manyvariants" class="sub">Many-variant specimens</a>
     <a href="#noncoi">7. Non-coding marker mode</a>
     <div class="sec">The pipeline</div>
     <a href="#phase1" class="sub">Phase 1 — Demultiplexing</a>
@@ -446,12 +448,16 @@ markers. Off by default.</p>
       <td>Minimum proportion of a secondary haplotype for it to count as a real variant
           (and for the sample to be flagged as mixed). Below this the minority is treated
           as noise and the ordinary consensus is kept. Values below ~10% approach the ONT
-          error floor and risk false positives.</td></tr>
+          error floor and risk false positives. This value also caps how many variants
+          can be reported at once — see
+          <a href="#manyvariants">Tuning for specimens with many variants</a>.</td></tr>
   <tr><td><b>Variant tolerance (% of diagnostic sites)</b></td><td>10</td><td>0 … 40</td>
       <td>Maximum percentage of the polymorphic (diagnostic) sites at which two reads of
           the <i>same</i> haplotype may disagree — due to sequencing error — before they
           are split into separate variant clusters. Lower = stricter (more clusters);
-          higher = lumps more reads together.</td></tr>
+          higher = lumps more reads together. Applied as a percentage of the sites
+          found, so its effect grows with the number of variants present — see
+          <a href="#manyvariants">Tuning for specimens with many variants</a>.</td></tr>
 </table>
 
 <h4>Mixture triage — how a flagged sample is interpreted</h4>
@@ -488,6 +494,114 @@ likely a common haplotype of a well-sampled species. One that is identical to a
 the classic cross-contamination signature — check the two samples' positions on the plate.
 The <b>Identical to N other barcodes</b> column of the variants sheet gives that count
 directly.
+</div>
+
+<h4 id="manyvariants">Tuning for specimens with many variants</h4>
+<p>The defaults (20% / 10%) are calibrated for the common case: one dominant template plus
+one contaminant, NUMT or allele. A specimen expected to carry <b>several</b> co-abundant
+variants — pooled or bulk material, gut contents, multi-copy nuclear markers, deliberately
+mixed libraries — needs both knobs re-tuned, because both scale with the number of variants
+actually present.</p>
+
+<h5>1. The detection ceiling is set by the minimum fraction</h5>
+<p>A cluster is only promoted to a real variant when it holds at least
+<i>Min. secondary variant fraction</i> of the reads. That puts a hard ceiling on how many
+variants can ever be reported at once:</p>
+<table>
+  <tr><th>Min. secondary variant fraction</th><th>Max. variants detectable in one specimen</th></tr>
+  <tr><td>20% <span class="pill def">default</span></td><td>5</td></tr>
+  <tr><td>15%</td><td>6</td></tr>
+  <tr><td>10% <i>(GUI minimum)</i></td><td>10</td></tr>
+</table>
+<div class="warn">
+<b>The silent failure mode</b>
+Six equally abundant templates hold ~17% of the reads each. At the default 20%,
+<i>none</i> of them clears the bar, every cluster is demoted to noise, the resolver falls
+back to a single cluster and the specimen is reported as <b>not mixed</b> at all. A visibly
+mixed sample coming back clean is almost always this. Lower the fraction to 10% before
+concluding anything.
+</div>
+<p>Lowering this value also lowers the per-column polymorphism threshold that finds the
+diagnostic sites in the first place (it is derived as
+<code>min(20%, min. secondary fraction)</code> and never set above it), so a variant at the
+chosen fraction always remains detectable.</p>
+
+<h5>2. Tolerance is relative, so it grows with the number of variants</h5>
+<p><i>Variant tolerance</i> is applied as a percentage of the polymorphic sites found:
+<code>allowed mismatches = tolerance × number of diagnostic sites</code>. More variants
+means more diagnostic sites, so the same 10% buys progressively more slack:</p>
+<table>
+  <tr><th>Diagnostic sites found</th><th>Mismatches allowed at 10%</th><th>Mismatches allowed at 5%</th></tr>
+  <tr><td>8</td><td>1</td><td>0</td></tr>
+  <tr><td>20</td><td>2</td><td>1</td></tr>
+  <tr><td>40</td><td>4</td><td>2</td></tr>
+</table>
+<p>With 40 diagnostic sites the default merges any two variants separated by 4 sites or
+fewer — exactly the closely-related haplotypes you are trying to separate. Drop the
+tolerance to <b>5%</b> as a starting point for multi-variant specimens.</p>
+
+<h5>3. Coverage has to support the fraction</h5>
+<p>Variant calling runs on the sub-sampled read set of each coverage value in the
+<i>Coverage list</i> (§6.3), and a cluster additionally needs <b>≥ 3 reads in absolute
+terms</b>, not just the right percentage. At a 25-read subset, a 10% variant is 2.5 reads
+and is invisible by construction. Include high values in the coverage list — e.g.
+<code>50, 100, 200, 400</code> — so the resolver has enough reads to work with. As a rule of
+thumb, aim for at least <code>30 / fraction</code> reads per specimen: ~300 reads to call
+10% variants reliably.</p>
+
+<h5>4. Built-in caps you cannot reach from the GUI</h5>
+<table>
+  <tr><th>Cap</th><th>Value</th><th>Effect</th></tr>
+  <tr><td>Variants recovered per specimen</td><td>3</td>
+      <td>Only the 3 most abundant secondary variants are re-processed (2a re-consensus +
+          Phase 3) into <code>secondary_variants_recovered.fa</code>. The rest are still
+          written in full to <code>secondary_variants.fa</code>, just uncorrected, and the
+          count left out is reported in the <b>Variants beyond cap (not recovered)</b>
+          column of the variants sheet.</td></tr>
+  <tr><td>Ambiguities per secondary variant</td><td>&lt; 5 Ns</td>
+      <td>A secondary consensus with 5 or more Ns is dropped from
+          <code>secondary_variants.fa</code> and from recovery, to keep the file
+          informative.</td></tr>
+  <tr><td>Linked polymorphic columns</td><td>≥ 2</td>
+      <td>Single-SNP variants are never reported (anti-hotspot guard, above).</td></tr>
+  <tr><td>Reads per cluster</td><td>≥ 3</td>
+      <td>Absolute floor, applied on top of the percentage.</td></tr>
+</table>
+
+<h5>5. Suggested starting point</h5>
+<pre><span class="c"># specimens expected to carry many co-abundant variants</span>
+Detect intra-sample sequence variants   ON
+Min. secondary variant fraction (%)     10
+Variant tolerance (%)                    5
+Coverage list                           50, 100, 200, 400</pre>
+
+<h5>6. Reading the result back and correcting course</h5>
+<p>Use the <b>Intra-sample variants</b> sheet of <code>runsummary.xlsx</code>
+(<a href="#excel">§8.1</a>) to check whether the settings landed:</p>
+<table>
+  <tr><th>Symptom in the sheet</th><th>Diagnosis</th><th>Fix</th></tr>
+  <tr><td><b>#noise reads</b> is high and <b>#variants</b> is low</td>
+      <td>Tolerance too strict: one true haplotype fragmented into many small clusters,
+          each of which then fell below the minimum fraction.</td>
+      <td>Raise tolerance back towards 8–10%.</td></tr>
+  <tr><td>Few variants but large <b>Divergence vs dominant</b> values</td>
+      <td>Tolerance too loose: distinct haplotypes lumped into one cluster.</td>
+      <td>Lower tolerance to 3–5%.</td></tr>
+  <tr><td><b>Variants beyond cap (not recovered)</b> &gt; 0</td>
+      <td>More eligible variants than the recovery cap of 3.</td>
+      <td>The sequences are still in <code>secondary_variants.fa</code>; use those, or run
+          them through <a href="#util-compare">FASTA Compare</a> separately.</td></tr>
+  <tr><td>Sample not flagged mixed at all, despite expectation</td>
+      <td>Detection ceiling, or coverage below <code>3 / fraction</code> reads.</td>
+      <td>Lower the fraction to 10% and raise the coverage list.</td></tr>
+</table>
+<div class="warn">
+<b>Below ~10% you are at the ONT error floor</b>
+The 10% GUI minimum is a deliberate limit, not an arbitrary one. At that setting expect
+false positives, and validate every variant before reporting it: check the
+<code>div=…%</code> field in the <code>secondary_variants.fa</code> headers. In coding
+markers a divergence under ~1% combined with <code>translates=no</code> is far more likely
+to be residual error, heteroplasmy or a NUMT than a real variant.
 </div>
 
 <h4>Non-coding / genetic code / performance</h4>
@@ -912,7 +1026,8 @@ cores; gzip files are streamed sequentially.</p>
 <p>Submit barcode FASTA files to NCBI BLAST (remote URL API) for taxonomic identification.
 Sequences are merged, normalized and split into batches; each batch is submitted, polled
 and its hits written incrementally to a timestamped <code>.tsv</code> (and an
-<code>.xlsx</code>).</p>
+<code>.xlsx</code>). The sequences that were queried are saved alongside them as
+<code>blast-&lt;ts&gt;.fa</code>.</p>
 
 <figure class="">
   <img src="images/util-blast.png" alt="BLAST utility">
@@ -929,7 +1044,20 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
       repeated network calls.</li>
   <li>If the output file is locked (e.g. open in Excel) the writer retries; if it cannot
       create the file at all, the run aborts cleanly rather than wasting network queries.</li>
+  <li>The run also writes <code>blast-&lt;ts&gt;.fa</code> with the sequences submitted, in
+      the normalized single-line form actually sent to NCBI — so its headers are exactly the
+      <code>Query_name</code> values of the results table. It is written before the first
+      query, so it survives a run stopped half way.</li>
 </ul>
+<div class="tip">
+<b>Feeding the Best Sequence utility</b>
+The FASTA and the results table share the same base name on purpose
+(<code>blast-20260908-210439.fa</code> + <code>.xlsx</code>), which is how
+<a href="#util-best">§14</a> pairs a run's sequences with its BLAST table. Running BLAST on
+each parameter set therefore leaves the input for that utility ready, with no renaming.
+Remember that §14 additionally requires the <code>Query_*</code> taxonomy columns, which you
+add to the table yourself.
+</div>
 <div class="note">
 <b>NCBI API key required</b>
 The panel requires a personal NCBI API key before it will submit queries (registered free
@@ -951,6 +1079,25 @@ in more than one run, slightly different sequences. This utility merges those ru
 keeps <b>one best sequence per sample</b>, using the BLAST hits of each candidate as the
 arbiter. Open it from <b>Best Sequence</b> in the sidebar, just below <b>BLAST</b>.</p>
 
+<p>The panel works in two modes, decided by how many runs you drop into it:</p>
+<table>
+  <tr><th>Input</th><th>Mode</th><th>What it does</th></tr>
+  <tr><td><b>Two or more</b> FASTA + table pairs</td><td>Selection</td>
+      <td>Compares the runs and keeps the best sequence per sample, then classifies the
+          result. <code>Decision</code> says how each one was settled.</td></tr>
+  <tr><td><b>One</b> FASTA + table pair</td><td>Classification</td>
+      <td>There is nothing to choose between, so every sequence is kept and the run is
+          simply <b>split by taxonomic match</b>: which sequences agree with the expected
+          taxonomy and which do not. <code>Decision</code> reads
+          <code>single_run</code> for every row.</td></tr>
+</table>
+<div class="tip">
+The single-run mode is the quick way to triage one BLAST run: it produces the same report
+and the same <code>_identified</code> / <code>_no_tax_hit</code> split, so you can pull out
+the sequences with a taxonomic match — and spot the <code>tax_mismatch</code> ones — without
+having to process the library twice.
+</div>
+
 <figure class="">
   <img src="images/util-best.png" alt="Best Sequence utility">
   <figcaption><b>Figure 11.</b> The Best Sequence utility: paired FASTA + BLAST inputs and
@@ -963,8 +1110,11 @@ automatically <b>by base file name</b>, so each pair must share it:</p>
 <pre>run_strict.fa      +  run_strict.xlsx
 run_relaxed.fa     +  run_relaxed.xlsx
 run_permissive.fa  +  run_permissive.xlsx</pre>
-<p>Two or more comparisons are required; there is no upper limit. BLAST tables may be
-<code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>. Each row of the drop zone shows
+<p>The <a href="#util-blast">BLAST utility</a> already writes each run as such a pair
+(<code>blast-&lt;ts&gt;.fa</code> + <code>blast-&lt;ts&gt;.xlsx</code>), so its output
+folders can be dropped here directly.</p>
+<p>One pair is enough (classification mode); two or more enable the comparison, with no
+upper limit. BLAST tables may be <code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>. Each row of the drop zone shows
 the pair, its sequence count and whether the table passed validation; a FASTA with no
 matching table (or a table with no matching FASTA) is listed in red and ignored.</p>
 
@@ -991,6 +1141,9 @@ at all is still handled.</p>
 <p>Sequences are grouped by <b>sample ID</b>: the text before the first <code>;</code> in
 the header, minus the suffix configured in the panel (<code>_all.fa</code> by default), so
 <code>DNS-1343_all.fa;758;807;ambs=0;estgaps=0</code> → <code>DNS-1343</code>.</p>
+<p>With a single run each sample has one candidate, so the steps below do not apply: the
+sequence is kept as it is and only its taxonomic level is computed. The scoring matters
+only when there is more than one candidate to compare.</p>
 <ol>
   <li><b>Identical sequences are taken as they are.</b> If a sample's sequence is
       byte-identical in every run where it appears, there is nothing to decide — it is
@@ -1087,28 +1240,102 @@ must be reviewed. Use the <b>Decision</b> column of the report to tell those apa
 samples that also disagreed between runs.
 </div>
 
-<p>The report lists, per sample: the decision and the run it came from, the original header,
-the sequence metrics (length, reads, ambs, estgaps), the BLAST evidence (number of hits,
-taxonomic level reached, expected taxon, best hit accession/organism/identity/alignment/
-bit score), the final score, the runner-up run and its score, and a <b>Flag</b> column:</p>
+<h3>14.5 Reading the report</h3>
+<p>The report has one row per sample, laid out in four colour-coded zones.</p>
 <table>
-  <tr><th>Flag</th><th>Meaning</th></tr>
-  <tr><td><code>no_blast_hit</code></td>
-      <td>No hit survived the minimum-alignment filter; the choice rested on length,
-          ambiguities and read count alone.</td></tr>
-  <tr><td><code>low_taxonomic_support</code></td>
-      <td>The best hit matched only at order level, or at no rank.</td></tr>
-  <tr><td><code>near_tie</code></td>
-      <td>The runner-up scored within 1 point — the winner is defensible but marginal.</td></tr>
-  <tr><td><code>missing_in_N_run(s)</code></td>
-      <td>The sample was not recovered in <i>N</i> of the runs supplied.</td></tr>
-  <tr><td><code>ambs=N</code></td>
-      <td>The selected sequence still carries <i>N</i> ambiguous bases.</td></tr>
+  <tr><th>Zone</th><th>Columns</th><th>Answers</th></tr>
+  <tr><td>1 · Identity</td>
+      <td><code>Sample</code>, <code>Decision</code>, <code>N_files</code>,
+          <code>Selected_file</code>, <code>Header</code></td>
+      <td>Which sequence was kept, from which run, and how it was chosen.</td></tr>
+  <tr><td>2 · Sequence</td>
+      <td><code>Length</code>, <code>Reads</code>, <code>Ambs</code>, <code>Estgaps</code></td>
+      <td>How good the consensus itself is.</td></tr>
+  <tr><td>3 · BLAST evidence</td>
+      <td><code>N_hits</code>, <code>N_hits_raw</code>, <code>Tax_level</code>,
+          <code>Query_Order/Family/Genus/organism</code>,
+          <code>Hit_Order/Family/Genus/organism</code>, <code>Best_hit_acc</code>,
+          <code>P_identity</code>, <code>Alignment_length</code>, <code>Bit_score</code></td>
+      <td>What the expected taxonomy was, what BLAST actually found, and how strong
+          that match is.</td></tr>
+  <tr><td>4 · Decision</td>
+      <td><code>Score</code>, <code>Runner_up_file</code>, <code>Runner_up_score</code>,
+          <code>Flag</code></td>
+      <td>How close the call was, and what deserves review.</td></tr>
 </table>
 <div class="tip">
-Sort or filter the <code>.xlsx</code> by <b>Flag</b> and by <b>Decision</b> =
-<code>blast_selected</code> to review only the samples that actually required a decision;
-rows resolved by BLAST are shown in bold and the flags in amber.
+The expected taxonomy and the taxonomy of the best hit are written <b>side by side, rank by
+rank</b>, so a mismatch shows exactly where it breaks: same order but different family is a
+distant relative, different order is another lineage entirely. Both are reported with their
+original spelling (<i>Epidendrum fimbriatum</i>, not <code>epidendrum_fimbriatum</code>);
+the comparison itself is case-insensitive.
+</div>
+<p>The <code>Query_*</code> columns are read from the BLAST table independently of the
+hits, so the expected taxonomy is still reported for a sample whose hits were all filtered
+out. It can only be empty when the sample appears in no BLAST table at all, or when the
+rank was left blank in the input.</p>
+
+<h4>Decision</h4>
+<table>
+  <tr><th>Value</th><th>Meaning</th></tr>
+  <tr><td><code>single_run</code></td>
+      <td>Only one run was supplied: nothing was compared, the sequence was kept and
+          classified.</td></tr>
+  <tr><td><code>identical_in_all_runs</code></td>
+      <td>The sample came out byte-identical in every run: no decision was needed.</td></tr>
+  <tr><td><code>identical_in_available_runs</code></td>
+      <td>Identical wherever it appeared, but the sample is missing from some run.</td></tr>
+  <tr><td><code>resolved_by_score</code></td>
+      <td>The runs disagreed and the module had to arbitrate. These are the rows worth
+          auditing; they are shown in bold in the workbook.</td></tr>
+</table>
+
+<h4>Hit counts</h4>
+<p><code>N_hits</code> counts the hits that <b>passed</b> the minimum-alignment filter and
+therefore took part in the decision; <code>N_hits_raw</code> counts the rows present in the
+table <b>before</b> filtering. <code>N_hits = 0</code> with <code>N_hits_raw &gt; 0</code>
+means BLAST did return something, but every hit was too short to be trusted — a different
+situation from BLAST returning nothing.</p>
+
+<h4>Flags</h4>
+<table>
+  <tr><th>Flag</th><th>Meaning</th><th>What to do</th></tr>
+  <tr><td><code>tax_mismatch</code></td>
+      <td>Hits passed the filter, but <b>none</b> matches the expected taxonomy at any
+          rank. The evidence is good and points somewhere else.</td>
+      <td><b>Review first.</b> This is what contamination, an index hop or a mislabelled
+          voucher looks like — especially at high identity.</td></tr>
+  <tr><td><code>low_taxonomic_support</code></td>
+      <td>The best hit matches only at <b>order</b> level.</td>
+      <td>Weak but consistent: usually a species with no close relative in the database.</td></tr>
+  <tr><td><code>hits_below_min_aln</code></td>
+      <td>Hits exist in the table but all fall below the minimum alignment length.</td>
+      <td>Check the sequence length and quality; consider lowering the threshold.</td></tr>
+  <tr><td><code>no_blast_hit</code></td>
+      <td>No hit at all for this sequence in the table.</td>
+      <td>The choice rested on length, ambiguities and read count alone.</td></tr>
+  <tr><td><code>near_tie</code></td>
+      <td>The runner-up scored within 1 point — the winner is defensible but marginal.</td>
+      <td>Compare the two runs by hand if the sample matters.</td></tr>
+  <tr><td><code>missing_in_N_run(s)</code></td>
+      <td>The sample was not recovered in <i>N</i> of the runs supplied.</td>
+      <td>Fewer candidates were available to compare.</td></tr>
+  <tr><td><code>ambs=N</code></td>
+      <td>The selected sequence still carries <i>N</i> ambiguous bases.</td>
+      <td>Informational; the score already penalised them.</td></tr>
+</table>
+<div class="warn">
+<b>A mismatch is not necessarily a contaminated sample</b>
+<code>tax_mismatch</code> means the sequence and the expected taxonomy disagree — it does
+not say which of the two is wrong. Before suspecting the DNA, check the identification you
+supplied in the <code>Query_*</code> columns and whether the reference database actually
+covers the group: an under-represented lineage can leave the true match absent, and the
+best available hit then lands in a different family.
+</div>
+<div class="tip">
+Filter the <code>.xlsx</code> by <b>Decision</b> = <code>resolved_by_score</code> to review
+only the samples where the runs disagreed and the module had to arbitrate; those rows are
+shown in bold, and the flags in amber.
 </div>
 
 <!-- ════════════════════════════════════════════════════ -->
@@ -1215,7 +1442,16 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
       <td>Enable/disable or tune <b>Detect intra-sample sequence variants</b> (§6.1) — a
           low <i>Min. secondary variant fraction</i> or high <i>Variant tolerance</i> makes
           the detector more sensitive to minor haplotypes/noise. Check the <b>Intra-sample
-          variants</b> sheet in <code>runsummary.xlsx</code> for the per-sample breakdown.</td></tr>
+          variants</b> sheet in <code>runsummary.xlsx</code> for the per-sample breakdown,
+          and <a href="#manyvariants">§6.1 — many-variant specimens</a> if several
+          variants are expected.</td></tr>
+  <tr><td>A specimen known to be mixed is reported as <b>not mixed</b></td>
+      <td>Most often the detection ceiling: with <i>Min. secondary variant fraction</i>
+          at the default 20%, six or more co-abundant variants each fall below the bar
+          and are all demoted to noise. Lower it to 10%, drop <i>Variant tolerance</i>
+          to 5%, and make sure the <i>Coverage list</i> reaches high enough values
+          (a cluster also needs ≥ 3 reads in absolute terms). See
+          <a href="#manyvariants">§6.1 — many-variant specimens</a>.</td></tr>
   <tr><td>Application crashes</td>
       <td>A crash log is written to <code>ONTbarcoder_crash.log</code> in your home folder
           (<code>%USERPROFILE%</code>). Include it when reporting issues.</td></tr>

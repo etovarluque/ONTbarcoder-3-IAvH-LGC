@@ -16,6 +16,21 @@ QUERY_TAX_COLUMNS = ("Query_Order", "Query_Family", "Query_Genus", "Query_organi
 # Taxonomic rank reached by the best concordant hit, deepest first.
 TAX_LEVELS = ("organism", "genus", "family", "order", "none")
 
+# Fallback for a query that appears in no BLAST table at all: its expected
+# taxonomy is simply unknown, since the tables are the only source for it.
+_EMPTY_TAX = {"order": "", "family": "", "genus": "", "organism": ""}
+
+# One-line meaning of each flag, printed next to its count in the run log.
+_FLAG_HELP = {
+    "no_blast_hit":          "(no hit at all in the BLAST table)",
+    "hits_below_min_aln":    "(hits exist but all below the minimum alignment)",
+    "tax_mismatch":          "(good hits, none matching the expected taxonomy)",
+    "low_taxonomic_support": "(best hit matches only at order level)",
+    "near_tie":              "(runner-up within 1 point of the winner)",
+    "missing_in":            "(sample not recovered in every run)",
+    "ambs":                  "(selected sequence still carries ambiguities)",
+}
+
 # ── Scoring weights ──────────────────────────────────────────────────────────
 # These are design constants, not user settings, so they are deliberately kept
 # out of the panel: their values only make sense relative to the 100-point gap
@@ -141,7 +156,8 @@ class _PairDropZone(QtWidgets.QFrame):
         self._lbl.setToolTip(
             "Drop every FASTA (.fa/.fas/.fasta) together with its BLAST table\n"
             "(.xlsx/.tsv/.csv). Files are paired by name, so each pair must share\n"
-            "the same base name — e.g. run1.fa + run1.xlsx."
+            "the same base name — e.g. run1.fa + run1.xlsx.\n"
+            "One pair classifies that run; two or more compare them."
         )
 
         self._drag_icon_lbl = QtWidgets.QLabel()
@@ -236,18 +252,21 @@ class _PairDropZone(QtWidgets.QFrame):
     def is_valid(self) -> Tuple[bool, str]:
         """Ready to run? Returns (ok, message shown next to the drop zone)."""
         pairs = self.pairs()
-        if len(pairs) < 2:
-            return False, "Add at least 2 comparisons (FASTA + BLAST table each)."
+        if not pairs:
+            return False, "Add at least one FASTA with its BLAST table."
         bad = [os.path.basename(p["blast"]) for p in pairs
                if self._missing_tax_columns(p["blast"])]
         if bad:
             return False, ("Missing query taxonomy columns in: " + ", ".join(bad[:3])
                            + ("…" if len(bad) > 3 else ""))
+        note = ("Single run: sequences will be classified by taxonomic match "
+                "(no selection between runs)." if len(pairs) == 1 else "")
         orphan_fa, orphan_bl = self._orphans()
         if orphan_fa or orphan_bl:
-            return True, (f"{len(orphan_fa) + len(orphan_bl)} unpaired file(s) "
-                          f"will be ignored.")
-        return True, ""
+            unpaired = (f"{len(orphan_fa) + len(orphan_bl)} unpaired file(s) "
+                        f"will be ignored.")
+            return True, (note + "  " + unpaired) if note else unpaired
+        return True, note
 
     # ── Rows ──────────────────────────────────────────────────────────────
 
@@ -479,12 +498,13 @@ class BestSeqPanel(QtWidgets.QWidget):
         # ── Title + description ──
         self._lbl_title = make_label("Best Sequence Selector", size=19, bold=True)
         self._lbl_desc = make_label(
-            "Pick the best consensus sequence per sample across two or more ONTbarcoder runs "
-            "made with different parameters.\n"
             "Drag-and-drop each FASTA together with its BLAST table (.xlsx, .tsv, .csv); "
             "files are paired by base name (run1.fa + run1.xlsx).\n"
-            "Sequences identical in every run are kept as they are; the rest are resolved "
-            "with the BLAST hits.",
+            "Two or more runs — picks the best consensus sequence per sample: those "
+            "identical in every run are kept as they are, the rest are resolved with the "
+            "BLAST hits.\n"
+            "A single run — classifies its sequences by taxonomic match, splitting them "
+            "into identified and no-hit FASTA files.",
             color=TEXT_SEC
         )
         self._lbl_desc.setWordWrap(True)
@@ -539,7 +559,8 @@ class BestSeqPanel(QtWidgets.QWidget):
 
         # ── Scoring explanation ──
         self._lbl_rule = make_label(
-            "Score = taxonomic rank of the best concordant hit "
+            "Score (when comparing two or more runs) = taxonomic rank of the "
+            "best concordant hit "
             "(species 400 · genus 300 · family 200 · order 100)  +  its bit score "
             f"×{BITSCORE_WEIGHT:g} normalised within the sample  −  {AMB_PENALTY:g} per "
             f"ambiguity  −  {GAP_PENALTY:g} per estimated gap. "
@@ -677,9 +698,10 @@ class BestSeqPanel(QtWidgets.QWidget):
         ctx = "BestSeqPanel"
         self._lbl_title.setText(_tr(ctx, "Best Sequence Selector"))
         self._lbl_desc.setText(_tr(ctx,
-            "Pick the best consensus sequence per sample across two or more ONTbarcoder "
-            "runs made with different parameters. Drag-and-drop each FASTA together with "
-            "its BLAST table (.xlsx, .tsv, .csv); files are paired by base name."))
+            "Drag-and-drop each FASTA together with its BLAST table (.xlsx, .tsv, .csv); "
+            "files are paired by base name. With two or more runs it picks the best "
+            "consensus sequence per sample; with a single run it classifies its sequences "
+            "by taxonomic match."))
         self._settings_box.setTitle(_tr(ctx, "Selection Settings"))
         self._lbl_minaln.setText(_tr(ctx, "Minimum alignment length (bp):"))
         self._lbl_suffix.setText(_tr(ctx, "Strip suffix from sample ID:"))
@@ -830,10 +852,14 @@ class BestSeqPanel(QtWidgets.QWidget):
 
 class _BestSeqWorker(QtCore.QThread):
     """
-    Select the best consensus sequence per sample among two or more runs.
+    Select the best consensus sequence per sample among one or more runs.
 
-    Sequences that are identical in every run where the sample appears are taken
-    as they are. The rest are scored with the BLAST hits of each candidate:
+    With a single run there is nothing to choose between: every sequence is kept
+    and the module works as a classifier, splitting the run by taxonomic match.
+
+    With two or more runs, sequences that are identical in every run where the
+    sample appears are taken as they are. The rest are scored with the BLAST
+    hits of each candidate:
 
       score = taxonomic bonus of the best concordant hit
             + bitscore_weight * (bit score of that hit, normalised in the sample)
@@ -859,17 +885,24 @@ class _BestSeqWorker(QtCore.QThread):
 
     # Report layout: 4 colour zones (identity · sequence metrics · BLAST · decision)
     _COLUMNS = [
+        # zone 1 - which sequence was kept
         "Sample", "Decision", "N_files", "Selected_file", "Header",
+        # zone 2 - sequence metrics
         "Length", "Reads", "Ambs", "Estgaps",
-        "N_hits", "Tax_level", "Query_taxon", "Best_hit_acc", "Best_hit_organism",
-        "P_identity", "Alignment_length", "Bit_score",
+        # zone 3 - BLAST evidence: expected taxonomy and the best hit side by
+        # side, so a mismatch shows at which rank it breaks
+        "N_hits", "N_hits_raw", "Tax_level",
+        "Query_Order", "Query_Family", "Query_Genus", "Query_organism",
+        "Hit_Order", "Hit_Family", "Hit_Genus", "Hit_organism",
+        "Best_hit_acc", "P_identity", "Alignment_length", "Bit_score",
+        # zone 4 - how the decision was made
         "Score", "Runner_up_file", "Runner_up_score", "Flag",
     ]
     _ZONE_2 = 5      # first column of zone 2
     _ZONE_3 = 9      # first column of zone 3
-    _ZONE_4 = 17     # first column of zone 4
+    _ZONE_4 = 24     # first column of zone 4
     _NUMERIC_NAMES = frozenset({
-        "N_files", "Length", "Reads", "Ambs", "Estgaps", "N_hits",
+        "N_files", "Length", "Reads", "Ambs", "Estgaps", "N_hits", "N_hits_raw",
         "P_identity", "Alignment_length", "Bit_score", "Score", "Runner_up_score",
     })
 
@@ -937,14 +970,30 @@ class _BestSeqWorker(QtCore.QThread):
         return info
 
     @staticmethod
-    def _clean(value) -> str:
-        """Empty taxonomic cells may be written as 0 / '-' / '' in the tables."""
+    def _display(value) -> str:
+        """Readable form of a taxon name, kept for the report.
+
+        Empty taxonomic cells may be written as 0 / '-' / '' in the tables.
+        NCBI writes organism names with the genus capitalised and underscores
+        instead of spaces (Palicourea_purpurea), so the underscores go and the
+        original capitalisation is preserved. A name that arrives entirely in
+        lower case is capitalised, so the genus reads correctly
+        (epidendrum fimbriatum -> Epidendrum fimbriatum).
+        """
         if value is None:
             return ""
         text = str(value).strip()
         if text in ("0", "0.0", "-", "", "N/A", "NA", "nan", "None"):
             return ""
-        return text.replace("_", " ").lower()
+        text = text.replace("_", " ")
+        if text == text.lower():
+            text = text[:1].upper() + text[1:]
+        return text
+
+    @staticmethod
+    def _clean(value) -> str:
+        """Normalised form used for comparisons only (never shown)."""
+        return _BestSeqWorker._display(value).lower()
 
     @staticmethod
     def _to_float(value) -> float:
@@ -953,8 +1002,20 @@ class _BestSeqWorker(QtCore.QThread):
         except (TypeError, ValueError):
             return 0.0
 
-    def _load_blast(self, path: str) -> Dict[str, List[dict]]:
-        """Return {query_name: [hit, ...]} ordered by Hit_rank."""
+    def _load_blast(self, path: str) -> Tuple[Dict[str, List[dict]],
+                                              Dict[str, dict],
+                                              Dict[str, int]]:
+        """Parse one BLAST table.
+
+        Returns (hits, query_tax, raw_counts):
+          hits        {query_name: [hit, ...]} ordered by Hit_rank, keeping only
+                      hits at or above the minimum alignment length;
+          query_tax   {query_name: expected taxonomy} read from every row,
+                      including the rows dropped by that filter, so the expected
+                      classification is still reported for a query whose hits
+                      were all too short;
+          raw_counts  {query_name: rows present in the table} before filtering.
+        """
         headers, rows = read_blast_rows(path)
         if not headers:
             raise ValueError(f"Empty or unreadable BLAST table: {os.path.basename(path)}")
@@ -978,58 +1039,77 @@ class _BestSeqWorker(QtCore.QThread):
 
         min_aln = float(self.cfg.get("min_alignment", 100))
         table: Dict[str, List[dict]] = {}
+        query_tax: Dict[str, dict] = {}
+        raw_counts: Dict[str, int] = {}
         for row in rows:
             query = get(row, "Query_name")
             if query is None or str(query).strip() == "":
                 continue
+            query = str(query).strip()
+            raw_counts[query] = raw_counts.get(query, 0) + 1
+            # The expected taxonomy is a property of the query, repeated on
+            # every hit row, so it is read before the alignment-length filter.
+            if query not in query_tax:
+                query_tax[query] = {
+                    "order":    self._display(get(row, "Query_Order")),
+                    "family":   self._display(get(row, "Query_Family")),
+                    "genus":    self._display(get(row, "Query_Genus")),
+                    "organism": self._display(get(row, "Query_organism")),
+                }
             alen = self._to_float(get(row, "Alignment_length"))
             if alen < min_aln:
                 continue   # spurious short hit: carries no taxonomic information
             hit = {
-                "rank":       self._to_float(get(row, "Hit_rank", 99)) or 99,
-                "acc":        str(get(row, "Subject_accession.ver", "") or ""),
-                "pident":     self._to_float(get(row, "P_identity")),
-                "alen":       alen,
-                "bit":        self._to_float(get(row, "Bit_score")),
-                "q_order":    self._clean(get(row, "Query_Order")),
-                "q_family":   self._clean(get(row, "Query_Family")),
-                "q_genus":    self._clean(get(row, "Query_Genus")),
-                "q_organism": self._clean(get(row, "Query_organism")),
-                "s_order":    self._clean(get(row, "Subject_Order")),
-                "s_family":   self._clean(get(row, "Subject_Family")),
-                "s_genus":    self._clean(get(row, "Subject_Genus")),
-                "s_organism": self._clean(get(row, "Subject_organism")),
+                "rank":     self._to_float(get(row, "Hit_rank", 99)) or 99,
+                "acc":      str(get(row, "Subject_accession.ver", "") or ""),
+                "pident":   self._to_float(get(row, "P_identity")),
+                "alen":     alen,
+                "bit":      self._to_float(get(row, "Bit_score")),
+                "order":    self._display(get(row, "Subject_Order")),
+                "family":   self._display(get(row, "Subject_Family")),
+                "genus":    self._display(get(row, "Subject_Genus")),
+                "organism": self._display(get(row, "Subject_organism")),
             }
-            table.setdefault(str(query).strip(), []).append(hit)
+            table.setdefault(query, []).append(hit)
         for hits in table.values():
             hits.sort(key=lambda h: h["rank"])
-        return table
+        return table, query_tax, raw_counts
 
     # ── Scoring ───────────────────────────────────────────────────────────
 
     @staticmethod
-    def _concordance(hit: dict) -> str:
-        """Deepest rank shared by the expected query taxonomy and the subject."""
-        if hit["q_organism"] and hit["s_organism"]:
+    def _concordance(hit: dict, qtax: dict) -> str:
+        """Deepest rank shared by the expected query taxonomy and the subject.
+
+        Both sides are compared in normalised (lower-case) form; the report
+        keeps the original spelling.
+        """
+        def same(rank):
+            a = qtax.get(rank, "").lower()
+            b = hit.get(rank, "").lower()
+            return bool(a) and a == b
+
+        q_sp = qtax.get("organism", "").lower()
+        s_sp = hit.get("organism", "").lower()
+        if q_sp and s_sp:
             # species names may carry authors or suffixes: compare the first two words
-            query_sp   = " ".join(hit["q_organism"].split()[:2])
-            subject_sp = " ".join(hit["s_organism"].split()[:2])
-            if query_sp and query_sp == subject_sp:
+            if " ".join(q_sp.split()[:2]) == " ".join(s_sp.split()[:2]):
                 return "organism"
-        if hit["q_genus"] and hit["s_genus"] and hit["q_genus"] == hit["s_genus"]:
+        if same("genus"):
             return "genus"
-        if hit["q_family"] and hit["s_family"] and hit["q_family"] == hit["s_family"]:
+        if same("family"):
             return "family"
-        if hit["q_order"] and hit["s_order"] and hit["q_order"] == hit["s_order"]:
+        if same("order"):
             return "order"
         return "none"
 
-    def _evaluate(self, hits: List[dict]) -> Tuple[Optional[dict], str]:
+    def _evaluate(self, hits: List[dict],
+                  qtax: dict) -> Tuple[Optional[dict], str]:
         """Best taxonomically concordant hit of one candidate sequence."""
         best = None
         best_level = "none"
         for hit in hits:
-            level = self._concordance(hit)
+            level = self._concordance(hit, qtax)
             deeper = self.TAX_BONUS[level] > self.TAX_BONUS[best_level]
             same_level_better_bit = (level == best_level and best is not None
                                      and hit["bit"] > best["bit"])
@@ -1139,7 +1219,7 @@ class _BestSeqWorker(QtCore.QThread):
                 raw_vals.append("")
             raw_vals = raw_vals[:n_cols]
 
-            decided = (raw_vals[_dec_idx] == "blast_selected"
+            decided = (raw_vals[_dec_idx] == "resolved_by_score"
                        if _dec_idx < n_cols else False)
             tinted = (rn % 2 == 0)
 
@@ -1211,16 +1291,18 @@ class _BestSeqWorker(QtCore.QThread):
             self.statusUpdated.emit(
                 "files", f"Loading     │ [{i + 1}/{n_files}] {os.path.basename(pair['fasta'])}"
             )
-            seqs  = self._read_fasta(pair["fasta"])
-            blast = self._load_blast(pair["blast"])
+            seqs = self._read_fasta(pair["fasta"])
+            blast, query_tax, raw_counts = self._load_blast(pair["blast"])
             total_seqs += len(seqs)
             for header, seq in seqs.items():
                 info = self._parse_header(header)
                 hits = blast.get(header, [])
-                best_hit, level = self._evaluate(hits)
+                qtax = query_tax.get(header, _EMPTY_TAX)
+                best_hit, level = self._evaluate(hits, qtax)
                 candidates.setdefault(info["sample"], []).append({
                     "file": label, "header": header, "seq": seq, "info": info,
-                    "n_hits": len(hits), "best_hit": best_hit, "level": level,
+                    "n_hits": len(hits), "n_hits_raw": raw_counts.get(header, 0),
+                    "qtax": qtax, "best_hit": best_hit, "level": level,
                 })
             self.progressUpdated.emit(i + 1, n_files + max(len(candidates), 1))
 
@@ -1247,6 +1329,7 @@ class _BestSeqWorker(QtCore.QThread):
         n_samples   = len(candidates)
         n_identical = 0
         n_selected  = 0
+        n_single    = 0
         n_written   = {"all": 0, "identified": 0, "no_tax": 0}
         level_counts = {lvl: 0 for lvl in TAX_LEVELS}
         flag_counts: Dict[str, int] = {}
@@ -1287,19 +1370,32 @@ class _BestSeqWorker(QtCore.QThread):
                 runner_up = cands[1] if len(cands) > 1 else None
 
                 in_all_files = len(cands) == n_files
-                if identical:
+                if n_files == 1:
+                    # Nothing to compare: the run is being classified by its
+                    # taxonomic match, not chosen against other runs.
+                    decision = "single_run"
+                    n_single += 1
+                elif identical:
                     decision = ("identical_in_all_runs" if in_all_files
                                 else "identical_in_available_runs")
                     n_identical += 1
                 else:
-                    decision = "blast_selected"
+                    decision = "resolved_by_score"
                     n_selected += 1
                 level_counts[best["level"]] = level_counts.get(best["level"], 0) + 1
 
+                # Flags say WHY the taxonomy is (or is not) supported, and are
+                # deliberately distinct: no hit at all, hits that exist but were
+                # all too short, hits that contradict the expected taxonomy
+                # (a contamination / mislabelling candidate), and a hit that only
+                # reaches order level (weak but consistent).
                 flags = []
                 if best["n_hits"] == 0:
-                    flags.append("no_blast_hit")
-                elif best["level"] in ("none", "order"):
+                    flags.append("hits_below_min_aln" if best["n_hits_raw"]
+                                 else "no_blast_hit")
+                elif best["level"] == "none":
+                    flags.append("tax_mismatch")
+                elif best["level"] == "order":
                     flags.append("low_taxonomic_support")
                 if (not identical and runner_up is not None
                         and abs(best["score"] - runner_up["score"]) < 1.0):
@@ -1312,20 +1408,23 @@ class _BestSeqWorker(QtCore.QThread):
                     key = f.split("=")[0]
                     flag_counts[key] = flag_counts.get(key, 0) + 1
 
-                hit = best["best_hit"]
-                query_taxon = ""
-                if hit:
-                    query_taxon = (hit["q_organism"] or hit["q_genus"]
-                                   or hit["q_family"] or hit["q_order"])
+                # The expected taxonomy comes from the BLAST table itself, so it
+                # is reported even when every hit of this query was filtered out.
+                hit  = best["best_hit"]
+                qtax = best["qtax"]
 
                 fh_tsv.write("\t".join(str(x) for x in [
                     sample, decision, len(cands), best["file"], best["header"],
                     best["info"]["length"] if best["info"]["length"] is not None else "",
                     best["info"]["reads"] if best["info"]["reads"] is not None else "",
                     best["info"]["ambs"], best["info"]["estgaps"],
-                    best["n_hits"], best["level"], query_taxon,
+                    best["n_hits"], best["n_hits_raw"], best["level"],
+                    qtax["order"], qtax["family"], qtax["genus"], qtax["organism"],
+                    hit["order"] if hit else "",
+                    hit["family"] if hit else "",
+                    hit["genus"] if hit else "",
+                    hit["organism"] if hit else "",
                     hit["acc"] if hit else "",
-                    hit["s_organism"] if hit else "",
                     round(hit["pident"], 3) if hit else "",
                     int(hit["alen"]) if hit else "",
                     round(hit["bit"], 1) if hit else "",
@@ -1353,6 +1452,8 @@ class _BestSeqWorker(QtCore.QThread):
                 if done % 25 == 0 or done == n_samples:
                     self.statusUpdated.emit(
                         "select",
+                        f"Classifying │ {done}/{n_samples} sequences"
+                        if n_files == 1 else
                         f"Selecting   │ {done}/{n_samples} samples · "
                         f"{n_identical} identical · {n_selected} decided by BLAST"
                     )
@@ -1364,23 +1465,30 @@ class _BestSeqWorker(QtCore.QThread):
                 except Exception:
                     pass
 
-        self.statusUpdated.emit(
-            "identical",
-            f"Identical   │ {n_identical} sample(s) identical across runs"
-        )
-        self.statusUpdated.emit(
-            "select",
-            f"Selected    │ {n_identical + n_selected}/{n_samples} samples · "
-            f"{n_selected} decided by BLAST"
-        )
+        if n_files == 1:
+            self.statusUpdated.emit(
+                "select",
+                f"Classified  │ {n_single}/{n_samples} sequences by taxonomic match"
+            )
+        else:
+            self.statusUpdated.emit(
+                "identical",
+                f"Identical   │ {n_identical} sample(s) identical across runs"
+            )
+            self.statusUpdated.emit(
+                "select",
+                f"Selected    │ {n_identical + n_selected}/{n_samples} samples · "
+                f"{n_selected} decided by BLAST"
+            )
 
         xlsx_path = self._tsv_to_xlsx(tsv_path)
 
         elapsed = datetime.datetime.now() - run_start
         elapsed_str = str(elapsed).split(".")[0]
         status_str  = "Stopped" if self._stop else "Completed"
+        kept = "sequences" if n_files == 1 else "best sequences"
         result_msg = (
-            f"{status_str}   │ {n_written['all']} best sequences · "
+            f"{status_str}   │ {n_written['all']} {kept} · "
             f"{n_written['identified']} identified · {n_written['no_tax']} without taxonomic hit"
         )
         self.statusUpdated.emit("result", result_msg)
@@ -1416,8 +1524,10 @@ class _BestSeqWorker(QtCore.QThread):
             "",
             "Results:",
             f"  Samples                  : {n_samples}",
-            f"  Identical across runs    : {n_identical}",
-            f"  Decided with BLAST       : {n_selected}",
+            (f"  Sequences classified     : {n_single}" if n_files == 1 else
+             f"  Identical across runs    : {n_identical}"),
+            *([] if n_files == 1 else
+              [f"  Resolved by score        : {n_selected}"]),
             "",
             "  Taxonomic level reached by the selected sequence:",
         ]
@@ -1426,7 +1536,10 @@ class _BestSeqWorker(QtCore.QThread):
         log_lines += ["", "  Flags:"]
         if flag_counts:
             for key in sorted(flag_counts):
-                log_lines.append(f"    {key:<24}: {flag_counts[key]}")
+                # missing_in_N_run(s) carries the run count in the key itself
+                help_key = "missing_in" if key.startswith("missing_in") else key
+                log_lines.append(
+                    f"    {key:<22}: {flag_counts[key]:<4} {_FLAG_HELP.get(help_key, '')}")
         else:
             log_lines.append("    (none)")
         log_lines += [
@@ -1446,6 +1559,11 @@ class _BestSeqWorker(QtCore.QThread):
             "      not a verified identification: without a taxonomic hit it goes to",
             "      '_no_tax_hit' like any other. Use the 'Decision' column of the report to",
             "      tell those apart from the ones that also disagreed between runs.",
+            "",
+            "      Review 'tax_mismatch' first: those samples have good BLAST hits that",
+            "      contradict the expected taxonomy, which is what a contamination, an",
+            "      index hop or a mislabelled voucher looks like. Compare the Query_* and",
+            "      Hit_* columns of the report to see at which rank the match breaks.",
             "",
         ]
         log_path = os.path.join(output_dir, f"bestseq_run_log_{mydate}.txt")

@@ -49,9 +49,9 @@ Requires Python 3.11+ (tested on 3.13). For real-time barcoding you also need
 ```
 ONTbarcoder3.py          Main application / GUI
 _utilities/              Worker pipeline + tool panels
-  ONTbarcoder3_multiprocessing.py   Deterministic multiprocessing pipeline
-  blast_panel.py / compare_panel.py / fasta_tools.py /
-  fastq_inspector.py / notes_panel.py / shared.py
+  pipeline.py            Deterministic multiprocessing worker pipeline
+  best_seq_panel.py / blast_panel.py / compare_panel.py /
+  fasta_tools.py / fastq_inspector.py / notes_panel.py / shared.py
   orf_trim_fasta.py      CLI: trim coding barcodes to their ORF
 _mafftfiles/             Bundled MAFFT (disttbfast) + parameter files
 _profiles/               Saved parameter profiles + BLAST config (git-ignored)

@@ -198,7 +198,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="Bio")
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-# Import workers from ONTbarcoder3_multiprocessing
+# Import workers from the pipeline module
 def _get_base_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
@@ -211,12 +211,12 @@ def _profiles_dir() -> str:
 
 sys.path.insert(0, _get_base_dir())
 sys.path.insert(0, os.path.join(_get_base_dir(), "_utilities"))
-from _utilities.ONTbarcoder3_multiprocessing import (
+from _utilities.pipeline import (
     prepdemultiplex, runconsensusparts, MSAcheck, mergedemfiles,
     calculatecoverage, runtoptwenty, copyfiles,
     rundemultiplex, pool_init, pool_init1, pool_init2
 )
-import _utilities.ONTbarcoder3_multiprocessing as _ont_mp
+import _utilities.pipeline as _ont_mp
 
 
 
