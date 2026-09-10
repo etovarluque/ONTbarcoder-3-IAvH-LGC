@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.1b — User Manual</title>
+<title>ONTbarcoder 3.3b — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -112,7 +112,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.1b — User Manual</span>
+    <span class="ver">v3.3b — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -138,11 +138,12 @@
     <a href="#util-tools">11. FASTA Tools</a>
     <a href="#util-fastq">12. FASTQ Inspector</a>
     <a href="#util-blast">13. BLAST</a>
-    <a href="#util-notes">14. Notes</a>
+    <a href="#util-best">14. Best Sequence</a>
+    <a href="#util-notes">15. Notes</a>
     <div class="sec">Reference</div>
-    <a href="#performance">15. Performance &amp; threads</a>
-    <a href="#troubleshoot">16. Troubleshooting</a>
-    <a href="#credits">17. Credits &amp; citation</a>
+    <a href="#performance">16. Performance &amp; threads</a>
+    <a href="#troubleshoot">17. Troubleshooting</a>
+    <a href="#credits">18. Credits &amp; citation</a>
   </nav>
 </aside>
 
@@ -190,7 +191,8 @@ specimen-level barcode sequences — with no command line required.
 Version 3.x preserves the algorithmic logic of ONTbarcoder 2.0 (Srivathsan <i>et al.</i>,
 2024) while adding a redesigned graphical interface, deterministic multiprocessing, a
 real-time (live sequencing) mode, a non-coding marker mode, and a set of integrated utilities
-(FASTA comparison, FASTA tools, a FASTQ inspector and an NCBI BLAST client).
+(FASTA comparison, FASTA tools, a FASTQ inspector, an NCBI BLAST client and a
+best-sequence selector that merges several runs).
 </p>
 <p>This manual targets researchers already familiar with amplicon sequencing and DNA
 barcoding. It documents every parameter, each pipeline phase, and all output files.</p>
@@ -452,6 +454,42 @@ markers. Off by default.</p>
           higher = lumps more reads together.</td></tr>
 </table>
 
+<h4>Mixture triage — how a flagged sample is interpreted</h4>
+<p>Finding two haplotypes is not the same as finding a contamination. Three built-in rules
+separate a real, actionable mixture from ordinary within-species variation and from noise:</p>
+<table>
+  <tr><th>Rule</th><th>Threshold</th><th>What it means</th></tr>
+  <tr><td><b>Dominant↔secondary divergence</b></td><td>≥ 3% → <b>NEEDS REVIEW</b></td>
+      <td>The genetic distance between the kept (dominant) haplotype and each secondary
+          one is computed per cluster (IUPAC-aware). At or above 3% the two templates are
+          at heterospecific level — a cross-contamination or sample-mix candidate — and the
+          sample is flagged for review with an explicit reason. Below 3% the mixture is
+          conspecific and stays informational: the identification is the same either way.
+          The value is reported in the run log, in the FASTA headers as
+          <code>div=…%</code>, and in the report sheet.</td></tr>
+  <tr><td><b>Anti-hotspot guard</b></td>
+      <td>≥ 2 linked polymorphic columns <br>and ≥ 3 reads per secondary cluster</td>
+      <td>A mixture is only declared when at least two polymorphic columns vary
+          <i>together</i>, and each secondary cluster holds at least 3 reads. This rejects
+          single-SNP splits, which at ONT error rates are indistinguishable from an error
+          hotspot or from heteroplasmy — and which would not change the identification
+          anyway.</td></tr>
+  <tr><td><b>Bimodal read length</b></td>
+      <td>second length mode ≥ 30 bp away holding ≥ 20% of reads</td>
+      <td>Advisory 🟠 warning computed on <i>all</i> demultiplexed reads of a sample
+          <b>before</b> the by-length subsampling — which would otherwise hide a
+          contaminant of a different length from the haplotype resolver entirely. Listed in
+          the run log and as its own row in the variants sheet.</td></tr>
+</table>
+<div class="tip">
+A secondary variant that is <b>identical to many other barcodes</b> in the run is most
+likely a common haplotype of a well-sampled species. One that is identical to a
+<b>single</b> other barcode <i>and</i> highly divergent from its own dominant haplotype is
+the classic cross-contamination signature — check the two samples' positions on the plate.
+The <b>Identical to N other barcodes</b> column of the variants sheet gives that count
+directly.
+</div>
+
 <h4>Non-coding / genetic code / performance</h4>
 <table>
   <tr><th>Parameter</th><th>Default</th><th>Range</th><th>Description</th></tr>
@@ -468,7 +506,7 @@ markers. Off by default.</p>
       <td>1 … logical CPUs</td>
       <td>Parallel workers. The analysis is internally capped at the number of physical
           cores; higher values oversubscribe the CPU and run slower. See
-          <a href="#performance">§15</a>.</td></tr>
+          <a href="#performance">§16</a>.</td></tr>
   <tr><td><b>Minimum mean read quality (Q, 0 = off)</b></td><td>0</td><td>0 … 50</td>
       <td>Discards input reads whose mean quality is below this Q value before
           demultiplexing. Mean read quality is computed the ONT/NanoPlot way
@@ -512,7 +550,22 @@ markers. Off by default.</p>
           this range to find a single valid consensus. (Non-coding: <code>0.3, 0.5</code>.)</td></tr>
   <tr><td><b>Range step</b></td><td>0.05</td><td>0.01 … 0.5</td>
       <td>Step size for the threshold sweep above.</td></tr>
+  <tr><td><b>QC length tolerance ± (bp)</b> <span class="pill coi">Coding only</span></td>
+      <td>0 <span class="pill def">exact length</span></td><td>0 … 300 (step 3)</td>
+      <td>A consensus is accepted when its length is within ± this many bp of
+          <i>Barcode length</i>. <code>0</code> keeps the classic exact-length rule —
+          correct for COI, whose 658 bp are invariant. Raise it for coding markers with
+          genuine length variation between taxa (rbcL, matK); real coding-length variation
+          comes in multiples of 3. Disabled in Non-coding mode, where length is not
+          enforced at all.</td></tr>
 </table>
+<div class="note">
+<b>Length tolerance does not weaken quality control</b>
+Translation validation still applies unchanged, so a consensus whose length shifted because
+of a sequencing indel (a frameshift) is rejected regardless of the tolerance. The ORF
+coverage check measures against the consensus's own length, so it stays correct at any
+tolerance. The value in force is written to <code>log.txt</code> and to the HTML report.
+</div>
 <h4>Consensus by length (Phase 2a)</h4>
 <table>
   <tr><th>Parameter</th><th>Default (Coding)</th><th>Description</th></tr>
@@ -682,7 +735,10 @@ errors determines the output category (1–5, 6–10, 11–15, &gt;15 errors).</
 <b>secondary_variants.fa</b>
 Only produced when <b>Detect intra-sample sequence variants</b> (§6.1) is enabled and at
 least one specimen is found to be mixed. Minority haplotypes are never silently discarded —
-they land here so they can be reviewed instead of contaminating the main barcode set.
+they land here so they can be reviewed instead of contaminating the main barcode set. Each
+header carries the cluster's read fraction and its divergence from the dominant haplotype
+(<code>div=…%</code>). A companion <code>secondary_variants_recovered.fa</code> holds the
+same variants after error correction.
 </div>
 
 <h4>Output categories explained</h4>
@@ -723,8 +779,10 @@ they land here so they can be reviewed instead of contaminating the main barcode
       <td>Only present when <b>Detect intra-sample sequence variants</b> (§6.1) is
           enabled and finds mixed samples. Per haplotype cluster: sample, read count,
           fraction of the sample's reads, length, Ns, whether it translates cleanly
-          (coding markers), and its role (dominant / secondary), plus samples flagged
-          "needs review" or with more variants than the recovery cap.</td></tr>
+          (coding markers), its role (dominant / secondary), <b>Divergence vs dominant
+          (%)</b> and <b>Identical to N other barcodes</b> (see the triage rules in §6.1),
+          plus samples flagged "needs review" or with more variants than the recovery cap,
+          and advisory rows for samples with a bimodal read-length distribution.</td></tr>
   <tr><td><b>Final results / RT Timeline</b></td>
       <td>In real-time runs: summary and a timeline of recovered barcodes per cycle.</td></tr>
 </table>
@@ -886,14 +944,182 @@ unpublished or sensitive sequence data to a third-party service.
 </div>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="util-notes">14. Utility — Notes</h2>
+<h2 id="util-best">14. Utility — Best Sequence</h2>
+<p>When the same library is processed several times with different parameters, each run
+recovers a slightly different set of consensus sequences — and, for the samples recovered
+in more than one run, slightly different sequences. This utility merges those runs and
+keeps <b>one best sequence per sample</b>, using the BLAST hits of each candidate as the
+arbiter. Open it from <b>Best Sequence</b> in the sidebar, just below <b>BLAST</b>.</p>
+
+<figure class="ph">
+  <img src="images/util-best.png" alt="Best Sequence utility">
+  <figcaption><b>Figure 11.</b> The Best Sequence utility: paired FASTA + BLAST inputs and
+  the scoring settings.</figcaption>
+</figure>
+
+<h3>14.1 Input — one FASTA + one BLAST table per run</h3>
+<p>Drag every FASTA together with its BLAST table into the drop zone. Files are paired
+automatically <b>by base file name</b>, so each pair must share it:</p>
+<pre>run_strict.fa      +  run_strict.xlsx
+run_relaxed.fa     +  run_relaxed.xlsx
+run_permissive.fa  +  run_permissive.xlsx</pre>
+<p>Two or more comparisons are required; there is no upper limit. BLAST tables may be
+<code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>. Each row of the drop zone shows
+the pair, its sequence count and whether the table passed validation; a FASTA with no
+matching table (or a table with no matching FASTA) is listed in red and ignored.</p>
+
+<div class="warn">
+<b>Required columns — expected taxonomy of the query</b>
+Every BLAST table must carry the expected classification of the sample in
+<b>each hit row</b>: <code>Query_Order</code>, <code>Query_Family</code>,
+<code>Query_Genus</code> and <code>Query_organism</code>. These are <i>not</i> produced by
+the BLAST utility (§13), which only writes the <code>Subject_*</code> taxonomy of each hit —
+you add them from your own collection/voucher data before using this panel. Ranks you do
+not know may be left blank or as <code>0</code>. Files missing any of these columns are
+rejected in the drop zone, before the run starts.
+</div>
+
+<p>Besides those four, the table must contain the usual BLAST columns written by §13:
+<code>Query_name</code> (matched verbatim against the FASTA header), <code>Hit_rank</code>,
+<code>Alignment_length</code>, <code>Bit_score</code>, <code>P_identity</code>,
+<code>Subject_accession.ver</code>, and <code>Subject_Order</code> /
+<code>Subject_Family</code> / <code>Subject_Genus</code> / <code>Subject_organism</code>.
+Five hits per sequence is the usual input, but fewer is fine — and a sequence with no hits
+at all is still handled.</p>
+
+<h3>14.2 How the best sequence is chosen</h3>
+<p>Sequences are grouped by <b>sample ID</b>: the text before the first <code>;</code> in
+the header, minus the suffix configured in the panel (<code>_all.fa</code> by default), so
+<code>DNS-1343_all.fa;758;807;ambs=0;estgaps=0</code> → <code>DNS-1343</code>.</p>
+<ol>
+  <li><b>Identical sequences are taken as they are.</b> If a sample's sequence is
+      byte-identical in every run where it appears, there is nothing to decide — it is
+      kept and flagged <code>identical_in_all_runs</code> (or
+      <code>identical_in_available_runs</code> when the sample is missing from some run).</li>
+  <li><b>The rest are scored with their BLAST hits.</b> For each candidate the panel finds
+      the hit that matches the expected taxonomy at the deepest rank, and computes:
+      <pre>score = taxonomic bonus of that hit          (species 400 · genus 300 · family 200 · order 100 · none 0)
+      + bit-score weight × (its bit score ÷ best bit score of the sample)
+      − penalty per ambiguity  × ambs
+      − penalty per estimated gap × estgaps</pre>
+      The bit score already combines percent identity and alignment length, so those are
+      not weighted separately. Ties are broken by longer sequence, then more reads, then
+      file name — the result is deterministic.</li>
+</ol>
+<p>Because the rank bonuses are 100 points apart and the default bit-score weight is 100,
+<b>taxonomic concordance always outranks raw alignment score</b>: a shorter sequence whose
+best hit is the right genus beats a longer one whose best hit is an unrelated family.</p>
+
+<h3>14.3 Settings</h3>
+<p>The panel exposes only the two settings that depend on your data:</p>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Description</th></tr>
+  <tr><td>Minimum alignment length (bp)</td><td>100</td>
+      <td>Hits shorter than this are discarded as spurious before scoring. Without this
+          filter a 30 bp accidental match to an unrelated organism can drive the whole
+          decision for a sample that has no real hit. The sensible value depends on your
+          marker and reference database.</td></tr>
+  <tr><td>Strip suffix from sample ID</td><td><code>_all.fa</code></td>
+      <td>Removed from the sample ID read out of the header. Clear it if your headers do
+          not carry a suffix.</td></tr>
+</table>
+
+<h4>Fixed scoring weights</h4>
+<p>The three weights of the formula are <b>design constants</b>, not settings, and are not
+offered in the interface: their values only make sense relative to the 100-point gap
+between taxonomic ranks, and raising them breaks the property the whole utility rests on —
+that taxonomic concordance outranks raw alignment score. They live at the top of
+<code>_utilities/best_seq_panel.py</code> and are written to every run log.</p>
+<table>
+  <tr><th>Constant</th><th>Value</th><th>Rationale</th></tr>
+  <tr><td><code>BITSCORE_WEIGHT</code></td><td>100</td>
+      <td>Matches the gap between ranks exactly, so the bit score can order candidates that
+          reached the <i>same</i> rank but never promote one that reached a lower rank.</td></tr>
+  <tr><td><code>AMB_PENALTY</code></td><td>2 per <code>ambs</code></td>
+      <td>A tie-breaker. Within a sample the normalised bit scores of the candidates
+          typically sit 1–5 points apart, so 2 points per ambiguity is the same order of
+          magnitude: enough to separate two otherwise equivalent candidates, never enough
+          to override taxonomy — that would take 50 ambiguities.</td></tr>
+  <tr><td><code>GAP_PENALTY</code></td><td>2 per <code>estgaps</code></td>
+      <td>Same reasoning, applied to estimated gaps.</td></tr>
+</table>
+<div class="note">
+<b>How sensitive is the result?</b>
+Barely. On a 517-sample test set of three runs, every ambiguity penalty between 1 and 5
+selected the same sequences. Setting it to <b>0</b> was worse — 18 samples fell back to
+length and read count alone — and values of <b>20 or more</b> started costing
+identifications, picking a candidate with no taxonomic hit just because it carried fewer
+Ns. The default sits in the middle of that flat range.
+</div>
+
+<h3>14.4 Outputs</h3>
+<p>Results go to a timestamped folder (<code>output/ont-barcoder_&lt;date&gt;_bestseq/</code>
+by default, or a folder you pick):</p>
+<table>
+  <tr><th>File</th><th>Content</th></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;_all.fasta</code></td>
+      <td>The best sequence of <b>every</b> sample.</td></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;_identified.fasta</code></td>
+      <td>Sequences whose best hit matched the expected taxonomy at <b>some</b> rank
+          (species, genus, family or order).</td></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;_no_tax_hit.fasta</code></td>
+      <td>Sequences whose hits matched <b>no</b> taxonomic rank — the ones that need
+          manual review.</td></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;.tsv</code> / <code>.xlsx</code></td>
+      <td>Decision report, one row per sample (see below).</td></tr>
+  <tr><td><code>bestseq_run_log_&lt;ts&gt;.txt</code></td>
+      <td>Input pairs, parameters, the scoring formula used, and counts per taxonomic
+          level and per flag.</td></tr>
+</table>
+<div class="note">
+<b>FASTA format</b>
+All three FASTA files keep the <b>original header verbatim</b> — nothing is appended — and
+write each sequence on a <b>single line</b>, so they drop straight into any downstream
+tool. The two subsets are disjoint and together add up to <code>_all</code>.
+</div>
+<div class="warn">
+<b>Reproducible is not the same as identified</b>
+The split is decided by <b>taxonomy alone</b>. A sample whose sequence came out identical in
+every run has a reproducible consensus, but that says nothing about whether it is the right
+organism — the same wrong template amplified under every parameter set is still wrong. If
+its hits match no taxonomic rank it goes to <code>_no_tax_hit</code> like any other, and
+must be reviewed. Use the <b>Decision</b> column of the report to tell those apart from the
+samples that also disagreed between runs.
+</div>
+
+<p>The report lists, per sample: the decision and the run it came from, the original header,
+the sequence metrics (length, reads, ambs, estgaps), the BLAST evidence (number of hits,
+taxonomic level reached, expected taxon, best hit accession/organism/identity/alignment/
+bit score), the final score, the runner-up run and its score, and a <b>Flag</b> column:</p>
+<table>
+  <tr><th>Flag</th><th>Meaning</th></tr>
+  <tr><td><code>no_blast_hit</code></td>
+      <td>No hit survived the minimum-alignment filter; the choice rested on length,
+          ambiguities and read count alone.</td></tr>
+  <tr><td><code>low_taxonomic_support</code></td>
+      <td>The best hit matched only at order level, or at no rank.</td></tr>
+  <tr><td><code>near_tie</code></td>
+      <td>The runner-up scored within 1 point — the winner is defensible but marginal.</td></tr>
+  <tr><td><code>missing_in_N_run(s)</code></td>
+      <td>The sample was not recovered in <i>N</i> of the runs supplied.</td></tr>
+  <tr><td><code>ambs=N</code></td>
+      <td>The selected sequence still carries <i>N</i> ambiguous bases.</td></tr>
+</table>
+<div class="tip">
+Sort or filter the <code>.xlsx</code> by <b>Flag</b> and by <b>Decision</b> =
+<code>blast_selected</code> to review only the samples that actually required a decision;
+rows resolved by BLAST are shown in bold and the flags in amber.
+</div>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="util-notes">15. Utility — Notes</h2>
 <p>A lightweight, file-based Markdown notebook built into the app — a place to keep
 run-specific observations, protocols or lab notes without leaving ONTbarcoder. Open it
 from the <b>NOTES 📝</b> item at the bottom of the sidebar.</p>
 
 <figure class="">
   <img src="images/util-notes.png" alt="Notes utility">
-  <figcaption><b>Figure 11.</b> The Notes utility: note list on the left, Markdown editor
+  <figcaption><b>Figure 12.</b> The Notes utility: note list on the left, Markdown editor
   and preview on the right.</figcaption>
 </figure>
 
@@ -944,7 +1170,7 @@ notes are ordinary text files:</p>
 </ul>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="performance">15. Performance &amp; threads</h2>
+<h2 id="performance">16. Performance &amp; threads</h2>
 <p>The heavy work is many short alignment subprocesses (<code>disttbfast.exe</code>, each
 forced to a single internal thread). Optimal concurrency therefore tracks the number of
 <b>physical</b> cores, not logical (hyperthreaded) processors.</p>
@@ -957,7 +1183,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
       keeps results deterministic and avoids disk contention.</li>
 </ul>
 
-<h2 id="troubleshoot">16. Troubleshooting</h2>
+<h2 id="troubleshoot">17. Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
   <tr><td>App fails to write output / profiles</td>
@@ -996,7 +1222,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
 </table>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="credits">17. Credits &amp; citation</h2>
+<h2 id="credits">18. Credits &amp; citation</h2>
 <p><b>Original software:</b> Amrita Srivathsan, V. Feng, D. Suárez, B. Emerson &amp;
 R. Meier.</p>
 <p><b>Version 3 development:</b> Eduardo Tovar Luque · Instituto Humboldt (2026).</p>
@@ -1013,7 +1239,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.1b — User Manual · Generated for the research community ·
+ONTbarcoder 3.3b — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 

@@ -29,7 +29,77 @@ UI_MAX_SCALE: float = 1.0      # never enlarge beyond the design baseline
 UI_MIN_SCALE: float = 0.6      # never shrink below this (readability floor)
 UI_DESIGN_W: int = 1280        # design canvas width  (logical px, = min window)
 UI_DESIGN_H: int = 920         # design canvas height (logical px, = min window)
+# On a 2K/4K screen the fit-screen math returns UI_MAX_SCALE (the canvas fits
+# easily) and Qt then still enlarges everything by the Windows DPI factor, so
+# text looks oversized.  What is really applied on screen is the *product*
+#     total_scale = win_scale x QT_SCALE_FACTOR
+# so auto mode caps that product here.  Raise it for bigger text, lower it for
+# smaller text; it only ever bites on high-DPI displays.
+UI_MAX_TOTAL_SCALE: float = 1.25
+# Values offered by the "UI size" selector in the top bar.  Each one is a *total*
+# on-screen scale relative to the design canvas, independent of the Windows DPI
+# setting; 0.0 means "Auto" (the fit-screen algorithm below).  Nothing below
+# UI_MIN_USER_SCALE is offered: the stylesheet sizes fonts in fixed pixels, so
+# shrinking the canvas clips the labels and the text disappears.
+UI_MIN_USER_SCALE: float = 1.0
+UI_SCALE_STEPS: tuple = (0.0, 1.0, 1.15, 1.25, 1.5, 1.75)
+# QSettings slot holding the user's choice (missing / 0 = Auto).
+UI_SETTINGS_ORG = "Tovar"
+UI_SETTINGS_APP = "ONTbarcoder"
+UI_SCALE_KEY = "ui_scale"
+UI_GEOM_KEY = "geometry_factor"   # scale the saved geometry was taken at
+# QT_SCALE_FACTOR actually applied this run; filled in by main().  A window
+# geometry saved at a different factor no longer matches and is discarded.
+_ACTIVE_UI_FACTOR: float = 1.0
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_user_ui_scale() -> float:
+    """Total UI scale picked by the user in the top bar (0.0 = auto).
+
+    A stored value below UI_MIN_USER_SCALE (an older build offered 75% / 85%,
+    which clips the fixed-pixel text) is treated as auto, so such a setting
+    cannot leave the GUI unreadable and unfixable."""
+    try:
+        from PyQt5 import QtCore as _qtcore
+        raw = _qtcore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).value(UI_SCALE_KEY)
+        value = float(raw) if raw not in (None, "") else 0.0
+        return value if value >= UI_MIN_USER_SCALE else 0.0
+    except Exception:
+        return 0.0
+
+
+def _save_user_ui_scale(value: float) -> None:
+    """Persist the UI scale; it is read again on the next start-up."""
+    try:
+        from PyQt5 import QtCore as _qtcore
+        _qtcore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).setValue(
+            UI_SCALE_KEY, float(value)
+        )
+    except Exception:
+        pass
+
+
+def _windows_dpi_scale() -> float:
+    """Windows display-scaling factor (1.0 @100%, 1.25 @125%, 1.5 @150% ...).
+
+    Also makes the process DPI-aware, so every later pixel query returns
+    physical pixels instead of the logical ones Windows feeds non-aware apps."""
+    if os.name != "nt":
+        return 1.0
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+        scale = (ctypes.windll.user32.GetDpiForSystem() or 96) / 96.0
+        return scale if scale > 0 else 1.0
+    except Exception:
+        return 1.0
 
 
 def _compute_ui_scale_factor() -> float:
@@ -45,7 +115,18 @@ def _compute_ui_scale_factor() -> float:
                                avail_h / (UI_DESIGN_H × win_scale) )
 
     capped at UI_MAX_SCALE and floored at UI_MIN_SCALE.  If the screen metrics
-    cannot be read we fall back to applying UI_SCALE verbatim."""
+    cannot be read we fall back to applying UI_SCALE verbatim.
+
+    A value chosen in the top-bar "UI size" selector overrides all of this."""
+    user_total = _load_user_ui_scale()
+    if user_total > 0:
+        # The selector is expressed as a total on-screen scale, so divide out
+        # the Windows DPI factor that Qt is about to multiply back in.  The UI
+        # then looks the same at any Windows scaling setting.
+        # QT_SCALE_FACTOR itself may fall below 1.0 here (100% total on a 150%
+        # Windows display needs 0.667); it is the *total* that never goes under
+        # UI_MIN_USER_SCALE, so the text keeps its design size.
+        return min(3.0, max(UI_MIN_USER_SCALE, user_total) / _windows_dpi_scale())
     if not UI_FIT_SCREEN:
         return UI_SCALE
     # The screen-fit math below relies on the Windows-only ctypes.windll API.
@@ -57,24 +138,10 @@ def _compute_ui_scale_factor() -> float:
         return UI_MAX_SCALE
     try:
         import ctypes
-        # Become DPI-aware so the pixel/size queries return physical values,
-        # not the logical ones Windows hands to non-aware processes.
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
-        except Exception:
-            try:
-                ctypes.windll.user32.SetProcessDPIAware()
-            except Exception:
-                pass
+        # Becomes DPI-aware as a side effect, so the pixel/size queries below
+        # return physical values.
+        win_scale = _windows_dpi_scale()
         user32 = ctypes.windll.user32
-
-        # Windows display-scaling factor (1.0 @100%, 1.25 @125% …).
-        try:
-            win_scale = (user32.GetDpiForSystem() or 96) / 96.0
-        except Exception:
-            win_scale = 1.0
-        if win_scale <= 0:
-            win_scale = 1.0
 
         # Available desktop area in *physical* pixels (taskbar excluded).
         class _RECT(ctypes.Structure):
@@ -100,7 +167,9 @@ def _compute_ui_scale_factor() -> float:
         fit_w = (avail_w - frame_w) / float(UI_DESIGN_W * win_scale)
         fit_h = (avail_h - frame_h) / float(UI_DESIGN_H * win_scale)
 
-        factor = min(UI_MAX_SCALE, fit_w, fit_h)
+        # UI_MAX_TOTAL_SCALE keeps win_scale x factor bounded, which is what
+        # stops text from ballooning on 2K/4K monitors running at 125-200%.
+        factor = min(UI_MAX_SCALE, fit_w, fit_h, UI_MAX_TOTAL_SCALE / win_scale)
         return max(UI_MIN_SCALE, factor)
     except Exception:
         return UI_SCALE
@@ -153,6 +222,7 @@ import _utilities.ONTbarcoder3_multiprocessing as _ont_mp
 
 from _utilities.compare_panel import ComparePanel, _CompareWorker, _PairCompareWorker
 from _utilities.blast_panel import BlastPanel, _BlastWorker
+from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.fastq_inspector import FastqInspectorPanel
 from _utilities.fasta_tools import FastaToolsPanel
 from _utilities.notes_panel import NotesPanel
@@ -684,7 +754,7 @@ class SidebarWidget(QtWidgets.QWidget):
     ITEMS = [
         ("setup",      "Input files"),
         ("params",     "Parameters"),
-        ("progress",   "Progress"),
+        ("progress",   "Analysis"),
         ("live_chart", "📈 RT Charts"),
         ("results",    "Results"),
     ]
@@ -693,6 +763,7 @@ class SidebarWidget(QtWidgets.QWidget):
         ("fasta_tools",     "FASTA Tools"),
         ("fastq_inspector", "FASTQ Inspector"),
         ("blast",           "BLAST"),
+        ("best_seq",        "Best Sequence"),
         ("notes",           "NOTES 📝"),
     ]
 
@@ -860,7 +931,7 @@ class AboutDialog(QtWidgets.QDialog):
 
         layout.addSpacing(4)
 
-        ver_lbl = make_label("Version 3.2b", size=16, color=TEXT_SEC)
+        ver_lbl = make_label("Version 3.3b", size=16, color=TEXT_SEC)
         ver_lbl.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(ver_lbl)
 
@@ -979,6 +1050,7 @@ class AboutDialog(QtWidgets.QDialog):
 class TopBar(QtWidgets.QWidget):
     languageChanged = QtCore.pyqtSignal(str)
     aboutRequested  = QtCore.pyqtSignal()
+    uiScaleChanged  = QtCore.pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -991,7 +1063,7 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
-        badge = QtWidgets.QLabel("v3.2b")
+        badge = QtWidgets.QLabel("v3.3b")
         badge.setObjectName("topbar_badge")
 
         layout.addWidget(logo)
@@ -1034,6 +1106,56 @@ class TopBar(QtWidgets.QWidget):
  #       layout.addSpacing(8)
 
  #       self._update_lang_buttons()
+
+        # ── UI size selector ────────────────────────────────────────────
+        # QT_SCALE_FACTOR can only be set before QApplication exists, so the
+        # choice is stored in QSettings and applied on the next start-up.
+        self._scale_label = QtWidgets.QLabel(_tr("TopBar", "UI size"))
+        self._scale_label.setStyleSheet(f"color:{WHITE}; font-size:15px;")
+        self._scale_combo = QtWidgets.QComboBox()
+        self._scale_combo.setObjectName("ui_scale_combo")
+        self._scale_combo.setFixedHeight(28)
+        self._scale_combo.setFixedWidth(92)
+        self._scale_combo.setToolTip(_tr(
+            "TopBar",
+            "Global size of text and widgets.\n"
+            "Auto fits the window to the screen; a fixed percentage keeps the\n"
+            "same size on any monitor. Applied when ONTbarcoder restarts."
+        ))
+        self._scale_combo.setStyleSheet(f"""
+            QComboBox {{
+                color: {WHITE};
+                background-color: transparent;
+                border: 1px solid {WHITE};
+                border-radius: 8px;
+                padding: 3px 8px;
+                font-size: 15px;
+            }}
+            QComboBox:hover {{ border-color: {BLUE}; color: {BLUE}; }}
+            QComboBox QAbstractItemView {{
+                background-color: {WHITE};
+                color: {TEXT_PRI};
+                selection-background-color: {BLUE_LIGHT};
+                selection-color: {TEXT_PRI};
+            }}
+        """)
+        _saved_scale = _load_user_ui_scale()
+        _steps = list(UI_SCALE_STEPS)
+        if _saved_scale > 0 and not any(abs(_saved_scale - s) < 1e-6 for s in _steps):
+            _steps.append(_saved_scale)          # honour a hand-edited value
+            _steps.sort()
+        for _value in _steps:
+            _text = _tr("TopBar", "Auto") if _value <= 0 else f"{int(round(_value * 100))}%"
+            self._scale_combo.addItem(_text, float(_value))
+        for _i in range(self._scale_combo.count()):
+            if abs(float(self._scale_combo.itemData(_i)) - _saved_scale) < 1e-6:
+                self._scale_combo.setCurrentIndex(_i)
+                break
+        self._scale_combo.currentIndexChanged.connect(self._on_scale_changed)
+        layout.addWidget(self._scale_label)
+        layout.addSpacing(6)
+        layout.addWidget(self._scale_combo)
+        layout.addSpacing(12)
 
         self._docs_btn = QtWidgets.QPushButton(_tr("TopBar", "Documentation"))
         self._docs_btn.setObjectName("secondary_btn")
@@ -1089,6 +1211,14 @@ class TopBar(QtWidgets.QWidget):
         """)
         self._about_btn.clicked.connect(self.aboutRequested)
         layout.addWidget(self._about_btn)
+
+    def _on_scale_changed(self, _index):
+        """Store the new UI scale and let MainWindow offer a restart."""
+        value = float(self._scale_combo.currentData() or 0.0)
+        if abs(value - _load_user_ui_scale()) < 1e-6:
+            return
+        _save_user_ui_scale(value)
+        self.uiScaleChanged.emit(value)
 
     def _set_lang(self, lang):
         set_language(lang)
@@ -4989,6 +5119,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_results         = ResultsPanel()
         self._panel_compare         = ComparePanel()
         self._panel_blast           = BlastPanel()
+        self._panel_best_seq        = BestSeqPanel()
         self._panel_fastq_inspector = FastqInspectorPanel()
         self._panel_fasta_tools     = FastaToolsPanel()
         self._panel_notes           = NotesPanel()
@@ -5013,7 +5144,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._setup_container, self._params_container,
             self._panel_progress, self._panel_live_chart,
             self._results_container, self._panel_compare,
-            self._panel_blast, self._panel_fastq_inspector,
+            self._panel_blast, self._panel_best_seq,
+            self._panel_fastq_inspector,
             self._panel_fasta_tools, self._panel_notes,
         ):
             self._stack.addWidget(panel)
@@ -5021,8 +5153,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_map = {
             "setup": 0, "params": 1, "progress": 2,
             "live_chart": 3, "results": 4, "compare": 5,
-            "blast": 6, "fastq_inspector": 7, "fasta_tools": 8,
-            "notes": 9,
+            "blast": 6, "best_seq": 7, "fastq_inspector": 8,
+            "fasta_tools": 9, "notes": 10,
         }
 
     def _connect_signals(self):
@@ -5033,13 +5165,56 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.finalizeRequested.connect(self._finalize_live)
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
+        self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
         self._panel_results.resetRequested.connect(self._on_reset_analysis)
         self._topbar.languageChanged.connect(self._on_language_changed)
         self._topbar.aboutRequested.connect(self._show_about)
+        self._topbar.uiScaleChanged.connect(self._on_ui_scale_changed)
 
         # Lock panels until user configures input files
         for key in ("params", "progress", "results"):
             self._sidebar.lock_item(key)
+
+    def _on_ui_scale_changed(self, value):
+        """The UI scale only reaches Qt through QT_SCALE_FACTOR, which is read
+        before QApplication is built, so the change needs a restart."""
+        name = "Auto" if value <= 0 else f"{int(round(value * 100))}%"
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setWindowTitle("UI size")
+        box.setText(f"UI size set to {name}.")
+        busy = bool(getattr(self, "_analysis_active", False))
+        if busy:
+            box.setInformativeText(
+                "The new size is applied the next time ONTbarcoder starts.\n"
+                "An analysis is running, so restarting now is disabled."
+            )
+            box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            box.exec_()
+            return
+        box.setInformativeText(
+            "The new size is applied the next time ONTbarcoder starts."
+        )
+        restart_btn = box.addButton("Restart now", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("Later", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is restart_btn:
+            self._restart_app()
+
+    def _restart_app(self):
+        """Close cleanly (stopping workers) and relaunch the same executable."""
+        if not self.close():
+            return                      # the user cancelled the close dialog
+        try:
+            if getattr(sys, "frozen", False):
+                program, args = sys.executable, sys.argv[1:]
+            else:
+                program = sys.executable
+                args = [os.path.abspath(__file__)] + sys.argv[1:]
+            QtCore.QProcess.startDetached(program, args, os.getcwd())
+        except Exception:
+            pass
+        QtWidgets.QApplication.quit()
 
     def _on_language_changed(self, lang):
         panels = [
@@ -5051,6 +5226,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_results,
             self._panel_compare,
             self._panel_blast,
+            self._panel_best_seq,
             self._topbar,
         ]
         set_language(lang, panels)
@@ -5085,7 +5261,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Stop the BLAST / comparison workers too if they are still running, so
         # they are not destroyed mid-run.
-        for attr in ("blast_worker", "comp_worker"):
+        for attr in ("blast_worker", "comp_worker", "best_seq_worker"):
             w = getattr(self, attr, None)
             if w is not None:
                 try:
@@ -5097,9 +5273,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        QtCore.QSettings("Tovar", "ONTbarcoder").setValue(
-            "geometry", self.saveGeometry()
-        )
+        _cfg = QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP)
+        _cfg.setValue("geometry", self.saveGeometry())
+        _cfg.setValue(UI_GEOM_KEY, float(_ACTIVE_UI_FACTOR))
         event.accept()
 
     def _current_screen(self):
@@ -5151,7 +5327,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.move(x, y)
 
     def _restore_geometry(self):
-        geom = QtCore.QSettings("Tovar", "ONTbarcoder").value("geometry")
+        _cfg = QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP)
+        try:
+            _saved_factor = float(_cfg.value(UI_GEOM_KEY) or 0.0)
+        except (TypeError, ValueError):
+            _saved_factor = 0.0
+        geom = _cfg.value("geometry")
+        # A geometry stored under a different UI scale would restore a window
+        # sized for the old scale, so start from the default size instead.
+        if abs(_saved_factor - _ACTIVE_UI_FACTOR) > 1e-3:
+            geom = None
         if geom:
             self.restoreGeometry(geom)
         # A geometry saved on another monitor / scaling factor may no longer
@@ -8642,7 +8827,7 @@ class MainWindow(QtWidgets.QMainWindow):
 </nav>
 
 <header class="hero">
-  <div class="hero-eyebrow">ONTbarcoder v3.2b · Analysis report</div>
+  <div class="hero-eyebrow">ONTbarcoder v3.3b · Analysis report</div>
   <h1>Run <span>{run_name}</span></h1>
   <div class="hero-meta">
     <span>📅 <strong>{ts_now}</strong></span>
@@ -8747,7 +8932,7 @@ class MainWindow(QtWidgets.QMainWindow):
         {samples_section}
 
 <footer>
-  <span>ONTbarcoder v3.2b — generated {ts_now}</span>
+  <span>ONTbarcoder v3.3b — generated {ts_now}</span>
   <span>{outpath}</span>
 </footer>
 
@@ -10759,6 +10944,122 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blast_worker.taskError.connect(self._panel_blast.on_error)
         self.blast_worker.start()
 
+    def _start_best_seq(self, pairs: list, cfg: dict):
+        # ── Output folder dialog (same pattern as _start_blast) ──
+        ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"ont-barcoder_{ts}_bestseq"
+        program_dir = _get_base_dir()
+        default_out = os.path.join(program_dir, "output", folder_name)
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Output folder")
+        dlg.setMinimumWidth(480)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background-color: {GRAY_CARD}; }}
+            QLabel {{ color: {TEXT_PRI}; background-color: transparent; }}
+            QRadioButton {{
+                color: {TEXT_PRI}; background-color: transparent;
+                font-size: 15px; padding: 6px 0;
+            }}
+            QRadioButton::indicator {{ width: 16px; height: 16px; }}
+            QPushButton {{
+                border-radius: 8px; padding: 8px 20px;
+                font-size: 15px; font-weight: 500;
+            }}
+            #dlg_ok_btn {{ background-color: {BLUE}; color: white; border: none; }}
+            #dlg_ok_btn:hover {{ background-color: #0C4A82; }}
+            #dlg_cancel_btn {{
+                background-color: transparent; color: {BLUE};
+                border: 1px solid {BLUE};
+            }}
+            #dlg_cancel_btn:hover {{ background-color: {BLUE_LIGHT}; }}
+        """)
+        vlay = QtWidgets.QVBoxLayout(dlg)
+        vlay.setSpacing(16)
+        vlay.setContentsMargins(24, 24, 24, 20)
+        title_lbl = QtWidgets.QLabel("Where to save the results?")
+        title_lbl.setStyleSheet(
+            f"font-size:17px; font-weight:700; color:{TEXT_PRI};"
+        )
+        vlay.addWidget(title_lbl)
+        radio_default = QtWidgets.QRadioButton(
+            f"Automatic folder (recommended)\n  …/output/{folder_name}"
+        )
+        radio_default.setChecked(True)
+        radio_custom = QtWidgets.QRadioButton("Select folder manually")
+        vlay.addWidget(radio_default)
+        vlay.addWidget(radio_custom)
+        vlay.addSpacing(8)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_cancel.setObjectName("dlg_cancel_btn")
+        btn_cancel.setFixedHeight(38)
+        btn_ok = QtWidgets.QPushButton("Continue")
+        btn_ok.setObjectName("dlg_ok_btn")
+        btn_ok.setFixedHeight(38)
+        btn_ok.setDefault(True)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addSpacing(8)
+        btn_row.addWidget(btn_ok)
+        vlay.addLayout(btn_row)
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        if radio_default.isChecked():
+            outdir = default_out
+        else:
+            parent_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select the output folder"
+            )
+            if not parent_dir:
+                return
+            outdir = os.path.join(parent_dir, folder_name)
+
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            self._panel_best_seq.on_error(f"Could not create output folder: {e}")
+            return
+
+        cfg["outdir"] = outdir
+
+        self._panel_best_seq.set_running(True)
+        self._panel_best_seq.update_status("result", f"Output      │ {outdir}")
+
+        # Disconnect any leftover stop/signal connections from a previous run
+        try:
+            self._panel_best_seq.stopRequested.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if getattr(self, "best_seq_worker", None) is not None:
+            try:
+                self.best_seq_worker.statusUpdated.disconnect()
+                self.best_seq_worker.progressUpdated.disconnect()
+                self.best_seq_worker.taskFinished.disconnect()
+                self.best_seq_worker.taskError.disconnect()
+            except RuntimeError:
+                pass
+            try:
+                if self.best_seq_worker.isRunning():
+                    self.best_seq_worker.stop()
+                    self.best_seq_worker.quit()
+                    self.best_seq_worker.wait(3000)
+            except RuntimeError:
+                pass
+            self.best_seq_worker = None
+
+        self.best_seq_worker = _BestSeqWorker(pairs, cfg)
+        self._panel_best_seq.stopRequested.connect(self.best_seq_worker.stop)
+        self.best_seq_worker.statusUpdated.connect(self._panel_best_seq.update_status)
+        self.best_seq_worker.progressUpdated.connect(self._panel_best_seq.set_progress)
+        self.best_seq_worker.taskFinished.connect(self._panel_best_seq.on_finished)
+        self.best_seq_worker.taskError.connect(self._panel_best_seq.on_error)
+        self.best_seq_worker.start()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
@@ -10804,6 +11105,7 @@ def main():
         # available screen area, so a single build adapts to any resolution
         # without manual editing (see _compute_ui_scale_factor()).
         _ui_factor = _compute_ui_scale_factor()
+        globals()["_ACTIVE_UI_FACTOR"] = _ui_factor
         if abs(_ui_factor - 1.0) > 1e-3:
             os.environ["QT_SCALE_FACTOR"] = f"{_ui_factor:.4f}"
 
@@ -10823,7 +11125,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(STYLESHEET)
         app.setApplicationName("ONTbarcoder")
-        app.setApplicationVersion("3.2b")
+        app.setApplicationVersion("3.3b")
 
         icon = QtGui.QIcon()
         for icon_name in ("icon.ico",):

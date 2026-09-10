@@ -15,6 +15,54 @@ repository):
 
 ---
 
+## [3.3b] — 2026-09
+
+Adds a post-processing utility for reconciling several runs of the same library.
+The analysis pipeline is untouched: 3.2b parameters reproduce 3.2b results
+exactly.
+
+### Added
+
+#### Best Sequence Selector utility (sidebar, below BLAST)
+- New **"Best Sequence"** panel (`_utilities/best_seq_panel.py`) that picks the
+  best consensus sequence per sample across **two or more** ONTbarcoder runs made
+  with different parameters. Each run is supplied as a FASTA + its BLAST table
+  (`.xlsx` / `.tsv` / `.csv`), paired automatically by base file name.
+- Samples whose sequence is identical in every run are kept as they are; the rest
+  are resolved by scoring each candidate: taxonomic rank shared by the best hit
+  and the expected classification of the query (species 400 / genus 300 /
+  family 200 / order 100), plus the weighted bit score of that hit, minus
+  penalties per `ambs` and `estgaps`. Ties break by longer sequence, then reads.
+- The panel exposes only the two settings that depend on the data (minimum
+  alignment length and the sample-ID suffix). The three scoring weights are
+  design constants at the top of `best_seq_panel.py`, documented with their
+  rationale: their values only make sense relative to the 100-point gap between
+  taxonomic ranks, and the result is flat over a wide range of the penalties
+  (1-5 selected identical sequences on a 517-sample test set).
+- **Requirement:** every BLAST table must carry `Query_Order`, `Query_Family`,
+  `Query_Genus` and `Query_organism` on **each hit row**; files missing those
+  columns are rejected in the drop zone before the run starts. Hits shorter than
+  the configurable minimum alignment length (default 100 bp) are discarded as
+  spurious.
+- Outputs a TSV + formatted XLSX decision report (with `Flag` column:
+  `no_blast_hit`, `low_taxonomic_support`, `near_tie`, `missing_in_N_run(s)`,
+  `ambs=N`), a run log, and three single-line FASTA files that preserve the
+  original headers verbatim: `_all`, plus a disjoint split into `_identified`
+  (best hit concordant at some rank) and `_no_tax_hit` (no rank matched). The
+  split is decided by taxonomy alone: a sequence identical in every run is a
+  reproducible consensus, not a verified identification, so without a taxonomic
+  hit it lands in `_no_tax_hit` for review like any other.
+
+### Documentation
+- Manual brought up to date (`guide/MANUAL.html`): new **§14 Utility — Best
+  Sequence**, and the two 3.2b features that were still undocumented — the
+  **QC length tolerance** parameter (§6.3) and the **mixture triage rules** of
+  intra-sample variant detection (§6.1: 3 % divergence review threshold,
+  anti-hotspot guard, bimodal read-length warning), plus the new columns of the
+  *Intra-sample variants* sheet (§8.1).
+
+---
+
 ## [3.2b] — 2026-09
 
 Reliability release plus targeted analysis features. Default parameters

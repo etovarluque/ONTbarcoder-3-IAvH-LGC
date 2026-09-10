@@ -1,4 +1,4 @@
-ONTbarcoder 3.1b — MANUAL.html screenshots
+ONTbarcoder 3.3b — MANUAL.html screenshots
 ===========================================
 
 Put your screenshots in THIS folder, using EXACTLY the filenames below.
@@ -21,6 +21,8 @@ class="ph"  ->  class=""   to activate it.
   8   §11 FASTA Tools           util-tools.png
   9   §12 FASTQ Inspector       util-fastq.png
  10   §13 BLAST                 util-blast.png
+ 11   §14 Best Sequence         util-best.png
+ 12   §15 Notes                 util-notes.png
 --------------------------------------------------------------------------
 
 Checklist (tick as you capture them):
@@ -34,6 +36,8 @@ Checklist (tick as you capture them):
   [ ] util-tools.png
   [ ] util-fastq.png
   [ ] util-blast.png
+  [ ] util-best.png
+  [ ] util-notes.png
 
 Tips
 ----
