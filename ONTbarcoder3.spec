@@ -83,11 +83,15 @@ coll = COLLECT(
 # The app resolves paths via os.path.dirname(sys.executable), so it must live here.
 _dist_root = os.path.join(DISTPATH, 'ONTbarcoder3')
 
+# Both MAFFT binaries live in the repository (the Linux build shares these
+# sources), so the one for the other platform is skipped here.
+_skip = shutil.ignore_patterns('disttbfast')
+
 for _folder in ('_mafftfiles', '_notes', 'guide'):
     _src = os.path.join(SPECPATH, _folder)
     _dst = os.path.join(_dist_root, _folder)
     if os.path.exists(_dst):
         shutil.rmtree(_dst)
-    shutil.copytree(_src, _dst)
+    shutil.copytree(_src, _dst, ignore=_skip if _folder == '_mafftfiles' else None)
 
 shutil.copy(os.path.join(SPECPATH, 'icon.ico'), os.path.join(_dist_root, 'icon.ico'))

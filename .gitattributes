@@ -1,0 +1,19 @@
+# Deliberately minimal: this repository already holds a mix of CRLF (the main
+# script) and LF (the _utilities modules) blobs, so no blanket `text=auto` rule
+# is applied — it would renormalise those files and bury real changes under a
+# whole-file diff. Only the cases where the ending actually breaks something
+# are pinned.
+
+# Shell scripts MUST keep LF. A CRLF shebang makes the kernel report
+# "bad interpreter: /bin/bash^M", so the Linux build would fail on a fresh
+# clone made on Windows with core.autocrlf=true.
+*.sh          text eol=lf
+*.desktop.in  text eol=lf
+
+# Binaries: never apply any conversion.
+_mafftfiles/disttbfast      binary
+_mafftfiles/disttbfast.exe  binary
+_mafftfiles/_aamtx          binary
+*.png                       binary
+*.ico                       binary
+*.svg                       text eol=lf

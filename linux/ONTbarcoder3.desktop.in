@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ONTbarcoder 3
+GenericName=DNA Barcode Assembler
+Comment=Assemble DNA barcodes from Oxford Nanopore reads
+Comment[es]=Ensambla códigos de barras de ADN a partir de lecturas Oxford Nanopore
+Exec=@APPDIR@/launch.sh
+Icon=@APPDIR@/icon.svg
+Path=@APPDIR@
+Terminal=false
+StartupNotify=true
+StartupWMClass=ONTbarcoder3
+Categories=Science;Biology;Education;
+Keywords=DNA;barcode;nanopore;ONT;MAFFT;sequencing;

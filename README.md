@@ -58,7 +58,34 @@ _profiles/               Saved parameter profiles + BLAST config (git-ignored)
 _notes/                  Markdown notes shown in the Notes panel
 guide/                   User manual (HTML) + screenshots
 icon.ico                 Application icon
+
+ONTbarcoder3.spec        PyInstaller recipe — Windows
+ONTbarcoder3_linux.spec  PyInstaller recipe — Linux
+build_linux.sh           Linux build driver (runs PyInstaller, assembles the
+                         bundle, produces dist/ONTbarcoder3.tar.gz)
+build_linux_docker.sh    Same build inside a manylinux container
+linux/                   Linux packaging assets
+  launch.sh              Launcher: checks the Qt/xcb prerequisites first
+  install.sh             Desktop-entry installer
+  icon.svg / ONTbarcoder3.desktop.in
 ```
+
+## Building the executables
+
+Both platforms build from the *same* sources; only the spec and the bundled
+MAFFT binary differ (`_mafftfiles/disttbfast.exe` vs `_mafftfiles/disttbfast`).
+Build each one on its own platform — PyInstaller does not cross-compile.
+
+```bash
+# Windows
+pyinstaller ONTbarcoder3.spec          # -> dist/ONTbarcoder3/
+
+# Linux
+./build_linux.sh                       # -> dist/ONTbarcoder3.tar.gz
+```
+
+The specs collect the whole `_utilities` package rather than listing panels one
+by one, so a newly added panel cannot be silently left out of the bundle.
 
 
 ## Credits
