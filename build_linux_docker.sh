@@ -61,5 +61,5 @@ if [ "$ENGINE" = "docker" ] && [ -d dist ]; then
 fi
 
 echo
-echo "Done.  dist/ONTbarcoder3.tar.gz was built against Ubuntu $UBUNTU_VERSION,"
+echo "Done.  dist/ONTbarcoder3_linux.tar.gz was built against Ubuntu $UBUNTU_VERSION,"
 echo "so it runs on Ubuntu $UBUNTU_VERSION and every newer release."

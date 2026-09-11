@@ -62,7 +62,7 @@ icon.ico                 Application icon
 ONTbarcoder3.spec        PyInstaller recipe — Windows
 ONTbarcoder3_linux.spec  PyInstaller recipe — Linux
 build_linux.sh           Linux build driver (runs PyInstaller, assembles the
-                         bundle, produces dist/ONTbarcoder3.tar.gz)
+                         bundle, produces dist/ONTbarcoder3_linux.tar.gz)
 build_linux_docker.sh    Same build inside a manylinux container
 linux/                   Linux packaging assets
   launch.sh              Launcher: checks the Qt/xcb prerequisites first
@@ -81,7 +81,7 @@ Build each one on its own platform — PyInstaller does not cross-compile.
 pyinstaller ONTbarcoder3.spec          # -> dist/ONTbarcoder3/
 
 # Linux
-./build_linux.sh                       # -> dist/ONTbarcoder3.tar.gz
+./build_linux.sh                       # -> dist/ONTbarcoder3_linux.tar.gz
 ```
 
 The specs collect the whole `_utilities` package rather than listing panels one

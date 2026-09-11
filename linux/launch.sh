@@ -60,7 +60,7 @@ log "=== launch: APP_DIR=$APP_DIR ==="
   $BIN
 
 The folder looks incomplete. Extract the package again with:
-  tar xzf ONTbarcoder3.tar.gz"
+  tar xzf ONTbarcoder3_linux.tar.gz"
 
 # Restore the executable bit if a Windows copy, a zip tool or an NTFS/exFAT
 # volume dropped it.  A very common cause of \"double click does nothing\".

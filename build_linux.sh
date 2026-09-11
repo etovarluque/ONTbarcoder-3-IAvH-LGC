@@ -8,8 +8,9 @@
 #   chmod +x build_linux.sh
 #   ./build_linux.sh
 #
-# Result:  dist/ONTbarcoder3/       -> self-contained folder, run ./launch.sh
-#          dist/ONTbarcoder3.tar.gz -> the same folder, ready to ship
+# Result:  dist/ONTbarcoder3/             -> self-contained folder, run ./launch.sh
+#          dist/ONTbarcoder3_linux.tar.gz -> the same folder, ready to ship
+#                                             (matches the GitHub Release asset name)
 #
 # ---------------------------------------------------------------------------
 # IMPORTANT — glibc portability
@@ -53,7 +54,7 @@ python -m pip install --upgrade pip wheel
 python -m pip install -r requirements.txt pyinstaller
 
 echo "==> [2/7] Clean previous build"
-rm -rf build "dist/$APP" "dist/$APP.tar.gz"
+rm -rf build "dist/$APP" "dist/${APP}_linux.tar.gz"
 
 echo "==> [3/7] Run PyInstaller"
 pyinstaller --noconfirm "${APP}_linux.spec"
@@ -103,7 +104,7 @@ chmod +x "$DIST/$APP"
 chmod +x "$DIST/launch.sh" "$DIST/install.sh"
 
 echo "==> [7/7] Package"
-tar czf "dist/$APP.tar.gz" -C dist "$APP"
+tar czf "dist/${APP}_linux.tar.gz" -C dist "$APP"
 
 deactivate || true
 
@@ -116,7 +117,7 @@ GLIBC_REQ=""
 
 echo
 echo "Done.  Distributable bundle:  $DIST/"
-echo "       Shippable archive:     dist/$APP.tar.gz"
+echo "       Shippable archive:     dist/${APP}_linux.tar.gz"
 echo
 echo "Built on glibc ${GLIBC_BUILD:-unknown}; the bundle requires glibc >= ${GLIBC_REQ:-unknown}."
 echo "It will NOT run on any machine with an older glibc than that."
@@ -124,6 +125,6 @@ echo
 echo "Test it here with:            ./$DIST/launch.sh"
 echo
 echo "On the target machine:"
-echo "  tar xzf $APP.tar.gz"
+echo "  tar xzf ${APP}_linux.tar.gz"
 echo "  cd $APP"
 echo "  ./install.sh          # adds it to the applications menu"

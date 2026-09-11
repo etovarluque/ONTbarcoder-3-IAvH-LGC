@@ -3,7 +3,7 @@
 ## Install
 
 ```bash
-tar xzf ONTbarcoder3.tar.gz
+tar xzf ONTbarcoder3_linux.tar.gz
 cd ONTbarcoder3
 ./install.sh
 ```
