@@ -1,11 +1,11 @@
 ---
 title: rbcL
 created: 2026-07-31T13:04:42
-updated: 2026-07-31T13:13:01
+updated: 2026-09-11T00:00:00
 tags: 
 ---
 
-### Análisis del marcador rbcL amplificado con los primers:
+### Analysis of the rbcL marker amplified with the primers:
 
 > **rbcLa-F**
 > ATGTCACCACAAACAGAGACTAAAGC
@@ -15,8 +15,8 @@ tags:
 
 ---
 
-1- Seleccionar el código genético **11** (**Bacteria/Archaebacteria/Plastid**).
+1- Select genetic code **11** (**Bacteria/Archaebacteria/Plastid**).
 
-2- En parametros introducir en **Barcode length (bp)**: 553 pb
+2- In parameters, set **Barcode length (bp)**: 553 bp
 
-3- **Minimum length (pb)**: 400
+3- **Minimum length (bp)**: 400

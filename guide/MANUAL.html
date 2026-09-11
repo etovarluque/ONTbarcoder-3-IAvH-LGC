@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.3b — User Manual</title>
+<title>ONTbarcoder 3.4b — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -113,7 +113,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.3b — User Manual</span>
+    <span class="ver">v3.4b — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -142,10 +142,11 @@
     <a href="#util-blast">13. BLAST</a>
     <a href="#util-best">14. Best Sequence</a>
     <a href="#util-notes">15. Notes</a>
+    <a href="#util-batch">16. Parameter Batch</a>
     <div class="sec">Reference</div>
-    <a href="#performance">16. Performance &amp; threads</a>
-    <a href="#troubleshoot">17. Troubleshooting</a>
-    <a href="#credits">18. Credits &amp; citation</a>
+    <a href="#performance">17. Performance &amp; threads</a>
+    <a href="#troubleshoot">18. Troubleshooting</a>
+    <a href="#credits">19. Credits &amp; citation</a>
   </nav>
 </aside>
 
@@ -620,7 +621,7 @@ to be residual error, heteroplasmy or a NUMT than a real variant.
       <td>1 … logical CPUs</td>
       <td>Parallel workers. The analysis is internally capped at the number of physical
           cores; higher values oversubscribe the CPU and run slower. See
-          <a href="#performance">§16</a>.</td></tr>
+          <a href="#performance">§17</a>.</td></tr>
   <tr><td><b>Minimum mean read quality (Q, 0 = off)</b></td><td>0</td><td>0 … 50</td>
       <td>Discards input reads whose mean quality is below this Q value before
           demultiplexing. Mean read quality is computed the ONT/NanoPlot way
@@ -949,15 +950,50 @@ colour-coded <code>summary.xlsx</code> plus per-category FASTA files
 <code>best_barcodes.fa</code>). When sequences differ, the "best" barcode is chosen by
 fewest ambiguities → fewest gaps → highest coverage.</p>
 
+<h4>Reading the summary with many files</h4>
+<p>With more than two or three files, a full file path in every column header — and every
+pairwise result spelled out in the <code>Note</code> column — becomes unreadable. Compare
+keeps the ID short by giving each file a one-letter <b>alias</b> instead:</p>
+<ul>
+  <li>Each compared file gets a single letter — <code>A</code>, <code>B</code>,
+      <code>C</code>… — in the order it was loaded; the reference file (versus-a-reference
+      mode) is always <code>REF</code>. Column headers use the alias
+      (<code>A_len</code>, <code>A_cov</code>…), and <code>summary.xlsx</code> merges a
+      band above them naming the run (<code>A · 103536</code>, with the full path as a
+      cell comment) so the full name is one hover away, not repeated in every column.</li>
+  <li>A new <b>Runs</b> sheet in <code>summary.xlsx</code> lists the alias, the
+      distinctive fragment of the file name, its role (<code>run</code> /
+      <code>reference</code>), the file name, and the sequence count — the legend for
+      every alias used in the report. The on-screen results window shows the same mapping
+      as a row of chips above the table.</li>
+  <li>In all-vs-all mode, files that carry the exact same sequence for a specimen are
+      collapsed into a <b>variant group</b>, numbered <code>1</code>, <code>2</code>,
+      <code>3</code>… — deliberately numbers, never letters, so a group label is never
+      mistaken for one of the (lettered) files it lists. Two columns summarize this:
+      <b><code>Vars</code></b> (how many distinct sequences were found for that ID) and
+      <b><code>Pattern</code></b> (one group number per file, in file order, <code>.</code>
+      when the file lacks that ID — e.g. <code>123114</code> means files 1, 4 and 5 agree,
+      while 2, 3 and 6 each hold their own variant).</li>
+  <li>The <code>Note</code> column reports group membership and the distances
+      <i>between</i> groups instead of every pairwise result:
+      <code>1=A-D | 2=E | 3=F || 1-2 d=34, 1-3 d=43, 2-3 d=15 || Best F (ambs=1, gaps=0,
+      cov=22)</code>. Consecutive files compress to a range (<code>A-D</code>); a
+      non-contiguous group lists its members (<code>1=A,D,E</code>). Versus-a-reference
+      mode groups files by their verdict against the reference instead:
+      <code>= REF: A-C || ≠ REF d=34: D || Best E (…)</code>.</li>
+</ul>
+
 <h4>Specimen ID extraction</h4>
 <p>Compare needs a consistent specimen ID to match records across files; headers rarely
 agree on format, so the panel offers two ways to derive one:</p>
 <ul>
-  <li><b>Delimiter mode (default).</b> Choose an ID delimiter (<code>_</code>,
-      <code>|</code>, <code>;</code>, space, <code>.</code>, <code>-</code>, or a custom
-      one) and which occurrence to split before (1st … 5th) — this generalizes the old
-      "split at <code>_all.fa</code>" behavior. An <b>"any of these"</b> checkbox treats
-      the delimiter string as a set of individual characters rather than a literal
+  <li><b>Delimiter mode (default).</b> Choose an ID delimiter (<code>;</code> by default —
+      matching ONTbarcoder's own FASTA headers, e.g.
+      <code>&gt;Cnt1_all.fa;745;22;ambs=2;estgaps=0</code> — plus <code>_</code>,
+      <code>|</code>, space, <code>.</code>, <code>-</code>, or a custom one) and which
+      occurrence to split before (1st … 5th) — this generalizes the old "split at
+      <code>_all.fa</code>" behavior. An <b>"any of these"</b> checkbox treats the
+      delimiter string as a set of individual characters rather than a literal
       substring.</li>
   <li><b>Advanced (Regex) mode.</b> Supply one or more regex patterns, tried in order
       until one matches the header. Optional ID normalization can lowercase IDs, strip
@@ -1034,11 +1070,11 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
   <figcaption><b>Figure 10.</b> The BLAST utility: batch submission and taxonomy options.</figcaption>
 </figure>
 <ul>
-  <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> — recommended,
+  <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> &mdash; recommended,
       <code>blastn</code>, or <code>megablast</code>), target database (<code>core_nt</code>,
       <code>nt</code>, <code>refseq_rna</code>, <code>16S_ribosomal_RNA</code>), number of
-      hits per sequence, sequences per batch, and whether to fetch full taxonomy
-      (Kingdom → Genus + organism).</li>
+      hits per sequence, how the run is split into batches (see below), and whether to
+      fetch full taxonomy (Kingdom &rarr; Genus + organism).</li>
   <li>Taxonomy and accession lookups are <b>cached</b> on disk (<code>taxadb.dbx</code>,
       <code>accdb.dbx</code>) and reused across runs in sibling result folders, minimizing
       repeated network calls.</li>
@@ -1048,15 +1084,63 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
       the normalized single-line form actually sent to NCBI — so its headers are exactly the
       <code>Query_name</code> values of the results table. It is written before the first
       query, so it survives a run stopped half way.</li>
+  <li>Sequences that were queried but returned <b>no hit</b> are collected in
+      <code>nohit_seqs_&lt;ts&gt;.fa</code>, ready to be re-run against another database.
+      Sequences of batches that failed or were never processed go instead to
+      <code>missing_seqs_&lt;ts&gt;.fa</code>. Both counts, and the names of the
+      no-match queries, are recorded in <code>blast_run_log_&lt;ts&gt;.txt</code>.</li>
 </ul>
+<h4>Batch size &mdash; Automatic and Manual</h4>
+<p>Every batch is submitted to NCBI as <b>one BLAST search</b>, so the way the run is split
+decides how much of your NCBI quota it spends. Two limits matter, and they are not the ones
+most users assume:</p>
+<table>
+  <tr><th>Limit</th><th>Value</th><th>Counted against</th></tr>
+  <tr><td>Length of a single query</td><td>1,000,000 bases (<code>blastn</code>)</td>
+      <td>The search &mdash; NCBI rejects anything longer.</td></tr>
+  <tr><td>Searches in 24&nbsp;h</td><td>100</td>
+      <td>Your <b>IP address</b>. Beyond it NCBI moves your traffic to a slower queue and,
+          in extreme cases, blocks it.</td></tr>
+</table>
+<p>Because the penalty counts <b>searches, not sequences</b>, larger batches are <i>safer</i>,
+not riskier &mdash; NCBI's own developer guidance is that several queries sent as one search
+run more efficiently than one search each. A second API key does not lift the limit: it
+applies to the IP, not the account.</p>
+<p>The <b>Sequences per BLAST search</b> row therefore offers two modes:</p>
+<ul>
+  <li><b>Automatic</b> (default) &mdash; the program reads the loaded FASTA files and picks
+      the size that uses the <b>fewest searches</b>, then spreads the sequences evenly over
+      them so the last batch is not a remainder of two or three. It respects both the
+      1,000,000-base ceiling (a margin below it, for encoding overhead) and a cap of 1000
+      sequences per search, so that one failure never costs the whole run. There is no number
+      to set, so the box is hidden; the plan line below states the result.</li>
+  <li><b>Manual</b> &mdash; the number box appears and you set it yourself, from 1 to 1000.
+      It starts from the value Automatic had computed, so you adjust from a sensible
+      figure rather than from scratch.</li>
+</ul>
+<p>In both modes a line under the row shows the resulting plan before you run anything, for
+example <code>516 sequences &middot; 429,647 bases &rarr; 1 search of 516 sequences</code>. In
+Manual it also warns when the chosen value wastes quota (<i>&laquo;Automatic would use 1
+instead&raquo;</i>) or exceeds the 100-searches limit outright. The preview and the run share
+the same splitting code, so what is shown is what is submitted.</p>
+
+<h4>Waiting for results</h4>
+<p>A BLAST job is a queued search, not a request that fails after N retries: how long it takes
+depends on NCBI's load and on whether your IP is in the slow queue. The panel waits up to
+<b>45 minutes per search</b>, polling every 10&nbsp;s at first and backing off to 60&nbsp;s
+for long jobs (NCBI asks for no more than one poll per minute per search). If the budget runs
+out, the log reports the <b>RID</b> so the search can still be retrieved by hand at
+<code>blast.ncbi.nlm.nih.gov</code> &mdash; it is usually still running there &mdash; and the
+sequences of that batch go to <code>missing_seqs_&lt;ts&gt;.fa</code>.</p>
+
 <div class="tip">
 <b>Feeding the Best Sequence utility</b>
 The FASTA and the results table share the same base name on purpose
 (<code>blast-20260908-210439.fa</code> + <code>.xlsx</code>), which is how
 <a href="#util-best">§14</a> pairs a run's sequences with its BLAST table. Running BLAST on
 each parameter set therefore leaves the input for that utility ready, with no renaming.
-Remember that §14 additionally requires the <code>Query_*</code> taxonomy columns, which you
-add to the table yourself.
+Remember that &sect;14 additionally requires the <code>Query_*</code> taxonomy columns, which
+you either add to the table yourself or let it write from a taxonomy reference file.
 </div>
 <div class="note">
 <b>NCBI API key required</b>
@@ -1066,9 +1150,12 @@ machine.
 </div>
 <div class="warn">
 <b>Network &amp; usage policy</b>
-This tool sends your sequences to NCBI's public BLAST servers over the internet. Respect
-NCBI usage guidelines (batch sizes / submission rate) and be mindful of submitting
-unpublished or sensitive sequence data to a third-party service.
+This tool sends your sequences to NCBI's public BLAST servers over the internet. Keep the run
+under 100 searches per 24&nbsp;h (the &#9888; button next to the batch row shows the full
+policy), avoid running several BLAST sessions at once, and prefer off-peak hours for large
+projects &mdash; weekends, or 21:00&ndash;05:00 US Eastern. Be mindful of submitting
+unpublished or sensitive sequence data to a third-party service. For recurring high volume,
+NCBI asks that you use standalone BLAST+ or a cloud instance instead of the public service.
 </div>
 
 <!-- ════════════════════════════════════════════════════ -->
@@ -1126,8 +1213,37 @@ Every BLAST table must carry the expected classification of the sample in
 the BLAST utility (§13), which only writes the <code>Subject_*</code> taxonomy of each hit —
 you add them from your own collection/voucher data before using this panel. Ranks you do
 not know may be left blank or as <code>0</code>. Files missing any of these columns are
-rejected in the drop zone, before the run starts.
+rejected in the drop zone, before the run starts &mdash; unless you supply the reference
+file described below, which writes them for you.
 </div>
+
+<h4>Adding the columns automatically &mdash; taxonomy reference file</h4>
+<p>Preparing every table by hand is only reasonable for one run. Tick
+<b>&laquo;I have a reference file with the query taxonomy&raquo;</b> in the settings and drop a
+single reference table (<code>.csv</code>, <code>.xlsx</code> or <code>.tsv</code>): the four
+<code>Query_*</code> columns are then written into <b>every</b> BLAST table of the run before
+the comparison starts, from that one list.</p>
+<ul>
+  <li>The <b>identifier</b> of the reference must be the same sample ID used to group the
+      sequences: the text before the first <code>;</code> of the FASTA header with the
+      suffix of the panel removed (<code>DNS-1343_all.fa;758;807</code> &rarr;
+      <code>DNS-1343</code>). The identifier column is the first one named
+      <i>Sample</i>, <i>ID</i>, <i>Query_name</i>, <i>Code</i>, <i>Voucher</i>&hellip;, and the
+      first column of the file when none of those is present.</li>
+  <li>The <b>four columns following it</b> are read, in that order, as <b>Order, Family,
+      Genus and Organism</b> &mdash; whatever their own headers say. Anything further to the
+      right is ignored.</li>
+  <li>Matching is exact first, then case-insensitive. A sample absent from the reference
+      gets empty ranks (it can then only be flagged <code>tax_mismatch</code>), and every
+      such sample is listed in the run log.</li>
+  <li>The tables are <b>modified in place</b>: existing <code>Query_*</code> columns are
+      overwritten with the reference values, and the missing ones are appended at the right
+      end, leaving the rest of the table untouched. Close the tables in Excel before running
+      &mdash; a locked file stops the run with a message instead of losing the change.</li>
+</ul>
+<pre>Sample,Order,Family,Genus,Organism
+DNS-1343,Asterales,Asteraceae,Baccharis,Baccharis latifolia
+DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
 
 <p>Besides those four, the table must contain the usual BLAST columns written by §13:
 <code>Query_name</code> (matched verbatim against the FASTA header), <code>Hit_rank</code>,
@@ -1397,7 +1513,101 @@ notes are ordinary text files:</p>
 </ul>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="performance">16. Performance &amp; threads</h2>
+<h2 id="util-batch">16. Utility — Parameter Batch <span class="pill def">Optional</span> <span class="pill coi">Conventional only</span></h2>
+<p>Runs the currently loaded dataset once per combination of a small parameter grid —
+e.g. several <i>Main consensus calling frequency</i> / <i>Min. secondary variant
+fraction</i> / <i>Variant tolerance</i> values — instead of changing them by hand in
+<a href="#params">Parameters</a> and pressing <b>Run</b> again each time. It sits in the
+sidebar right below <b>Parameters</b>, shown in italics and locked until a dataset is
+loaded, to signal that it is optional rather than a required step of the workflow.
+Not available in Real-Time mode.</p>
+
+<figure class="">
+  <img src="images/util-batch.png" alt="Parameter Batch utility">
+  PLACEHOLDER · drop images/util-batch.png here
+</figure>
+
+<h4>16.1 The <code>.cfg</code> grid file</h4>
+<p>A batch is defined by a plain-text file: one parameter per line, values separated by
+commas, <code>#</code> for comments. Only the parameters <i>listed</i> are overridden —
+on top of whatever is currently set in the Parameters panel — so a sweep of 3
+parameters only needs 3 lines, not a copy of every setting:</p>
+<pre>consfreqfixed                    = 0.30, 0.35, 0.40, 0.45, 0.50
+resolve_mixed.min_secondary_frac = 20, 15, 10
+resolve_mixed.tolerance          = 10, 9, 8, 7, 6, 5</pre>
+<p>Click <b>Create example cfg</b> in the panel to write out
+<code>_profiles/ontbarcoder_batch.cfg</code> — a fully commented template listing
+<i>every</i> sweepable parameter with its default, valid range and an example value
+list, ready to uncomment and edit. Percent fields (<i>Min. secondary variant
+fraction</i>, <i>Variant tolerance</i>) are written on the same 0–100 scale as their
+GUI spinboxes, not as a 0–1 fraction.</p>
+
+<h4>16.2 Validation</h4>
+<p>The file is checked as soon as it is loaded — before anything runs:</p>
+<ul>
+  <li>Every key must be a recognised parameter name (a typo is rejected immediately,
+      naming the offending line) and every value must fall inside that parameter's
+      valid range, the same bounds enforced by its GUI spinbox.</li>
+  <li><b>Non-Coding marker</b> (<code>non_coi</code>) cannot be swept: it decides the
+      genetic code and which phases exist, so set it in the Parameters panel — the
+      batch inherits whatever is checked there.</li>
+  <li>Listing any <code>resolve_mixed.*</code> key (secondary variant fraction,
+      tolerance) turns <b>Detect intra-sample sequence variants</b>
+      (<a href="#params">§6.1</a>) <i>on</i> for the whole batch, even if the
+      Parameters checkbox is unchecked — otherwise every combination would be
+      identical. This is logged in the panel so it is never a silent surprise.</li>
+  <li>A batch of more than 15 combinations shows a warning in the panel (each one is a
+      full analysis); above 200 the app asks for confirmation before starting anything.</li>
+</ul>
+
+<h4>16.3 Running a batch</h4>
+<ol>
+  <li>Load a dataset and set every parameter you want to keep <b>fixed</b> as usual, in
+      <a href="#inputs">Input files</a> and <a href="#params">Parameters</a>.</li>
+  <li>Open <b>Parameter Batch</b>, click <b>Load batch config…</b> and pick the
+      <code>.cfg</code>. The panel shows the combination count before you commit.</li>
+  <li>Click <b>Start batch</b>. Each combination runs as an ordinary
+      <code>ont-barcoder_*_conv</code> folder under <code>output/</code>, with its own
+      self-documenting log recording the exact parameters used — indistinguishable from
+      a manual run except for how it was launched.</li>
+  <li>Two progress bars track it: combinations completed (<code>i/N</code>) and the
+      combination currently running (its own phase-by-phase progress, 0–100&nbsp;%).</li>
+</ol>
+
+<h4>16.4 Output — deduplicated FASTA</h4>
+<p>Once every combination finishes (or the batch is stopped), the
+<code>consensus_filtered.fa</code> of every completed run is merged into the batch's own
+output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_batch/</code>):</p>
+<ul>
+  <li><code>unique_consensus_filtered.fasta</code> — a sample whose sequence is
+      identical in every run that produced it appears <b>once</b>, header untouched. A
+      sample with different sequences across runs gets <b>one entry per distinct
+      variant</b>, header suffixed with the run folder that produced it
+      (<code>;20260910_103536_conv</code>).</li>
+  <li><code>batch_dedup_report.tsv</code> — one row per sample: how many distinct
+      variants were found and which run folders they came from, so you can see at a
+      glance which samples are worth a closer look before BLASTing.</li>
+</ul>
+<p>BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
+stay manual steps, run afterwards on that merged FASTA — remote BLAST is rate-limited
+and can queue for 10–40&nbsp;minutes per batch, which makes it impractical to run once
+per combination automatically. Best Sequence already picks the best-scoring variant per
+sample when a sample carries more than one candidate, exactly the case a batch with
+variants produces.</p>
+
+<h4>16.5 Stopping a batch</h4>
+<p>Stopping is handled the same way no matter how it happens — every path still writes
+the deduplicated FASTA from whatever combinations completed:</p>
+<ul>
+  <li>The panel's own <b>Stop</b> button lets the combination currently running finish
+      cleanly, then stops before starting the next one.</li>
+  <li>Stopping from the Analysis panel's own Stop button, resetting the analysis, or
+      closing the app mid-batch all hard-abort the running combination instead — none
+      of them leave the batch stuck waiting on one that was just killed.</li>
+</ul>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="performance">17. Performance &amp; threads</h2>
 <p>The heavy work is many short alignment subprocesses (<code>disttbfast.exe</code>, each
 forced to a single internal thread). Optimal concurrency therefore tracks the number of
 <b>physical</b> cores, not logical (hyperthreaded) processors.</p>
@@ -1410,7 +1620,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
       keeps results deterministic and avoids disk contention.</li>
 </ul>
 
-<h2 id="troubleshoot">17. Troubleshooting</h2>
+<h2 id="troubleshoot">18. Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
   <tr><td>App fails to write output / profiles</td>
@@ -1458,7 +1668,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
 </table>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="credits">18. Credits &amp; citation</h2>
+<h2 id="credits">19. Credits &amp; citation</h2>
 <p><b>Original software:</b> Amrita Srivathsan, V. Feng, D. Suárez, B. Emerson &amp;
 R. Meier.</p>
 <p><b>Version 3 development:</b> Eduardo Tovar Luque · Instituto Humboldt (2026).</p>
@@ -1475,7 +1685,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.3b — User Manual · Generated for the research community ·
+ONTbarcoder 3.4b — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 

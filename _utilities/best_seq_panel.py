@@ -13,6 +13,64 @@ from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
 # They must be present in each BLAST table, repeated on every hit row.
 QUERY_TAX_COLUMNS = ("Query_Order", "Query_Family", "Query_Genus", "Query_organism")
 
+# Column names accepted as the identifier column of a query-taxonomy reference
+# file. The first one present wins; if none is, the first column is used.
+_REF_ID_HEADERS = ("query_name", "sample", "sample_id", "sampleid", "id",
+                   "identifier", "code", "voucher", "specimen")
+
+_REF_EXT = (".csv", ".xlsx", ".tsv", ".txt")
+
+
+def _is_reference(path: str) -> bool:
+    return path.lower().endswith(_REF_EXT)
+
+
+def read_tax_reference(path: str):
+    """Read a query-taxonomy reference table.
+
+    The identifier column is the first one carrying a known ID header (Sample,
+    ID, Query_name, ...), else the first column of the file. The FOUR columns
+    that follow it are taken, in that order, as Order, Family, Genus and
+    Organism, whatever their own headers say.
+
+    Returns (id_column_name, [4 taxonomy column names],
+             {identifier: (order, family, genus, organism)}).
+    """
+    headers, rows = read_blast_rows(path)
+    if not headers:
+        raise ValueError(f"Empty or unreadable reference file: {os.path.basename(path)}")
+    id_i = 0
+    for i, name in enumerate(headers):
+        if str(name).strip().lower() in _REF_ID_HEADERS:
+            id_i = i
+            break
+    if len(headers) < id_i + 5:
+        raise ValueError(
+            f"{os.path.basename(path)}: the identifier column "
+            f"'{headers[id_i]}' must be followed by 4 columns "
+            f"(Order, Family, Genus, Organism); {len(headers) - id_i - 1} found."
+        )
+    tax_cols = [str(h).strip() for h in headers[id_i + 1:id_i + 5]]
+    table = {}
+    for row in rows:
+        if id_i >= len(row):
+            continue
+        key = "" if row[id_i] is None else str(row[id_i]).strip()
+        if not key or key in table:
+            continue   # first occurrence wins; duplicates are ignored
+        values = []
+        for j in range(id_i + 1, id_i + 5):
+            v = row[j] if j < len(row) else ""
+            values.append("" if v is None else str(v).strip())
+        table[key] = tuple(values)
+    if not table:
+        raise ValueError(
+            f"{os.path.basename(path)}: no identifier found in column "
+            f"'{headers[id_i]}'."
+        )
+    return str(headers[id_i]).strip(), tax_cols, table
+
+
 # Taxonomic rank reached by the best concordant hit, deepest first.
 TAX_LEVELS = ("organism", "genus", "family", "order", "none")
 
@@ -144,6 +202,10 @@ class _PairDropZone(QtWidgets.QFrame):
         self._blasts: List[str] = []
         self._seq_cache: Dict[str, int] = {}
         self._col_cache: Dict[str, List[str]] = {}
+        # True when a taxonomy reference file is supplied: the Query_* columns
+        # are then written into the tables at run time, so missing ones are a
+        # note, not an error.
+        self._ref_mode = False
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
@@ -231,6 +293,18 @@ class _PairDropZone(QtWidgets.QFrame):
         cols = set(self._columns(path))
         return [c for c in QUERY_TAX_COLUMNS if c not in cols]
 
+    def set_reference_mode(self, enabled: bool):
+        """Accept tables without the Query_* columns (a reference file fills them)."""
+        if enabled != self._ref_mode:
+            self._ref_mode = enabled
+            self._update_display()
+
+    def refresh_columns(self):
+        """Re-read the table headers, which change once a run writes the
+        Query_* columns into them."""
+        self._col_cache = {}
+        self._update_display()
+
     # ── Pairing ───────────────────────────────────────────────────────────
 
     def pairs(self) -> List[dict]:
@@ -256,7 +330,7 @@ class _PairDropZone(QtWidgets.QFrame):
             return False, "Add at least one FASTA with its BLAST table."
         bad = [os.path.basename(p["blast"]) for p in pairs
                if self._missing_tax_columns(p["blast"])]
-        if bad:
+        if bad and not self._ref_mode:
             return False, ("Missing query taxonomy columns in: " + ", ".join(bad[:3])
                            + ("…" if len(bad) > 3 else ""))
         note = ("Single run: sequences will be classified by taxonomic match "
@@ -306,7 +380,12 @@ class _PairDropZone(QtWidgets.QFrame):
                 size=14, color=RED)
         else:
             missing = self._missing_tax_columns(blast)
-            if missing:
+            if missing and self._ref_mode:
+                detail = make_label(
+                    f"{n_seqs:,} seqs  ·  📊 {os.path.basename(blast)}  ·  "
+                    f"{', '.join(missing)} → will be written from the reference",
+                    size=14, color=TEXT_HINT)
+            elif missing:
                 detail = make_label(
                     f"{n_seqs:,} seqs  ·  📊 {os.path.basename(blast)}  ·  "
                     f"missing: {', '.join(missing)}",
@@ -468,6 +547,194 @@ class _PairDropZone(QtWidgets.QFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# QUERY TAXONOMY REFERENCE DROP ZONE  (one .csv / .xlsx / .tsv file)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ElidingLabel(QtWidgets.QLabel):
+    """Single-line label that shrinks its text to the width it is given.
+
+    Used instead of word wrap so the row keeps one constant height: a long
+    file path is elided in the middle rather than pushing the text out of
+    the frame.
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full = text
+        self.setWordWrap(False)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored,
+                           QtWidgets.QSizePolicy.Preferred)
+        self.setMinimumWidth(60)
+
+    def setFullText(self, text: str):
+        self._full = text or ""
+        self._apply()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self):
+        fm = self.fontMetrics()
+        w = max(self.width(), self.minimumWidth())
+        text = self._full
+        if fm.width(text) > w:
+            text = fm.elidedText(text, QtCore.Qt.ElideMiddle, w)
+        if text != self.text():
+            super().setText(text)
+
+
+class _RefDropZone(QtWidgets.QFrame):
+    """Compact drop zone for the single query-taxonomy reference table.
+
+    The reference file is optional, so this stays one slim row: the hint (or
+    the chosen file name) on the left, the buttons on the right. The height
+    follows the contents instead of being fixed, which is what used to clip
+    the text, and the label is elided rather than wrapped so a long path can
+    never push the row out of shape.
+    """
+
+    fileChanged = QtCore.pyqtSignal(str)   # path ('' when cleared)
+
+    _HINT = "Drag the reference file here  (.csv, .xlsx, .tsv)"
+
+    _QSS = f"""
+    QFrame#ref_drop_zone {{
+        background-color: {GRAY_BG};
+        border: 1px dashed #D8D8D4;
+        border-radius: 8px;
+        padding: 4px 10px;
+    }}
+    QFrame#ref_drop_zone[dragging="true"] {{
+        background-color: #EBEBEA;
+        border: 1px dashed {BLUE_MID};
+    }}
+    QFrame#ref_drop_zone[dragging="invalid"] {{
+        background-color: {RED_LT};
+        border: 1px dashed {RED};
+    }}
+    QFrame#ref_drop_zone[filled="true"] {{
+        background-color: {GREEN_LT};
+        border: 1px solid {GREEN_MID};
+    }}
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ref_drop_zone")
+        self.setStyleSheet(self._QSS)
+        self.setAcceptDrops(True)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                           QtWidgets.QSizePolicy.Fixed)
+        self.path = ""
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(10)
+
+        self._lbl = _ElidingLabel(self._HINT)
+        self._lbl.setStyleSheet(f"font-size:15px; color:{TEXT_SEC};")
+        # The style sheet size is invisible to QFontMetrics, so set it on the
+        # font as well: that is what the elision measures against.
+        _f = self._lbl.font()
+        _f.setPixelSize(15)
+        self._lbl.setFont(_f)
+        self._lbl.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        layout.addWidget(self._lbl, 1)
+
+        self._browse_btn = QtWidgets.QPushButton("Add")
+        self._browse_btn.setObjectName("secondary_btn")
+        self._browse_btn.setMinimumWidth(96)
+        self._browse_btn.clicked.connect(self._browse)
+        self._clear_btn = QtWidgets.QPushButton("Clear")
+        self._clear_btn.setObjectName("danger_btn")
+        self._clear_btn.setMinimumWidth(96)
+        self._clear_btn.clicked.connect(self.clear)
+        self._clear_btn.hide()
+        layout.addWidget(self._browse_btn, 0)
+        layout.addWidget(self._clear_btn, 0)
+
+        self._tip = (
+            "One table (.csv / .xlsx / .tsv) holding the expected classification\n"
+            "of every sample. The identifier must be the same sample ID as in the\n"
+            "FASTA headers, and the 4 columns after it are read as Order, Family,\n"
+            "Genus and Organism, in that order."
+        )
+        self._render()
+
+    # ── Display ───────────────────────────────────────────────────────────
+
+    def _render(self):
+        if self.path:
+            self._lbl.setFullText(f"📑  {os.path.basename(self.path)}")
+            self._lbl.setToolTip(self.path)
+            self._clear_btn.show()
+            self.setProperty("filled", "true")
+        else:
+            self._lbl.setFullText(_tr("BestSeqRefDropZone", self._HINT))
+            self._lbl.setToolTip(self._tip)
+            self._clear_btn.hide()
+            self.setProperty("filled", "false")
+        refresh_style(self)
+
+    def set_path(self, path: str):
+        self.path = path or ""
+        self._render()
+        self.fileChanged.emit(self.path)
+
+    def clear(self):
+        self.set_path("")
+
+    def retranslateUi(self):
+        ctx = "BestSeqRefDropZone"
+        self._browse_btn.setText(_tr(ctx, "Add"))
+        self._clear_btn.setText(_tr(ctx, "Clear"))
+        self._render()
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.LanguageChange:
+            self.retranslateUi()
+        super().changeEvent(event)
+
+    # ── Input ─────────────────────────────────────────────────────────────
+
+    def _browse(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, _tr("BestSeqRefDropZone", "Select the taxonomy reference file"),
+            "", "Reference table (*.csv *.xlsx *.tsv *.txt);;All (*)"
+        )
+        if f:
+            self.set_path(f)
+
+    def _dropped_paths(self, mime) -> List[str]:
+        paths = [u.toLocalFile() for u in mime.urls()]
+        return [p for p in paths if p and _is_reference(p)]
+
+    def dragEnterEvent(self, e):
+        if not e.mimeData().hasUrls():
+            return
+        e.acceptProposedAction()
+        # Say up front whether the file can be used, the way the pair zone does.
+        ok = bool(self._dropped_paths(e.mimeData()))
+        self.setProperty("dragging", "true" if ok else "invalid")
+        refresh_style(self)
+
+    def dragLeaveEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+
+    def dropEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+        paths = self._dropped_paths(e.mimeData())
+        if paths:
+            self.set_path(paths[0])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # BEST SEQUENCE PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -516,10 +783,10 @@ class BestSeqPanel(QtWidgets.QWidget):
             "<td valign='top'>⚠&nbsp;&nbsp;</td>"
             "<td>Every BLAST table must carry the expected classification of the sample in "
             "<b>each hit row</b>: <b>Query_Order</b>, <b>Query_Family</b>, <b>Query_Genus</b> "
-            "and <b>Query_organism</b>, next to the usual "
-            "<i>Query_name, Hit_rank, P_identity, Alignment_length, Bit_score</i> and "
-            "<i>Subject_Order / Subject_Family / Subject_Genus / Subject_organism</i> columns.<br>"
-            "Empty ranks may be left blank or as 0. Files missing these columns are rejected.</td>"
+            "and <b>Query_organism</b>.<br>"
+            "Empty ranks may be left blank or as 0. Files missing these columns are rejected, "
+            "unless a <b>query taxonomy reference file</b> is supplied below: the four columns "
+            "are then written into every BLAST table before the run.</td>"
             "</tr></table>"
         )
         self._lbl_req.setWordWrap(True)
@@ -554,6 +821,31 @@ class BestSeqPanel(QtWidgets.QWidget):
         )
         self._lbl_suffix = QtWidgets.QLabel("Strip suffix from sample ID:")
         sg.addRow(self._lbl_suffix, self._suffix_edit)
+
+        # ── Optional query-taxonomy reference file ──
+        # Without it every BLAST table must already carry the Query_* columns.
+        # With it they are written into the tables from a single list, keyed by
+        # the sample ID left after the suffix above is stripped.
+        self._ref_check = QtWidgets.QCheckBox(
+            "I have a reference file with the query taxonomy")
+        self._ref_check.setToolTip(
+            "Adds Query_Order / Query_Family / Query_Genus / Query_organism to every\n"
+            "BLAST table from a single reference list, instead of preparing each\n"
+            "table by hand. The tables are rewritten in place."
+        )
+        self._ref_check.toggled.connect(self._on_ref_toggled)
+        sg.addRow(self._ref_check)
+
+        self._ref_zone = _RefDropZone()
+        self._ref_zone.fileChanged.connect(self._on_ref_file)
+        self._ref_zone.hide()
+        sg.addRow(self._ref_zone)
+
+        self._lbl_ref_info = QtWidgets.QLabel("")
+        self._lbl_ref_info.setWordWrap(True)
+        self._lbl_ref_info.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+        self._lbl_ref_info.hide()
+        sg.addRow(self._lbl_ref_info)
 
         self._layout.addWidget(self._settings_box)
 
@@ -659,6 +951,8 @@ class BestSeqPanel(QtWidgets.QWidget):
 
         self._last_outdir = ""
         self._last_report = ""
+        self._ref_ok = False          # reference file present and readable
+        self._describe_reference()
 
         self.installEventFilter(self)
 
@@ -705,6 +999,8 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._settings_box.setTitle(_tr(ctx, "Selection Settings"))
         self._lbl_minaln.setText(_tr(ctx, "Minimum alignment length (bp):"))
         self._lbl_suffix.setText(_tr(ctx, "Strip suffix from sample ID:"))
+        self._ref_check.setText(_tr(ctx, "I have a reference file with the query taxonomy"))
+        self._ref_zone.retranslateUi()
         self._clear_btn.setText(_tr(ctx, "Clear"))
         self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
         self._open_results_btn.setText(_tr(ctx, "Open results  📄"))
@@ -718,8 +1014,58 @@ class BestSeqPanel(QtWidgets.QWidget):
 
     # ── Slots ─────────────────────────────────────────────────────────────
 
-    def _on_pairs(self, pairs):
+    def _on_ref_toggled(self, checked: bool):
+        self._ref_zone.setVisible(checked)
+        self._lbl_ref_info.setVisible(checked)
+        self._describe_reference()
+        self._drop.set_reference_mode(checked and self._ref_ok)
+        self._on_pairs(None)
+
+    def _on_ref_file(self, path: str):
+        self._describe_reference()
+        self._drop.set_reference_mode(self._ref_check.isChecked() and self._ref_ok)
+        self._on_pairs(None)
+
+    def _describe_reference(self):
+        """Validate the reference file and describe how it will be read."""
+        self._ref_ok = False
+        path = self._ref_zone.path
+        if not path:
+            self._lbl_ref_info.setText(
+                "The identifier must be the same sample ID as in the FASTA headers "
+                "(the text before the first ';', with the suffix above removed). "
+                "The <b>4 columns following it</b> are read, in this order, as "
+                "<b>Order, Family, Genus and Organism</b>."
+            )
+            self._lbl_ref_info.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+            return
+        try:
+            id_col, tax_cols, table = read_tax_reference(path)
+        except Exception as exc:
+            self._lbl_ref_info.setText(f"⚠  {exc}")
+            self._lbl_ref_info.setStyleSheet(f"color:{RED}; font-size:14px;")
+            return
+        self._ref_ok = True
+        self._lbl_ref_info.setText(
+            f"{len(table):,} entries  ·  identifier: <b>{id_col}</b>  ·  "
+            f"<b>{' · '.join(tax_cols)}</b> → Query_Order · Query_Family · "
+            f"Query_Genus · Query_organism.<br>"
+            f"These columns will be written into every BLAST table dropped below "
+            f"(the files are modified in place)."
+        )
+        self._lbl_ref_info.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+
+    def _on_pairs(self, pairs=None):
         ok, msg = self._drop.is_valid()
+        # The reference file is what makes a table without Query_* columns
+        # acceptable, so its own problems are reported first.
+        if self._ref_check.isChecked() and self._drop.pairs():
+            if not self._ref_zone.path:
+                ok, msg = False, ("Add the query taxonomy reference file, "
+                                  "or uncheck that option.")
+            elif not self._ref_ok:
+                ok, msg = False, ("The query taxonomy reference file cannot be used "
+                                  "(see the message in the settings).")
         self._lbl_status.setText(msg)
         self._lbl_status.setStyleSheet(
             f"color:{TEXT_HINT};" if ok else f"color:{RED};"
@@ -737,6 +1083,8 @@ class BestSeqPanel(QtWidgets.QWidget):
             "amb_penalty":     AMB_PENALTY,
             "gap_penalty":     GAP_PENALTY,
             "strip_suffix":    self._suffix_edit.text().strip(),
+            "tax_reference":   (self._ref_zone.path
+                                if self._ref_check.isChecked() else ""),
         }
         self.bestSeqRequested.emit(self._drop.pairs(), cfg)
 
@@ -821,6 +1169,10 @@ class BestSeqPanel(QtWidgets.QWidget):
 
     def on_finished(self, outdir: str):
         self.set_running(False)
+        # A run with a reference file rewrites the tables, so their headers
+        # (and the "missing column" notes) are stale.
+        if self._ref_check.isChecked():
+            self._drop.refresh_columns()
         self._last_outdir = outdir
         if outdir and os.path.isdir(outdir):
             self._open_folder_btn.show()
@@ -1001,6 +1353,131 @@ class _BestSeqWorker(QtCore.QThread):
             return float(str(value).strip())
         except (TypeError, ValueError):
             return 0.0
+
+    # ── Query taxonomy taken from a reference file ────────────────────────
+
+    def _sample_of(self, query_name) -> str:
+        """Sample ID of a BLAST Query_name, parsed like a FASTA header."""
+        return self._parse_header(str(query_name))["sample"]
+
+    def _apply_reference_tax(self, path: str, ref: dict, ref_lower: dict):
+        """Write the four Query_* columns into a BLAST table, in place.
+
+        Every row is keyed by the sample ID of its Query_name (the text before
+        the first ';', with the configured suffix removed), which is the
+        identifier the reference file is expected to use. Columns already in the
+        table are overwritten; the missing ones are appended at its right end,
+        so the original layout and formatting are left alone.
+
+        Returns (rows seen, rows filled, sample IDs absent from the reference).
+        """
+        if path.lower().endswith(".xlsx"):
+            return self._apply_reference_xlsx(path, ref, ref_lower)
+        return self._apply_reference_text(path, ref, ref_lower)
+
+    def _lookup_tax(self, sample: str, ref: dict, ref_lower: dict):
+        """Reference row of *sample*, matched exactly then case-insensitively."""
+        tax = ref.get(sample)
+        if tax is None:
+            tax = ref_lower.get(sample.lower())
+        return tax
+
+    def _apply_reference_xlsx(self, path, ref, ref_lower):
+        import openpyxl
+        from copy import copy
+        wb = openpyxl.load_workbook(path)
+        sheet = wb[wb.sheetnames[0]]
+        header_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
+        headers = [(str(c.value).strip() if c.value is not None else "")
+                   for c in header_row]
+        if "Query_name" not in headers:
+            wb.close()
+            raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
+        q_i = headers.index("Query_name")
+
+        # Trailing blank headers are not part of the table: append after the
+        # last named column, so no empty column is left in between.
+        next_col = max((i for i, h in enumerate(headers, 1) if h), default=0)
+        style_src = sheet.cell(row=1, column=q_i + 1)
+        col_idx = {}
+        for name in QUERY_TAX_COLUMNS:
+            if name in headers:
+                col_idx[name] = headers.index(name) + 1
+            else:
+                next_col += 1
+                col_idx[name] = next_col
+                cell = sheet.cell(row=1, column=next_col, value=name)
+                cell._style = copy(style_src._style)
+
+        n_rows = n_filled = 0
+        unknown = set()
+        for row in sheet.iter_rows(min_row=2):
+            value = row[q_i].value if q_i < len(row) else None
+            if value is None or str(value).strip() == "":
+                continue
+            n_rows += 1
+            sample = self._sample_of(value)
+            tax = self._lookup_tax(sample, ref, ref_lower)
+            if tax is None:
+                unknown.add(sample)
+                tax = ("", "", "", "")
+            else:
+                n_filled += 1
+            for name, val in zip(QUERY_TAX_COLUMNS, tax):
+                sheet.cell(row=row[0].row, column=col_idx[name], value=val)
+
+        tmp = path + ".tmp"
+        wb.save(tmp)
+        wb.close()
+        os.replace(tmp, path)
+        return n_rows, n_filled, sorted(unknown)
+
+    def _apply_reference_text(self, path, ref, ref_lower):
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            first = fh.readline()
+            fh.seek(0)
+            sep = "\t" if "\t" in first else ","
+            rows = [r for r in csv.reader(fh, delimiter=sep)]
+        rows = [r for r in rows if any(c.strip() for c in r)]
+        if not rows:
+            raise ValueError(f"Empty BLAST table: {os.path.basename(path)}")
+        headers = [c.strip() for c in rows[0]]
+        if "Query_name" not in headers:
+            raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
+        q_i = headers.index("Query_name")
+        col_idx = {}
+        for name in QUERY_TAX_COLUMNS:
+            if name in headers:
+                col_idx[name] = headers.index(name)
+            else:
+                col_idx[name] = len(headers)
+                headers.append(name)
+        width = len(headers)
+
+        out = [headers]
+        n_rows = n_filled = 0
+        unknown = set()
+        for row in rows[1:]:
+            row = list(row) + [""] * (width - len(row))
+            value = row[q_i] if q_i < len(row) else ""
+            if str(value).strip():
+                n_rows += 1
+                sample = self._sample_of(value)
+                tax = self._lookup_tax(sample, ref, ref_lower)
+                if tax is None:
+                    unknown.add(sample)
+                    tax = ("", "", "", "")
+                else:
+                    n_filled += 1
+                for name, val in zip(QUERY_TAX_COLUMNS, tax):
+                    row[col_idx[name]] = val
+            out.append(row)
+
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            csv.writer(fh, delimiter=sep, lineterminator="\n").writerows(out)
+        os.replace(tmp, path)
+        return n_rows, n_filled, sorted(unknown)
 
     def _load_blast(self, path: str) -> Tuple[Dict[str, List[dict]],
                                               Dict[str, dict],
@@ -1279,6 +1756,73 @@ class _BestSeqWorker(QtCore.QThread):
             f"  │  Bit weight: {bit_weight:g}"
         )
 
+        # ── Query taxonomy written into the BLAST tables from a reference ──
+        # Without a reference every table must already carry the Query_* columns
+        # (_load_blast rejects it otherwise). With one, they are written now, in
+        # place, so a single list of samples serves every run.
+        ref_path  = cfg.get("tax_reference", "")
+        ref_lines: List[str] = []
+        if ref_path:
+            id_col, tax_cols, ref_table = read_tax_reference(ref_path)
+            ref_lower = {k.lower(): v for k, v in ref_table.items()}
+            self.statusUpdated.emit(
+                "files",
+                f"Reference   │ {len(ref_table)} entries · identifier '{id_col}'"
+            )
+            ref_lines += [
+                "",
+                "  Query taxonomy reference:",
+                f"    File        : {os.path.abspath(ref_path)}",
+                f"    Identifier  : {id_col}",
+                f"    Columns     : {' · '.join(tax_cols)} → "
+                f"{' · '.join(QUERY_TAX_COLUMNS)}",
+                f"    Entries     : {len(ref_table)}",
+            ]
+            all_unknown = set()
+            for i, pair in enumerate(self.pairs):
+                if self._stop:
+                    break
+                name = os.path.basename(pair["blast"])
+                self.statusUpdated.emit(
+                    "files",
+                    f"Reference   │ [{i + 1}/{n_files}] writing query taxonomy into {name}…"
+                )
+                try:
+                    n_rows, n_filled, unknown = self._apply_reference_tax(
+                        pair["blast"], ref_table, ref_lower)
+                except PermissionError:
+                    self.taskError.emit(
+                        f"Could not write the query taxonomy into {name}: the file is "
+                        f"open in another program. Close it and run again."
+                    )
+                    return
+                all_unknown.update(unknown)
+                ref_lines.append(
+                    f"    {name}: {n_filled}/{n_rows} rows filled"
+                    + (f" · {len(unknown)} sample(s) not in the reference"
+                       if unknown else "")
+                )
+            if all_unknown:
+                self.statusUpdated.emit(
+                    "files",
+                    f"Reference   │ Query taxonomy written · {len(all_unknown)} "
+                    f"sample(s) not found in the reference"
+                )
+                ref_lines += ["", "    Samples missing from the reference:"]
+                for sample in sorted(all_unknown)[:50]:
+                    ref_lines.append(f"      {sample}")
+                if len(all_unknown) > 50:
+                    ref_lines.append(f"      … {len(all_unknown) - 50} more")
+            else:
+                self.statusUpdated.emit(
+                    "files",
+                    f"Reference   │ Query taxonomy written into {n_files} table(s)  ✓"
+                )
+            if self._stop:
+                self.statusUpdated.emit("result", "Stopped     │ selection cancelled")
+                self.taskFinished.emit(output_dir)
+                return
+
         # ── Load every FASTA + BLAST pair ──
         candidates: Dict[str, List[dict]] = {}
         file_labels: List[str] = []
@@ -1514,6 +2058,9 @@ class _BestSeqWorker(QtCore.QThread):
             f"  Penalty per ambiguity    : {amb_penalty:g}",
             f"  Penalty per estimated gap: {gap_penalty:g}",
             f"  Sample ID suffix removed : {cfg.get('strip_suffix', '') or '(none)'}",
+            f"  Query taxonomy reference : "
+            f"{os.path.basename(ref_path) if ref_path else '(none - read from the tables)'}",
+            *ref_lines,
             "",
             "Scoring:",
             "  score = taxonomic bonus of the best concordant hit",

@@ -15,6 +15,67 @@ repository):
 
 ---
 
+## [3.4b] — 2026-09
+
+Adds a way to explore several values of a few parameters without re-running
+the analysis by hand each time. The analysis pipeline itself is untouched:
+a batch with an empty `.cfg` reproduces a normal single run exactly.
+
+### Added
+
+#### Parameter Batch utility (sidebar, right below Parameters — Optional)
+- New **"Parameter Batch"** panel (`_utilities/batch_sweep_panel.py`,
+  `_utilities/batch_sweep.py`) that runs the currently loaded dataset once per
+  combination of a parameter grid — e.g. several *Main consensus calling
+  frequency* / *Min. secondary variant fraction* / *Variant tolerance* values —
+  instead of changing them by hand and re-running each time. Conventional
+  analysis only; locked in the sidebar until a dataset is loaded, and shown in
+  italics to mark it as optional rather than a required Workflow step.
+- The grid is defined in a plain-text `.cfg` (`key = v1, v2, v3` per line, `#`
+  comments): only the parameters listed are overridden, on top of whatever is
+  currently set in the Parameters panel — so a sweep of 3 parameters needs 3
+  lines, not a full copy of every setting. `_profiles/ontbarcoder_batch.cfg`
+  ships as a fully-documented template (every sweepable parameter, its
+  default, valid range and an example), reachable from the panel's **"Create
+  example cfg"** button.
+- Every key and value is validated against an explicit range table (mirroring
+  each parameter's GUI spinbox bounds) as soon as the `.cfg` is loaded —
+  unknown keys and out-of-range values are rejected with the offending line
+  before anything runs, rather than surfacing as a confusing failure mid-batch.
+  `non_coi` is deliberately not sweepable (it derives the genetic code and
+  which phases exist; set it in the Parameters panel instead). Listing any
+  `resolve_mixed.*` key turns intra-sample variant detection on for the whole
+  batch even if the panel checkbox is off — otherwise every combination would
+  be identical — logged explicitly so it is never a silent surprise.
+- Each combination runs as an ordinary `ont-barcoder_*_conv` folder, with its
+  own self-documenting log recording the exact parameters used — indistinguishable
+  from a manual run except for how it was launched. A batch of more than 15
+  combinations shows a visible warning (each one is a full analysis); above
+  200 the app asks for confirmation before starting anything.
+- Once every combination finishes (or the batch is stopped), the
+  `consensus_filtered.fa` of every completed run is merged into a single
+  `unique_consensus_filtered.fasta` plus a `batch_dedup_report.tsv`, inside the
+  batch's own output folder: a sample whose sequence is identical in every run
+  appears once; a sample with different sequences across runs gets one entry
+  per distinct variant, header tagged with the run folder that produced it
+  (`;20260910_103536_conv`). BLAST and Best Sequence stay manual steps, run
+  afterwards on that merged FASTA — Best Sequence already picks the best
+  variant per sample when there is more than one candidate.
+- Two progress bars track the batch: combinations completed (`i/N`) and the
+  current combination's own phase progress (0-100 %, equal weight per active
+  phase), the latter driven by a new `ProgressPanel.overallProgressChanged`
+  signal so it updates live even though the Progress panel itself stays off
+  screen during a batch.
+- Stopping is handled the same way regardless of how it happens: the panel's
+  own **Stop** finishes the running combination cleanly before stopping;
+  stopping from the Analysis panel's own Stop button, resetting the analysis,
+  or closing the app mid-batch all still deduplicate and write the merged
+  FASTA from whatever combinations completed — none of them can leave the
+  batch's internal queue silently stuck.
+- New **Notes** entry ("Parameter Batch") walking through the workflow.
+
+---
+
 ## [3.3b] — 2026-09
 
 Adds a post-processing utility for reconciling several runs of the same library.
@@ -105,6 +166,61 @@ exactly.
   sequences with its BLAST table, so no renaming is needed between the two
   panels. It is written before the first query (it survives a run stopped half
   way) and a failure to write it never aborts the BLAST run.
+
+#### Best Sequence accepts a query taxonomy reference file
+- New **"I have a reference file with the query taxonomy"** option in the panel
+  settings. When ticked it opens a drop zone for a single reference table
+  (`.csv` / `.xlsx` / `.tsv`) and the four `Query_Order` / `Query_Family` /
+  `Query_Genus` / `Query_organism` columns are written into **every** BLAST table
+  of the run from that one list, instead of preparing each table by hand.
+- The identifier of the reference is the sample ID the panel already uses to
+  group sequences (header up to the first `;`, minus the *Strip suffix* value),
+  and the **four columns following the identifier** are read as Order, Family,
+  Genus and Organism whatever their headers say. The identifier column is the
+  first one named `Sample` / `ID` / `Query_name` / `Code` / `Voucher`…, else the
+  first column of the file.
+- Tables are rewritten **in place**: existing `Query_*` columns are overwritten,
+  missing ones are appended at the right end, and a table locked by Excel stops
+  the run with a message rather than losing the change. With the option on, the
+  drop zone no longer rejects tables lacking those columns.
+- The run log records the reference file, its identifier and taxonomy columns,
+  the rows filled per table and the samples that were not found in it.
+
+#### BLAST utility reports the sequences with no match
+- A run now writes `nohit_seqs_<ts>.fa` with the sequences that were queried
+  successfully but got no hit from NCBI, so they can be re-run against another
+  database or inspected without diffing the input FASTA against the table.
+  It is built from the batches whose rows reached the TSV, so it never overlaps
+  `missing_seqs_<ts>.fa` (batches that failed or were never processed).
+- The run log gains `Seqs with hits`, `Seqs with no hits`, the no-hit file name
+  and the list of the query names that returned no match; the live-log result
+  line reports the same summary.
+
+#### Compare utility: readable summary for many files
+- Files now get short single-letter aliases (`A`, `B`, `C`…, plus `REF` in
+  reference mode) instead of their full path in every column header. A new
+  **`Runs`** sheet in `summary.xlsx` maps each alias to its label, role, file,
+  sequence count and full path; the on-screen results window shows the same
+  mapping as a chip bar and in the header tooltips.
+- `summary.xlsx` gains a two-row header: a merged band naming the run
+  (`A · 103536`, with the full path as a cell comment) over the `len` / `cov` /
+  `ambs` / `gaps` sub-columns. The sheet also gets an autofilter and freezes the
+  `ID` / `State` columns.
+- The `Note` column no longer enumerates the N·(N−1)/2 pairs with both file
+  names spelled out. Files carrying the same sequence are collapsed into
+  variant groups, **numbered** `1, 2, 3…` — deliberately not lettered, so a
+  group label is never confused with the letter-aliased runs it lists — and
+  only the distances **between groups** are reported:
+  `1=A-D | 2=E | 3=F || 1-2 d=34, 1-3 d=43, 2-3 d=15 || Best F (…)`.
+  On a 6-file comparison this cut a typical note from ~1 450 to ~90 characters.
+  Reference mode groups the files by their verdict against the reference
+  instead: `= REF: A-C || ≠ REF d=34: D || …`.
+- Two new columns in all-vs-all mode: **`Vars`**, the number of distinct
+  sequences found for the ID, and **`Pattern`**, one group number per file
+  (`111123`, `.` for absent), so rows sharing a discrepancy pattern sort and
+  filter together.
+- FASTA outputs are unchanged and still record the full source file name in the
+  `best_from=` / `src=` header fields.
 
 ### Documentation
 - Manual brought up to date (`guide/MANUAL.html`): new **§14 Utility — Best

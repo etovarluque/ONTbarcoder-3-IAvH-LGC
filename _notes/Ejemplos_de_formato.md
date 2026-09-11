@@ -1,78 +1,78 @@
 ---
-title: Ejemplos de formato
+title: Formatting examples
 created: 2026-07-17T00:00:00
-updated: 2026-07-31T12:03:54
-tags: ayuda, ejemplo
+updated: 2026-09-11T00:00:00
+tags: help, example
 ---
 
-# Ejemplos de formato
+# Formatting examples
 
-Esta nota muestra los estilos disponibles. Pulsa el boton 👁 para ver el
-resultado, o quita el 👁 para ver como se escribe cada uno.
+This note shows the available styles. Click the 👁 button to see the
+rendered result, or turn off 👁 to see how each one is written.
 
-## Titulos
+## Headings
 
-# Titulo grande (H1)
-## Titulo mediano (H2)
-### Titulo pequeno (H3)
+# Large heading (H1)
+## Medium heading (H2)
+### Small heading (H3)
 
-## Estilos de texto
+## Text styles
 
-Texto normal sin formato.
-**Texto en negrita** con dos asteriscos.
-*Texto en cursiva* con un asterisco.
-***Negrita y cursiva*** con tres asteriscos.
-~~Texto tachado~~ con dos virgulillas.
-<u>Texto subrayado</u> con la etiqueta u.
-Codigo en linea con `comillas invertidas`.
+Plain text with no formatting.
+**Bold text** with two asterisks.
+*Italic text* with one asterisk.
+***Bold and italic*** with three asterisks.
+~~Strikethrough text~~ with two tildes.
+<u>Underlined text</u> with the u tag.
+Inline code with `backticks`.
 
-## Listas con vinetas
+## Bulleted lists
 
-- Primer punto
-- Segundo punto
-- Tercer punto
+- First item
+- Second item
+- Third item
 
-## Listas numeradas
+## Numbered lists
 
-1. Primer paso
-2. Segundo paso
-3. Tercer paso
+1. First step
+2. Second step
+3. Third step
 
-## Lista de tareas
+## Task list
 
-- [x] Tarea terminada
-- [ ] Tarea pendiente
-- [ ] Otra pendiente
+- [x] Completed task
+- [ ] Pending task
+- [ ] Another pending task
 
-## Cita
+## Quote
 
-> Esto es una cita destacada.
-> Sirve para resaltar una nota o advertencia importante.
+> This is a highlighted quote.
+> Used to emphasize an important note or warning.
 
-## Bloque de codigo
+## Code block
 
 ```
-# Ejemplo de secuencia o comando
+# Example sequence or command
 ATGCGTACGTTAGCATCG
 python ONTbarcoder3.py
 ```
 
-## Tabla
+## Table
 
-| Region | Longitud | Notas |
+| Region | Length | Notes |
 | --- | --- | --- |
-| COI | 658 pb | barcode estandar |
-| Cytb | 1032 pb | codon stop recortado |
-| 16S | 550 pb | variable |
+| COI | 658 bp | standard barcode |
+| Cytb | 1032 bp | stop codon trimmed |
+| 16S | 550 bp | variable |
 
-## Enlace
+## Link
 
-[Sitio de referencia](https://www.ncbi.nlm.nih.gov)
+[Reference site](https://www.ncbi.nlm.nih.gov)
 
-## Separador
+## Divider
 
-Texto antes de la linea.
+Text before the line.
 
 ---
 
-Texto despues de la linea.
+Text after the line.

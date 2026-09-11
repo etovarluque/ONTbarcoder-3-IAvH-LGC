@@ -9,6 +9,86 @@ from .shared import *
 from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# BATCH PLANNING
+#
+# NCBI penalises the number of *searches* (over 100 in 24 h moves the IP to a
+# slower queue), while its hard limit is the length of one query: 1,000,000
+# bases for blastn. Both the panel preview and the worker use the functions
+# below, so what the user is shown is exactly what will be submitted.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Cap for one query, a little below NCBI's 1,000,000 so headers and percent
+# encoding cannot push a batch over the line.
+MAX_QUERY_BASES = 900_000
+# Ceiling on sequences in one search. Not an NCBI rule: it keeps a single job
+# from growing so large that one failure costs the whole run.
+MAX_QUERY_SEQS  = 1000
+
+
+def plan_batch_sizes(lengths, nseq, max_bases=MAX_QUERY_BASES):
+    """Split `lengths` into batches of at most `nseq` sequences / `max_bases` bases.
+
+    Returns the size of each batch, in order. A single sequence longer than
+    `max_bases` gets a batch of its own rather than being dropped: letting NCBI
+    reject it explicitly beats losing it in silence.
+    """
+    sizes = []
+    count = 0
+    bases = 0
+    for L in lengths:
+        if count and (count >= nseq or bases + L > max_bases):
+            sizes.append(count)
+            count = 0
+            bases = 0
+        count += 1
+        bases += L
+    if count:
+        sizes.append(count)
+    return sizes
+
+
+def auto_nseq(lengths, max_bases=MAX_QUERY_BASES, max_seqs=MAX_QUERY_SEQS):
+    """Sequences per search that uses the fewest searches, evenly filled.
+
+    Fewest searches is what protects the user's IP quota; spreading the
+    sequences evenly over that number avoids a last batch of two or three.
+    """
+    n = len(lengths)
+    if n == 0:
+        return max_seqs
+    total = sum(lengths)
+    # Smallest batch count that satisfies both ceilings.
+    k = max(1,
+            -(-total // max_bases),   # ceil division
+            -(-n // max_seqs))
+    return max(1, -(-n // k))         # spread evenly over k batches
+
+
+def fasta_lengths(path):
+    """Sequence lengths in a FASTA file, ignoring headers and blank lines."""
+    lengths = []
+    cur = 0
+    started = False
+    try:
+        opener = __import__("gzip").open if path.endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                if ln.startswith(">"):
+                    if started:
+                        lengths.append(cur)
+                    cur = 0
+                    started = True
+                elif started:
+                    cur += len(ln.strip())
+        if started:
+            lengths.append(cur)
+    except Exception:
+        return []
+    return lengths
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # BLAST PANEL
 # ═══════════════════════════════════════════════════════════════════════════
@@ -134,29 +214,52 @@ class BlastPanel(QtWidgets.QWidget):
         bl2 = QtWidgets.QHBoxLayout(batch_row)
         bl2.setContentsMargins(0, 0, 0, 0)
         bl2.setSpacing(6)
+        # Two ways to size a batch. Automatic is the default because the good
+        # setting depends on the data (NCBI's ceiling is total bases, not a
+        # sequence count) and because too many small searches is what gets an
+        # IP moved to the slow queue.
+        self._batch_mode = QtWidgets.QComboBox()
+        self._batch_mode.addItems(["Automatic", "Manual"])
+        self._batch_mode.setFixedWidth(130)
+        self._batch_mode.currentIndexChanged.connect(self._on_batch_mode)
+        bl2.addWidget(self._batch_mode)
+
         self._batch_spin = QtWidgets.QSpinBox()
-        self._batch_spin.setRange(1, 100)
-        self._batch_spin.setValue(50)
+        # NCBI's limit is total query length (1,000,000 bases for blastn), not a
+        # sequence count, and its penalty counts *searches*, not sequences — so a
+        # low ceiling here works against the user. The worker splits a batch that
+        # exceeds the length limit on its own.
+        self._batch_spin.setRange(1, 1000)
+        self._batch_spin.setValue(500)
         self._batch_spin.setFixedWidth(80)
+        self._batch_spin.valueChanged.connect(self._update_batch_plan)
         bl2.addWidget(self._batch_spin)
-        self._ncbi_warn_icon = QtWidgets.QLabel("⚠")
+        # A tooltip is the wrong place for the full NCBI policy: it gets clipped
+        # and cannot be read at leisure. Keep the hint to one line and put the
+        # detail behind a click.
+        self._ncbi_warn_icon = QtWidgets.QPushButton("⚠")
+        self._ncbi_warn_icon.setFlat(True)
+        self._ncbi_warn_icon.setFixedSize(26, 26)
+        self._ncbi_warn_icon.setCursor(QtCore.Qt.PointingHandCursor)
         self._ncbi_warn_icon.setStyleSheet(
-            "color: #B45309; font-size: 17px; padding: 0 2px;"
+            "QPushButton { color:#B45309; font-size:17px; border:none;"
+            " background:transparent; }"
+            "QPushButton:hover { color:#92400E; background:#FEF3C7;"
+            " border-radius:13px; }"
         )
         self._ncbi_warn_icon.setToolTip(
-            "<b>NCBI usage policy warning</b><br><br>"
-            "NCBI monitors and penalizes excessive use of its servers.<br>"
-            "Submitting too many requests in a short period may result in:<br>"
-            "• Temporary or permanent IP blocking<br>"
-            "• Suspension of your API key<br><br>"
-            "Keep batches ≤ 50 sequences and avoid running multiple<br>"
-            "simultaneous BLAST sessions or long sessions in NCBI."
-        )
-        self._ncbi_warn_icon.setCursor(QtCore.Qt.WhatsThisCursor)
+            "NCBI usage policy — click to read")
+        self._ncbi_warn_icon.clicked.connect(self._show_ncbi_policy)
         bl2.addWidget(self._ncbi_warn_icon)
         bl2.addStretch()
-        self._lbl_batch = QtWidgets.QLabel("Sequences per batch (max 50 recommended):")
+        self._lbl_batch = QtWidgets.QLabel("Sequences per BLAST search:")
         sg.addRow(self._lbl_batch, batch_row)
+
+        self._lbl_plan = QtWidgets.QLabel("")
+        self._lbl_plan.setWordWrap(True)
+        self._lbl_plan.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+        sg.addRow("", self._lbl_plan)
+
 
         self._tax_check = QtWidgets.QCheckBox("Fetch organism + taxonomic classification")
         self._tax_check.setChecked(True)
@@ -251,6 +354,11 @@ class BlastPanel(QtWidgets.QWidget):
         fl.addWidget(self._blast_btn)
         outer_layout.addWidget(footer)
 
+        # path -> ((mtime, size), [lengths]) so the plan refreshes only when
+        # a file actually changes on disk.
+        self._len_cache: dict = {}
+        self._on_batch_mode(self._batch_mode.currentIndex())
+
         self._last_outdir = ""
         self._last_tsv    = ""
 
@@ -274,6 +382,143 @@ class BlastPanel(QtWidgets.QWidget):
         """Cuando el panel se muestra por primera vez."""
         super().showEvent(event)
         self._adjust_log_height()
+
+    # ── Batch planning ───────────────────────────────────────────
+
+    def _seq_lengths(self):
+        """Lengths of every sequence currently loaded, cached per file."""
+        lengths = []
+        for f in self._drop.files:
+            try:
+                stamp = (os.path.getmtime(f), os.path.getsize(f))
+            except OSError:
+                stamp = None
+            hit = self._len_cache.get(f)
+            if not hit or hit[0] != stamp:
+                hit = (stamp, fasta_lengths(f))
+                self._len_cache[f] = hit
+            lengths.extend(hit[1])
+        return lengths
+
+    def _effective_nseq(self, lengths=None):
+        """Sequences per search actually used: computed, or the user's number."""
+        if self._batch_mode.currentIndex() == 0:      # Automatic
+            if lengths is None:
+                lengths = self._seq_lengths()
+            return auto_nseq(lengths)
+        return self._batch_spin.value()
+
+    def _on_batch_mode(self, index):
+        auto = index == 0
+        # In Automatic the number is the program's decision, so the box has
+        # nothing to offer: hide it and let the plan line below state the
+        # result. It keeps holding the computed value, which becomes the
+        # starting point if the user switches to Manual.
+        self._batch_spin.setVisible(not auto)
+        self._update_batch_plan()
+
+    def _update_batch_plan(self, *_):
+        """Show how the loaded sequences will be split, for the current mode."""
+        ctx = "BlastPanel"
+        lengths = self._seq_lengths()
+        auto = self._batch_mode.currentIndex() == 0
+
+        if not lengths:
+            self._lbl_plan.setText(_tr(ctx, "Add FASTA files to see the batch plan.")
+                                   if auto else "")
+            return
+
+        nseq = self._effective_nseq(lengths)
+        if auto:
+            # Reflect the decision in the spin without re-entering this slot.
+            self._batch_spin.blockSignals(True)
+            self._batch_spin.setValue(min(nseq, self._batch_spin.maximum()))
+            self._batch_spin.blockSignals(False)
+
+        sizes = plan_batch_sizes(lengths, nseq)
+        n = len(sizes)
+        total = sum(lengths)
+        word = _tr(ctx, "search") if n == 1 else _tr(ctx, "searches")
+        if n == 1:
+            plan = f"<b>1 {word}</b> of {sizes[0]:,} sequences"
+        else:
+            if len(set(sizes)) == 1:
+                shape = f"{sizes[0]:,} each"
+            else:
+                shape = (f"{sizes[0]:,} + {sizes[-1]:,}" if n == 2 else
+                         f"{sizes[0]:,} × {n - 1} + {sizes[-1]:,}")
+            plan = f"<b>{n} {word}</b> ({shape})"
+        msg = (f"{len(lengths):,} sequences · {total:,} bases → " + plan)
+
+        # Only the search count is worth a warning: it is what NCBI penalises.
+        if n > 100:
+            msg += ("<br>⚠ Over NCBI's limit of 100 searches per 24 h — "
+                    "your IP would be moved to a slower queue.")
+            colour = RED
+        elif not auto and n > len(plan_batch_sizes(lengths, auto_nseq(lengths))):
+            best = len(plan_batch_sizes(lengths, auto_nseq(lengths)))
+            msg += (f"<br>Automatic would use {best} instead. Fewer searches is "
+                    f"what protects your NCBI quota.")
+            colour = "#B45309"
+        else:
+            colour = TEXT_HINT
+        self._lbl_plan.setStyleSheet(f"color:{colour}; font-size:14px;")
+        self._lbl_plan.setText(msg)
+
+
+    # ── NCBI usage policy ───────────────────────────────────────
+
+    def _show_ncbi_policy(self):
+        """Explain, in full, how NCBI counts and penalises usage."""
+        ctx = "BlastPanel"
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(_tr(ctx, "NCBI usage policy"))
+        dlg.setMinimumWidth(560)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background-color: {GRAY_CARD}; }}
+            QLabel {{ color: {TEXT_PRI}; background-color: transparent;
+                      font-size: 15px; }}
+        """)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        lay.setContentsMargins(22, 20, 22, 18)
+        lay.setSpacing(14)
+
+        body = QtWidgets.QLabel(_tr(ctx,
+            "<b>Each batch is one BLAST search.</b> NCBI counts searches, not "
+            "sequences.<br><br>"
+            "Submitting more than <b>100 searches in 24 h</b> moves your traffic to "
+            "a slower queue and, in extreme cases, blocks it. The limit applies to "
+            "your <b>IP address</b>, so using a different API key does not lift "
+            "it.<br><br>"
+            "This means <b>larger batches are safer, not riskier.</b> NCBI's own "
+            "guidance is that several queries sent as one search run more "
+            "efficiently than one search each.<br><br>"
+            "The real ceiling is total length: <b>1,000,000 bases per search</b> "
+            "(blastn). A batch above that is split automatically.<br><br>"
+            "Avoid simultaneous BLAST sessions, and for large projects prefer "
+            "off-peak hours — weekends, or 21:00–05:00 US Eastern."
+        ))
+        body.setWordWrap(True)
+        body.setTextFormat(QtCore.Qt.RichText)
+        lay.addWidget(body)
+
+        link = QtWidgets.QLabel(
+            "<a href='https://blast.ncbi.nlm.nih.gov/doc/blast-help/developerinfo.html'"
+            f" style='color:#185FA5;'>{_tr(ctx, 'NCBI developer guidelines')}</a>")
+        link.setOpenExternalLinks(True)
+        lay.addWidget(link)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch()
+        ok = QtWidgets.QPushButton(_tr(ctx, "Close"))
+        ok.setObjectName("secondary_btn")
+        ok.setMinimumWidth(110)
+        ok.clicked.connect(dlg.accept)
+        btns.addWidget(ok)
+        lay.addLayout(btns)
+
+        dlg.exec_()
+
 
     # ── API key persistence ───────────────────────────────────────────────
 
@@ -329,7 +574,15 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_db.setText(_tr(ctx, "Database:"))
         self._lbl_prog.setText(_tr(ctx, "Program:"))
         self._lbl_hits.setText(_tr(ctx, "Hits per sequence (1–100):"))
-        self._lbl_batch.setText(_tr(ctx, "Sequences per batch (max 50 recommended):"))
+        self._lbl_batch.setText(_tr(ctx, "Sequences per BLAST search:"))
+        self._ncbi_warn_icon.setToolTip(_tr(ctx, "NCBI usage policy — click to read"))
+        _mode = self._batch_mode.currentIndex()
+        self._batch_mode.blockSignals(True)
+        self._batch_mode.setItemText(0, _tr(ctx, "Automatic"))
+        self._batch_mode.setItemText(1, _tr(ctx, "Manual"))
+        self._batch_mode.setCurrentIndex(_mode)
+        self._batch_mode.blockSignals(False)
+        self._update_batch_plan()
         self._lbl_tax.setText(_tr(ctx, "Taxonomy lookup:"))
         self._tax_check.setText(_tr(ctx, "Fetch organism + taxonomy"))
         self._clear_btn.setText(_tr(ctx, "Clear"))
@@ -359,6 +612,7 @@ class BlastPanel(QtWidgets.QWidget):
                 f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
                 f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
             )
+        self._update_batch_plan()
 
     def _emit_blast(self):
         cfg = {
@@ -366,7 +620,7 @@ class BlastPanel(QtWidgets.QWidget):
             "database":       self._DATABASES[self._db_combo.currentIndex()],
             "program":        self._PROGRAMS[self._prog_combo.currentIndex()],
             "nhits":          self._hits_spin.value(),
-            "nseq":           self._batch_spin.value(),
+            "nseq":           self._effective_nseq(),
             "fetch_taxonomy": self._tax_check.isChecked(),
         }
         self.blastRequested.emit(list(self._drop.files), cfg)
@@ -514,11 +768,26 @@ class _BlastWorker(QtCore.QThread):
 
     _NCBI_BASE    = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
     _BLAST_URL    = "https://blast.ncbi.nlm.nih.gov/blast/Blast.cgi"
-    _MAX_RETRY    = 50
-    _POLL_SLEEP   = 5    # seconds between BLAST status polls
+    # NCBI asks every client to identify itself; unidentified traffic is the
+    # first to be throttled when their servers are busy.
+    _NCBI_TOOL    = "ONTbarcoder3"
+    _USER_AGENT   = "ONTbarcoder3 (NCBI E-utilities client)"
+    _MAX_RETRY    = 50   # HTTP-level retries inside _http_get / _http_post
+    # A BLAST job is not a request that "fails after N retries": it is a queued
+    # search that takes as long as it takes. A batch of 50 sequences against
+    # core_nt routinely needs 10-40 min on the public queue, so the wait is a
+    # time budget, not a poll count. Polling itself follows the NCBI URL API
+    # policy: never more often than every 10 s for a single RID.
+    _POLL_BUDGET  = 2700  # max seconds to wait for one RID before giving up
+    _POLL_MIN     = 10    # polling interval while the job still looks quick
+    _POLL_MAX     = 60    # interval cap once the job is clearly a long one
+    _POLL_FAST_S  = 180   # keep the short interval for this long before backing off
     _SOCK_TIMEOUT = 15   # max seconds blocked in a single urlopen call
     _TAX_RETRIES  = 2    # extra retry rounds for "Not_found_in_Taxonomy" results
     _NCBI_RATE    = 9.0  # max HTTP requests/second (NCBI allows 10 with API key)
+    # NCBI rejects a blastn query longer than 1,000,000 bases. Cap a batch a
+    # little below that so headers and encoding overhead cannot push it over.
+    _MAX_QUERY_BASES = MAX_QUERY_BASES
     _BATCH_UNITS  = 1000 # progress units per batch (phases: wait 0-400, org 400-600, tax 600-800, rows 800-1000)
 
     def __init__(self, files: List[str], cfg: dict, parent=None):
@@ -571,8 +840,25 @@ class _BlastWorker(QtCore.QThread):
 
     # ── HTTP helpers ──────────────────────────────────────────────────────
 
+    def _eutils_params(self, url: str, params: dict) -> dict:
+        """Add the API key and tool name to every E-utilities request.
+
+        Without the key NCBI allows 3 requests/second, not the 10 the rate
+        limiter here assumes, and answers the excess with HTTP 429 — so a call
+        that forgets it fails in a way no amount of retrying can fix.
+        """
+        if "eutils.ncbi" not in url:
+            return params or {}
+        out = dict(params or {})
+        out.setdefault("tool", self._NCBI_TOOL)
+        key = (self.cfg.get("api_key") or "").strip()
+        if key:
+            out.setdefault("api_key", key)
+        return out
+
     def _http_get(self, url, params=None, timeout=60):
         import urllib.request, urllib.parse, urllib.error
+        params = self._eutils_params(url, params)
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
         for attempt in range(self._MAX_RETRY):
@@ -582,7 +868,8 @@ class _BlastWorker(QtCore.QThread):
             if self._stop:
                 return ""
             try:
-                req = urllib.request.Request(url)
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": self._USER_AGENT})
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     if resp.status == 200:
                         text = resp.read().decode("utf-8", errors="replace")
@@ -613,6 +900,8 @@ class _BlastWorker(QtCore.QThread):
 
     def _http_post(self, url, data: str, timeout=120):
         import urllib.request, urllib.error
+        if "eutils.ncbi" in url and "tool=" not in data:
+            data = f"{data}&tool={self._NCBI_TOOL}"
         for attempt in range(self._MAX_RETRY):
             if self._stop:
                 return ""
@@ -623,7 +912,8 @@ class _BlastWorker(QtCore.QThread):
                 req = urllib.request.Request(
                     url,
                     data=data.encode("utf-8"),
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    headers={"Content-Type": "application/x-www-form-urlencoded",
+                             "User-Agent": self._USER_AGENT},
                     method="POST"
                 )
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -700,6 +990,12 @@ class _BlastWorker(QtCore.QThread):
         """Return (batches, batch_pairs_list).
         batches[i]       – FASTA text string for batch i
         batch_pairs_list[i] – list of (header, seq) tuples for batch i
+
+        A batch is capped both by `nseq` and by _MAX_QUERY_BASES: NCBI rejects
+        a blastn query longer than 1,000,000 bases, and that length — not a
+        sequence count — is its real per-search limit. A single sequence above
+        the cap is still sent on its own: letting NCBI reject it is better than
+        dropping it silently.
         """
         # `fasta_text` comes from _to_single_line_fasta(): each header is followed by
         # exactly one sequence line (possibly empty). Do NOT drop blank lines here —
@@ -718,9 +1014,13 @@ class _BlastWorker(QtCore.QThread):
                 i += 1
         batches = []
         batch_pairs_list = []
-        for start in range(0, len(pairs), nseq):
-            chunk = pairs[start:start + nseq]
-            batches.append("\n".join(h + "\n" + s for h, s in chunk))
+        sizes = plan_batch_sizes([len(s) for _, s in pairs], nseq,
+                                 self._MAX_QUERY_BASES)
+        pos = 0
+        for size in sizes:
+            chunk = pairs[pos:pos + size]
+            pos += size
+            batches.append("\n".join(a + "\n" + b for a, b in chunk))
             batch_pairs_list.append(chunk)
         return batches, batch_pairs_list
 
@@ -753,46 +1053,60 @@ class _BlastWorker(QtCore.QThread):
         return rid, rtoe
 
     def _blast_poll(self, rid, batch_label=""):
+        """Wait for one RID, up to _POLL_BUDGET seconds.
+
+        The interval grows from _POLL_MIN to _POLL_MAX: a short job is picked up
+        quickly, a long one is not polled needlessly. Returns True only when the
+        search is READY.
+        """
         url = f"{self._BLAST_URL}?CMD=Get&RID={rid}"
-        attempts = 0
-        t0 = time.monotonic()
+        polls    = 0
+        interval = self._POLL_MIN
+        t0       = time.monotonic()
+        deadline = t0 + self._POLL_BUDGET
         prefix = f"BLAST       │ [{batch_label}] " if batch_label else "BLAST       │ "
-        while not self._stop and attempts < self._MAX_RETRY:
+
+        def _progress(state=""):
+            elapsed = int(time.monotonic() - t0)
+            self.statusUpdated.emit(
+                "blast",
+                f"{prefix}Waiting for RID {rid}{state}… "
+                f"({elapsed // 60}m {elapsed % 60:02d}s of "
+                f"{self._POLL_BUDGET // 60}m max · poll {polls})"
+            )
+
+        while not self._stop and time.monotonic() < deadline:
             resp = self._http_get(url)
+            polls += 1
             if self._stop:
                 return False
-            if "Status=WAITING" in resp:
-                elapsed = int(time.monotonic() - t0)
-                self.statusUpdated.emit(
-                    "blast",
-                    f"{prefix}Polling for results… "
-                    f"(attempt {attempts + 1}/{self._MAX_RETRY} · {elapsed}s elapsed)"
-                )
-                self._interruptible_sleep(self._POLL_SLEEP)
-                attempts += 1
-                continue
+            if "Status=READY" in resp:
+                return True
             if "Status=FAILED" in resp:
                 self.statusUpdated.emit("blast", f"{prefix}Search failed for RID {rid}.")
                 return False
             if "Status=UNKNOWN" in resp:
                 self.statusUpdated.emit("blast", f"{prefix}Search expired for RID {rid}.")
                 return False
-            if "Status=READY" in resp:
-                return True
-            # Empty or unrecognised response — count as a transient failure
-            elapsed = int(time.monotonic() - t0)
-            self.statusUpdated.emit(
-                "blast",
-                f"{prefix}Polling for results… "
-                f"(attempt {attempts + 1}/{self._MAX_RETRY} · {elapsed}s elapsed)"
-            )
-            attempts += 1
-            self._interruptible_sleep(self._POLL_SLEEP)
+            # WAITING, or an empty/unrecognised reply: both mean "not yet".
+            _progress("" if "Status=WAITING" in resp else " (no status in reply)")
+            self._interruptible_sleep(interval)
+            # A healthy NCBI queue answers a 50-sequence batch in well under a
+            # minute, so hold the short interval for the first _POLL_FAST_S:
+            # that keeps normal runs as responsive as they have always been.
+            # Only once the job is clearly long does the interval grow, so a
+            # 45 min wait costs ~50 polls instead of ~270.
+            if time.monotonic() - t0 > self._POLL_FAST_S:
+                interval = min(interval + 5, self._POLL_MAX)
+
         if not self._stop:
             elapsed = int(time.monotonic() - t0)
             self.statusUpdated.emit(
                 "blast",
-                f"{prefix}No response after {attempts} polls ({elapsed}s)."
+                f"{prefix}Gave up after {elapsed // 60}m {elapsed % 60:02d}s "
+                f"({polls} polls). The search may still be running at NCBI — "
+                f"open blast.ncbi.nlm.nih.gov and enter RID {rid}, or retry this "
+                f"batch with fewer sequences per BLAST."
             )
         return False
 
@@ -1361,6 +1675,9 @@ class _BlastWorker(QtCore.QThread):
         batches, batch_pairs_list = self._split_batches(fasta, nseq)
         n_batches = len(batches)
         completed_batches: set = set()   # indices of batches fully written to TSV
+        # Query_name values with at least one hit written to the TSV. Sequences
+        # of a completed batch that are absent here got no match from BLAST.
+        hit_queries: set = set()
 
         # ── Summary line (fixed slot "info") ──
         self.statusUpdated.emit(
@@ -1592,6 +1909,12 @@ class _BlastWorker(QtCore.QThread):
             if _batch_written:
                 completed_batches.add(batch_idx)
                 total_hits_done += len(batch_rows_out)
+                # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
+                # which is the FASTA header of the query without the leading '>'.
+                for _r in batch_rows_out:
+                    _fields = _r.split("\t")
+                    if len(_fields) > 1:
+                        hit_queries.add(_fields[1])
 
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
         missing_pairs = []
@@ -1613,19 +1936,49 @@ class _BlastWorker(QtCore.QThread):
             except Exception as exc:
                 miss_msg = f"Could not write missing FASTA: {exc}"
 
+        # ── Build no-hit FASTA (queried, but BLAST returned no match) ──
+        # Only batches whose rows reached the TSV are inspected: sequences of a
+        # failed or unprocessed batch were never really queried and are already
+        # reported in the missing FASTA above.
+        nohit_pairs = []
+        for bi in sorted(completed_batches):
+            for h, sq in batch_pairs_list[bi]:
+                if h[1:] not in hit_queries:
+                    nohit_pairs.append((h, sq))
+
+        nohit_msg  = ""
+        nohit_path = ""
+        if nohit_pairs:
+            nohit_path = os.path.join(output_dir, f"nohit_seqs_{mydate}.fa")
+            try:
+                with open(nohit_path, "w", encoding="utf-8") as fh:
+                    for h, sq in nohit_pairs:
+                        fh.write(h + "\n" + sq + "\n")
+                nohit_msg = (
+                    f"{len(nohit_pairs)} seqs without BLAST match → "
+                    f"{os.path.basename(nohit_path)}"
+                )
+            except Exception as exc:
+                nohit_path = ""
+                nohit_msg  = f"Could not write no-hit FASTA: {exc}"
+
         # ── Convert TSV → XLSX ──
         xlsx_path = ""
         if not self._stop and total_hits_done > 0:
             xlsx_path = self._tsv_to_xlsx(tsv_path)
 
+        extra_msgs = [m for m in (miss_msg, nohit_msg) if m]
         if self._stop:
-            result_msg = f"Stopped     │ {miss_msg}" if miss_msg else "Stopped by user."
+            result_msg = (
+                "Stopped     │ " + "  │  ".join(extra_msgs)
+                if extra_msgs else "Stopped by user."
+            )
         else:
             out_name = os.path.basename(xlsx_path if xlsx_path else tsv_path)
-            if miss_msg:
-                result_msg = f"Done  ✓     │ {total_hits_done} hits written  │ {miss_msg}"
-            else:
-                result_msg = f"Done  ✓     │ {total_hits_done} hits written → {out_name}"
+            head = f"{total_hits_done} hits written"
+            if not extra_msgs:
+                head += f" → {out_name}"
+            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs)
         self.statusUpdated.emit("result", result_msg)
 
         # ── Write run log ──────────────────────────────────────────────────
@@ -1671,6 +2024,8 @@ class _BlastWorker(QtCore.QThread):
             f"  Sequences found   : {seq_count}",
             f"  Batches           : {batches_ok}/{n_batches} completed",
             f"  Hits written      : {total_hits_done}",
+            f"  Seqs with hits    : {len(hit_queries)}",
+            f"  Seqs with no hits : {len(nohit_pairs)}",
             f"  Output folder     : {output_dir}",
             f"  TSV file          : {os.path.basename(tsv_path)}",
             f"  XLSX file         : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
@@ -1679,6 +2034,12 @@ class _BlastWorker(QtCore.QThread):
         ]
         if miss_msg:
             log_lines.append(f"  Missing seqs      : {miss_msg}")
+        if nohit_msg:
+            log_lines.append(f"  No-hit seqs       : {nohit_msg}")
+        if nohit_pairs:
+            log_lines += ["", "Sequences with no BLAST hit:"]
+            for h, _sq in nohit_pairs:
+                log_lines.append(f"  {h[1:]}")
         log_lines += [
             "",
             "NOTE: Do not delete the .dbx cache files (accdb.dbx, taxadb.dbx).",

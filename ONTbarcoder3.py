@@ -226,6 +226,9 @@ from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.fastq_inspector import FastqInspectorPanel
 from _utilities.fasta_tools import FastaToolsPanel
 from _utilities.notes_panel import NotesPanel
+from _utilities.batch_sweep_panel import BatchSweepPanel
+from _utilities.batch_sweep import (parse_sweep_config, expand_grid, apply_overrides,
+                                     validate_sweep, combo_label, dedup_consensus_filtered)
 # ── i18n ──────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import xml.etree.ElementTree as _ET
@@ -752,11 +755,12 @@ class SidebarWidget(QtWidgets.QWidget):
     panelRequested = QtCore.pyqtSignal(str)
 
     ITEMS = [
-        ("setup",      "Input files"),
-        ("params",     "Parameters"),
-        ("progress",   "Analysis"),
-        ("live_chart", "📈 RT Charts"),
-        ("results",    "Results"),
+        ("setup",       "Input files"),
+        ("params",      "Parameters"),
+        ("batch_sweep", "Parameter Batch"),
+        ("progress",    "Analysis"),
+        ("live_chart",  "📈 RT Charts"),
+        ("results",     "Results"),
     ]
     TOOLS = [
         ("compare",         "FASTA Compare"),
@@ -766,6 +770,11 @@ class SidebarWidget(QtWidgets.QWidget):
         ("best_seq",        "Best Sequence"),
         ("notes",           "NOTES 📝"),
     ]
+
+    # Sidebar items shown in italics to signal they sit outside the linear
+    # Workflow even though they live in that section (e.g. Parameter Batch:
+    # optional, self-contained, not a required step to reach Results).
+    _ITALIC_ITEMS = {"batch_sweep"}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -791,6 +800,10 @@ class SidebarWidget(QtWidgets.QWidget):
 
         for key, label in self.ITEMS:
             btn = self._make_item(key, label)
+            if key in self._ITALIC_ITEMS:
+                f = btn.font()
+                f.setItalic(True)
+                btn.setFont(f)
             layout.addWidget(btn)
             self._buttons[key] = btn
 
@@ -931,7 +944,7 @@ class AboutDialog(QtWidgets.QDialog):
 
         layout.addSpacing(4)
 
-        ver_lbl = make_label("Version 3.3b", size=16, color=TEXT_SEC)
+        ver_lbl = make_label("Version 3.4b", size=16, color=TEXT_SEC)
         ver_lbl.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(ver_lbl)
 
@@ -1063,7 +1076,7 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
-        badge = QtWidgets.QLabel("v3.3b")
+        badge = QtWidgets.QLabel("v3.4b")
         badge.setObjectName("topbar_badge")
 
         layout.addWidget(logo)
@@ -3513,6 +3526,11 @@ class StatCard(QtWidgets.QFrame):
 class ProgressPanel(QtWidgets.QWidget):
     stopRequested = QtCore.pyqtSignal()
     finalizeRequested = QtCore.pyqtSignal()
+    # Rough 0-100 progress of the CURRENT run (equal weight per active phase:
+    # finished phases count fully, the running phase counts by its own %).
+    # Used by Parameter Batch to show per-iteration progress, not just how
+    # many combinations have completed.
+    overallProgressChanged = QtCore.pyqtSignal(int)
 
     PHASES = [
         ("1", "Phase 1 · Demultiplexing"),
@@ -3659,6 +3677,12 @@ class ProgressPanel(QtWidgets.QWidget):
 
         # ── Phase rows ──
         self._phase_rows = {}
+        # Which phases count towards _compute_overall_percent() for the
+        # current run. Tracked separately from PhaseRow.isVisible(): that
+        # reflects on-screen visibility, which is always False while this
+        # panel isn't the active QStackedWidget page (e.g. during a
+        # Parameter Batch run, where Progress is never switched to).
+        self._active_phase_ids = {pid for pid, _ in self.PHASES}
         for pid, pname in self.PHASES:
             row = PhaseRow(pid, pname)
             self._layout.addWidget(row)
@@ -3788,11 +3812,13 @@ class ProgressPanel(QtWidgets.QWidget):
             row.set_state("pending")
             row.set_progress(0, 0)
             row.setVisible(True)   # all visible until configured_phases filters them out
+        self._active_phase_ids = {pid for pid, _ in self.PHASES}
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
         for card in (self.stat_total, self.stat_dem, self.stat_ok):
             card.update_value("—")
+        self.overallProgressChanged.emit(0)
 
     def reset_soft(self):
         """Clear log, phases and stats without touching the current timer.
@@ -3813,6 +3839,7 @@ class ProgressPanel(QtWidgets.QWidget):
             row.set_state("pending")
             row.set_progress(0, 0)
             row.setVisible(True)
+        self._active_phase_ids = {pid for pid, _ in self.PHASES}
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
@@ -3830,6 +3857,10 @@ class ProgressPanel(QtWidgets.QWidget):
         for pid, visible in mapping.items():
             if pid in self._phase_rows:
                 self._phase_rows[pid].setVisible(visible)
+                if visible:
+                    self._active_phase_ids.add(pid)
+                else:
+                    self._active_phase_ids.discard(pid)
 
     def configure_for_live(self, non_coi: bool = False):
         self._cycle_timer_card.setVisible(True)
@@ -3848,6 +3879,10 @@ class ProgressPanel(QtWidgets.QWidget):
         for pid in ("2b", "3"):
             if pid in self._phase_rows:
                 self._phase_rows[pid].setVisible(not non_coi)
+                if non_coi:
+                    self._active_phase_ids.discard(pid)
+                else:
+                    self._active_phase_ids.add(pid)
         self._finalize_btn.setVisible(True)
 
     def configure_for_conventional(self, non_coi: bool = False):
@@ -3902,14 +3937,37 @@ class ProgressPanel(QtWidgets.QWidget):
                 if self._phase_rows[pid].property("state") not in ("done", "current"):
                     self._phase_rows[pid].set_state("pending")
         self._phase_lbl.setText(f"Phase {phase_id} · {detail}" if detail else f"Phase {phase_id}")
+        self.overallProgressChanged.emit(self._compute_overall_percent())
 
     def update_phase_progress(self, phase_id, value, total, extra=""):
         if phase_id in self._phase_rows:
             self._phase_rows[phase_id].set_progress(value, total, extra)
+            self.overallProgressChanged.emit(self._compute_overall_percent())
+
+    def _compute_overall_percent(self) -> int:
+        """Rough progress (0-100) of the run in progress: equal weight per
+        active phase for this run — a finished phase counts fully, the
+        running one counts by its own bar %, pending phases count as 0.
+        Uses _active_phase_ids rather than PhaseRow.isVisible(), since the
+        latter is always False while this panel isn't the current
+        QStackedWidget page (e.g. during a Parameter Batch run)."""
+        order = [pid for pid, _ in self.PHASES if pid in self._active_phase_ids]
+        if not order:
+            return 0
+        total_frac = 0.0
+        for pid in order:
+            row = self._phase_rows[pid]
+            state = row.property("state")
+            if state == "done":
+                total_frac += 1.0
+            elif state == "current":
+                total_frac += row._bar.value() / 100.0
+        return max(0, min(100, int(total_frac / len(order) * 100)))
 
     def mark_phase_done(self, phase_id, detail=""):
         if phase_id in self._phase_rows:
             self._phase_rows[phase_id].set_state("done", detail)
+            self.overallProgressChanged.emit(self._compute_overall_percent())
 
     def get_ok_value(self) -> int:
         try:
@@ -4995,6 +5053,11 @@ def _phase_callback(method):
 
 class MainWindow(QtWidgets.QMainWindow):
 
+    # Fired at the very end of _finish_analysis(), once per completed
+    # conventional run (or finalized RT run). Used by the batch-sweep
+    # orchestration to know when it is safe to start the next combination.
+    analysisFinished = QtCore.pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ONTbarcoder")
@@ -5020,6 +5083,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_params = {}
         self._run_start = None
         self._analysis_active = False
+
+        # Parameter-sweep (batch) state — see _start_batch_sweep().
+        self._batch_running = False
+        self._batch_stop_requested = False
+        self._batch_queue = []
+        self._batch_index = 0
+        self._batch_base_params = {}
+        self._batch_run_folders = []
+        self._batch_outdir = ""
 
         # Variables for analysis
         self.worker_prep = None
@@ -5123,6 +5195,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_fastq_inspector = FastqInspectorPanel()
         self._panel_fasta_tools     = FastaToolsPanel()
         self._panel_notes           = NotesPanel()
+        self._panel_batch_sweep     = BatchSweepPanel()
 
         # SetupPanel manages its own footer internally (outer layout)
         # ParamsPanel uses BasePanel (QScrollArea), that's why it needs external wrap
@@ -5147,6 +5220,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_blast, self._panel_best_seq,
             self._panel_fastq_inspector,
             self._panel_fasta_tools, self._panel_notes,
+            self._panel_batch_sweep,
         ):
             self._stack.addWidget(panel)
 
@@ -5154,7 +5228,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "setup": 0, "params": 1, "progress": 2,
             "live_chart": 3, "results": 4, "compare": 5,
             "blast": 6, "best_seq": 7, "fastq_inspector": 8,
-            "fasta_tools": 9, "notes": 10,
+            "fasta_tools": 9, "notes": 10, "batch_sweep": 11,
         }
 
     def _connect_signals(self):
@@ -5166,13 +5240,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
         self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
+        self._panel_batch_sweep.sweepRequested.connect(self._start_batch_sweep)
+        self._panel_batch_sweep.stopRequested.connect(self._stop_batch_sweep)
         self._panel_results.resetRequested.connect(self._on_reset_analysis)
         self._topbar.languageChanged.connect(self._on_language_changed)
         self._topbar.aboutRequested.connect(self._show_about)
         self._topbar.uiScaleChanged.connect(self._on_ui_scale_changed)
 
         # Lock panels until user configures input files
-        for key in ("params", "progress", "results"):
+        for key in ("params", "batch_sweep", "progress", "results"):
             self._sidebar.lock_item(key)
 
     def _on_ui_scale_changed(self, value):
@@ -5361,7 +5437,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"QPushButton:hover {{ background-color: #0C4A82; }}"
             )
         # Unlock all panels upon completion of file setup
-        for key in ("params", "progress", "results"):
+        for key in ("params", "batch_sweep", "progress", "results"):
             self._sidebar.unlock_item(key)
         self._runmode = runmode
         self._fastq = fastq
@@ -5617,7 +5693,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._panel_progress.reset()
         self._sidebar.mark_done("params")
-        self._switch_panel("progress")
+        if not self._batch_running:
+            self._switch_panel("progress")
 
         mode_str = "Real-Time" if self._is_live() else "Conventional"
         self._panel_progress.append_log(f"Mode: {mode_str}", "info")
@@ -5748,6 +5825,246 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sidebar.hide_item("live_chart")
             self._panel_progress.configure_for_conventional(non_coi=params.get("non_coi", False))
             self._run_conventional_pipeline(params, outpath, logfile)
+
+    # ── Parameter sweep (batch mode) ────────────────────────────────────────
+    # Drives the SAME orchestration as a normal single run (_run_full_pipeline),
+    # once per combination of the sweep grid, waiting for analysisFinished
+    # between combinations. No new QThread: the work already happens in the
+    # pipeline's own QThread workers, dispatched through the existing Qt event
+    # loop.
+
+    def _start_batch_sweep(self, cfg_path: str):
+        if self._analysis_active or self._batch_running:
+            self._panel_batch_sweep.on_error(
+                "An analysis is already running. Wait for it to finish before "
+                "starting a parameter sweep.")
+            return
+        if not self._fastq or not self._demfile:
+            self._panel_batch_sweep.on_error(
+                "Load a dataset first (Input files panel) before starting a sweep.")
+            return
+        if self._is_live():
+            self._panel_batch_sweep.on_error(
+                "Parameter Batch only supports Conventional mode, not Real-Time.")
+            return
+
+        try:
+            sweep = parse_sweep_config(cfg_path)
+            validate_sweep(sweep)
+            combos = expand_grid(sweep)
+        except Exception as e:
+            self._panel_batch_sweep.on_error(str(e))
+            return
+
+        base_params = self._panel_params.get_params()
+
+        if not base_params.get("non_coi", False):
+            gc = self._scan_demfile_gencodes()
+            if gc["invalid"]:
+                self._panel_batch_sweep.on_error(
+                    "The CSV assigns invalid NCBI genetic code table(s). Fix the "
+                    "last column of the CSV before running a sweep.")
+                return
+            if gc["has_any"] and gc["missing"]:
+                self._panel_batch_sweep.on_error(
+                    "Some samples in the CSV are missing a per-sample genetic "
+                    "code. Add it to every row, or remove it from all rows, "
+                    "before running a sweep.")
+                return
+
+        # Sweeping the intra-sample variant knobs with detection switched off
+        # would make every combination identical, so it is turned on for the
+        # whole batch. An explicit resolve_mixed.enabled in the .cfg still
+        # wins: apply_overrides() runs on top of this baseline.
+        _forced_resolve = (any(k.startswith("resolve_mixed.") for k in sweep)
+                           and not base_params.get("resolve_mixed", {}).get("enabled"))
+        if any(k.startswith("resolve_mixed.") for k in sweep):
+            base_params.setdefault("resolve_mixed", {})["enabled"] = True
+
+        if len(combos) > 200:
+            reply = QtWidgets.QMessageBox.question(
+                self, "Parameter Batch",
+                f"This sweep will run {len(combos)} analyses sequentially, one "
+                f"after another. This can take a very long time. Continue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        program_dir = _get_base_dir()
+        self._batch_outdir = os.path.join(program_dir, "output", f"ont-barcoder_{ts}_batch")
+        os.makedirs(self._batch_outdir, exist_ok=True)
+        try:
+            with open(os.path.join(self._batch_outdir, "sweep_config.log"),
+                      "w", encoding="utf-8") as fh:
+                fh.write(f"Parameter sweep started {datetime.datetime.now()}\n")
+                fh.write(f"Config file: {cfg_path}\n")
+                fh.write(f"Combinations: {len(combos)}\n\n")
+                for key, values in sweep.items():
+                    fh.write(f"  {key} = {', '.join(values)}\n")
+        except OSError:
+            pass
+
+        self._batch_base_params = base_params
+        self._batch_queue = combos
+        self._batch_index = 0
+        self._batch_run_folders = []
+        self._batch_stop_requested = False
+        self._batch_running = True
+
+        self.analysisFinished.connect(self._on_batch_combo_finished)
+        self._panel_progress.overallProgressChanged.connect(self._on_batch_run_progress)
+        self._panel_batch_sweep.set_running(True)
+        self._panel_batch_sweep.append_log(
+            f"Starting sweep: {len(combos)} combination(s) -> {self._batch_outdir}")
+        if _forced_resolve:
+            self._panel_batch_sweep.append_log(
+                "  Note: 'Detect intra-sample sequence variants' was turned ON "
+                "for this batch (the .cfg sweeps resolve_mixed.* keys), even "
+                "though it is unchecked in the Parameters panel.")
+        self._run_next_batch_combo()
+
+    def _run_next_batch_combo(self):
+        if self._batch_stop_requested or self._batch_index >= len(self._batch_queue):
+            self._finish_batch_sweep()
+            return
+
+        combo = self._batch_queue[self._batch_index]
+        try:
+            params = apply_overrides(self._batch_base_params, combo)
+        except Exception as e:
+            self._panel_batch_sweep.append_log(f"  Skipping combination (invalid): {e}")
+            self._batch_index += 1
+            self._run_next_batch_combo()
+            return
+
+        # Same invariants ParamsPanel.get_params() enforces: in Non-Coding mode
+        # translation validation is off (gencode 0) and phases 2b/3 do not
+        # exist. A .cfg that re-enables them would run a phase whose output
+        # folder is never created below.
+        if params.get("non_coi"):
+            params["gencode"] = 0
+            params["run_phase2b"] = False
+            params["run_phase3"] = False
+
+        n_threads = _ont_mp.optimal_worker_count(params.get('n_threads', 4))
+        params['n_threads'] = n_threads
+        _ont_mp.set_threads(n_threads)
+
+        program_dir = _get_base_dir()
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"ont-barcoder_{ts}_conv"
+        outpath = os.path.join(program_dir, "output", folder_name)
+        suffix = 2
+        while os.path.exists(outpath):
+            folder_name = f"ont-barcoder_{ts}_conv_{suffix}"
+            outpath = os.path.join(program_dir, "output", folder_name)
+            suffix += 1
+        os.makedirs(outpath, exist_ok=True)
+
+        # Same subfolder layout as a normal (non-RT) run — see _start_analysis.
+        non_coi = params.get("non_coi", False)
+        os.makedirs(os.path.join(outpath, "barcodesets"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "barcodesets", "consensus_by_length"), exist_ok=True)
+        if not non_coi:
+            os.makedirs(os.path.join(outpath, "barcodesets", "consensus_by_similarity"), exist_ok=True)
+            os.makedirs(os.path.join(outpath, "barcodesets", "fixing"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "barcodesets", "temps"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "demultiplexingfiles"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "demultiplexed"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "2a_ConsensusByLength"), exist_ok=True)
+        os.makedirs(os.path.join(outpath, "1_demultiplexing"), exist_ok=True)
+        if not non_coi:
+            os.makedirs(os.path.join(outpath, "2b_ConsensusBySimilarity"), exist_ok=True)
+            os.makedirs(os.path.join(outpath, "3_ConsensusByBarcodeComparison"), exist_ok=True)
+        else:
+            os.makedirs(os.path.join(outpath, "Main_barcode_results"), exist_ok=True)
+
+        self._params = params
+        self._outpath = outpath
+        self._stopped = False
+        self._analysis_active = True
+        self._run_start = time.time()
+        self._batch_run_folders.append((outpath, folder_name[len("ont-barcoder_"):]))
+
+        self._panel_progress.reset()
+        n = len(self._batch_queue)
+        self._panel_batch_sweep.set_progress(self._batch_index, n)
+        self._panel_batch_sweep.append_log(
+            f"[{self._batch_index + 1}/{n}] {combo_label(combo)} -> {folder_name}")
+
+        self._run_full_pipeline()
+
+    def _on_batch_run_progress(self, pct: int):
+        if not self._batch_running:
+            return
+        self._panel_batch_sweep.set_run_progress(pct)
+
+    def _on_batch_combo_finished(self):
+        if not self._batch_running:
+            return
+        filt = os.path.join(self._outpath, "consensus_filtered.fa")
+        n_filt = 0
+        if os.path.isfile(filt):
+            try:
+                with open(filt, encoding="utf-8", errors="replace") as fh:
+                    n_filt = sum(1 for line in fh if line.startswith(">"))
+            except OSError:
+                pass
+        self._panel_batch_sweep.append_log(
+            f"    done — consensus_filtered.fa: {n_filt} barcode(s)")
+        self._batch_index += 1
+        self._run_next_batch_combo()
+
+    def _stop_batch_sweep(self):
+        if not self._batch_running:
+            return
+        self._batch_stop_requested = True
+        self._panel_batch_sweep.append_log(
+            "Stop requested — finishing the current combination, then stopping.")
+
+    def _abort_batch_sweep(self, reason: str):
+        """End a batch interrupted from OUTSIDE the Parameter Batch panel
+        (Analysis Stop, Reset, app close). Those paths kill the running
+        combination without ever emitting analysisFinished, so the queue would
+        wait on it forever and _batch_running would stay set — blocking any
+        later batch and, worse, letting a future single run's analysisFinished
+        resume this dead queue. Unlike _stop_batch_sweep (which lets the
+        current combination finish), this ends the batch right away, still
+        deduplicating whatever combinations did complete."""
+        if not self._batch_running:
+            return
+        self._batch_stop_requested = True
+        self._panel_batch_sweep.append_log(f"  {reason}")
+        self._finish_batch_sweep()
+
+    def _finish_batch_sweep(self):
+        try:
+            self.analysisFinished.disconnect(self._on_batch_combo_finished)
+        except TypeError:
+            pass
+        try:
+            self._panel_progress.overallProgressChanged.disconnect(self._on_batch_run_progress)
+        except TypeError:
+            pass
+        self._batch_running = False
+        self._panel_batch_sweep.set_progress(
+            self._batch_index, len(self._batch_queue), finished=True)
+
+        n_runs = len(self._batch_run_folders)
+        summary = {"outdir": self._batch_outdir, "n_runs": n_runs}
+        if n_runs:
+            out_fasta = os.path.join(self._batch_outdir, "unique_consensus_filtered.fasta")
+            out_report = os.path.join(self._batch_outdir, "batch_dedup_report.tsv")
+            try:
+                stats = dedup_consensus_filtered(self._batch_run_folders, out_fasta, out_report)
+                summary.update(stats)
+            except Exception as e:
+                self._panel_batch_sweep.append_log(f"  Warning: deduplication failed: {e}")
+
+        self._panel_batch_sweep.on_finished(summary)
 
     # ── Conventional pipeline ──────────────────────── ────────────────────────
     def _run_conventional_pipeline(self, params, outpath, logfile):
@@ -8827,7 +9144,7 @@ class MainWindow(QtWidgets.QMainWindow):
 </nav>
 
 <header class="hero">
-  <div class="hero-eyebrow">ONTbarcoder v3.3b · Analysis report</div>
+  <div class="hero-eyebrow">ONTbarcoder v3.4b · Analysis report</div>
   <h1>Run <span>{run_name}</span></h1>
   <div class="hero-meta">
     <span>📅 <strong>{ts_now}</strong></span>
@@ -8932,7 +9249,7 @@ class MainWindow(QtWidgets.QMainWindow):
         {samples_section}
 
 <footer>
-  <span>ONTbarcoder v3.3b — generated {ts_now}</span>
+  <span>ONTbarcoder v3.4b — generated {ts_now}</span>
   <span>{outpath}</span>
 </footer>
 
@@ -9615,8 +9932,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress._stop_btn.setEnabled(False)
         self._analysis_active = False
         self._panel_results.populate(self._outpath, summary)
-        self._switch_panel("results")
+        if not self._batch_running:
+            self._switch_panel("results")
         self._sidebar.mark_done("results")
+        self.analysisFinished.emit()
 
     # ══════════════════════════════════════════════════════════════════════════
     # END REAL TIME MODE
@@ -10294,6 +10613,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blast_worker = None
 
     def _on_reset_analysis(self):
+        # Before wiping state: a batch in progress must be closed out, or its
+        # queue stays armed and a later single run would resume it.
+        self._abort_batch_sweep(
+            "Analysis was reset — finishing the batch with the combinations "
+            "completed so far.")
+
         self._runmode = "1"
         self._fastq = ""
         self._demfile = ""
@@ -10397,7 +10722,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sidebar.hide_item("live_chart")
 
         # Re-lock panels until new file configuration
-        for key in ("params", "progress", "results"):
+        for key in ("params", "batch_sweep", "progress", "results"):
             self._sidebar.lock_item(key)
 
         self._switch_panel("setup")
@@ -10538,12 +10863,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_progress._stop_timer()
             self._sidebar.mark_done("progress")
             self._sidebar.mark_done("results")
-            self._switch_panel("results")
+            if not self._batch_running:
+                self._switch_panel("results")
         else:
             # No output folder — analysis was stopped too early
             self._panel_progress.append_log(
                 "  Analysis stopped before generating results.", "warn")
             self._panel_progress._stop_timer()
+
+        self._abort_batch_sweep(
+            "Current combination was stopped from the Analysis panel — "
+            "finishing the batch with the combinations completed so far.")
 
     def _write_excel_on_stop(self):
         """Write the available sheets with data from the interrupted RT cycle into the workbook."""
@@ -11125,7 +11455,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(STYLESHEET)
         app.setApplicationName("ONTbarcoder")
-        app.setApplicationVersion("3.3b")
+        app.setApplicationVersion("3.4b")
 
         icon = QtGui.QIcon()
         for icon_name in ("icon.ico",):

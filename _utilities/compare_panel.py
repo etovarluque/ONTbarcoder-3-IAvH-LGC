@@ -37,7 +37,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         "Unique":              ("#4A4A4A", "#DCDCDC"),
     }
 
-    def __init__(self, rows, headers, outdir, parent=None):
+    def __init__(self, rows, headers, outdir, runs_info=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Comparison results — ONTbarcoder")
         self.resize(1200, 680)
@@ -109,9 +109,49 @@ class _CompareResultsWindow(QtWidgets.QDialog):
             pb_layout.addWidget(path_lbl, 1)
             layout.addWidget(path_bar)
 
+        # ── Legend: which file hides behind each alias ────────────────────
+        runs_info = runs_info or []
+        alias_display = {inf["alias"]: inf["display"] for inf in runs_info}
+        alias_path    = {inf["alias"]: inf["path"]    for inf in runs_info}
+
+        if runs_info:
+            legend_bar = QtWidgets.QWidget()
+            legend_bar.setStyleSheet(
+                f"background-color: #F7F6F2; border-bottom: 1px solid {GRAY_LINE};")
+            lg_layout = QtWidgets.QHBoxLayout(legend_bar)
+            lg_layout.setContentsMargins(20, 4, 16, 4)
+            lg_layout.setSpacing(10)
+            for inf in runs_info:
+                chip = QtWidgets.QLabel(
+                    f"<b>{inf['alias']}</b> · {inf.get('label', '')}"
+                    if inf.get("label") else f"<b>{inf['alias']}</b>")
+                chip.setTextFormat(QtCore.Qt.RichText)
+                chip.setToolTip(inf["path"])
+                chip.setStyleSheet(
+                    "background-color:#E6EEF8; color:#123F6E; border-radius:7px;"
+                    " padding:2px 9px; font-size:11px;")
+                lg_layout.addWidget(chip)
+            lg_layout.addStretch()
+            layout.addWidget(legend_bar)
+
         # ── Tabla ─────────────────────────────────────────────────────────────
+        def _split_header(h):
+            for al in alias_display:
+                if h.startswith(al + "_"):
+                    return al, h[len(al) + 1:]
+            return None, h
+
         table = QtWidgets.QTableWidget(len(rows), len(headers))
-        table.setHorizontalHeaderLabels(headers)
+        table.setHorizontalHeaderLabels([
+            f"{al}\n{sub}" if al else sub
+            for al, sub in (_split_header(h) for h in headers)
+        ])
+        for j, h in enumerate(headers):
+            al, _sub = _split_header(h)
+            if al:
+                item = table.horizontalHeaderItem(j)
+                if item is not None:
+                    item.setToolTip(f"{alias_display[al]}\n{alias_path[al]}")
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setShowGrid(False)
@@ -317,12 +357,12 @@ class ComparePanel(QtWidgets.QWidget):
         self._id_delim_combo.setFixedWidth(90)
         self._id_delim_combo.setToolTip(
             "Character (or string) that separates the sample ID from the rest of the header.\n"
-            "Common choices: '_' for ONT outputs, '|' for BOLD/GenBank.\n"
+            "Common choices: ';' for ONTbarcoder outputs, '|' for BOLD/GenBank.\n"
             "Multi-character delimiters are also accepted (e.g. '_all.fa')."
         )
-        for ch in ["_", "|", ";", " ", ".", "-"]:
+        for ch in [";", "_", "|", " ", ".", "-"]:
             self._id_delim_combo.addItem(ch)
-        self._id_delim_combo.setCurrentText("_")
+        self._id_delim_combo.setCurrentText(";")
         simple_layout.addWidget(self._id_delim_combo)
 
         self._lbl_id_occ = make_label("before occurrence:", color=TEXT_SEC)
@@ -799,8 +839,8 @@ class ComparePanel(QtWidgets.QWidget):
         self._comp_bar.show()
         self._comp_bar.setValue(n)
 
-    @QtCore.pyqtSlot(list, list)
-    def show_results(self, rows, headers):
+    @QtCore.pyqtSlot(list, list, list)
+    def show_results(self, rows, headers, runs_info=None):
         self._comp_bar.hide()
         self._comp_bar.setValue(0)
 
@@ -842,7 +882,8 @@ class ComparePanel(QtWidgets.QWidget):
                 self._results_win.close()
             except Exception:
                 pass
-        self._results_win = _CompareResultsWindow(rows, headers, outdir_shown, self)
+        self._results_win = _CompareResultsWindow(
+            rows, headers, outdir_shown, runs_info, self)
         self._results_win.show()
         self._view_btn.show()
 
@@ -899,7 +940,7 @@ class ComparePanel(QtWidgets.QWidget):
         )
 
         # Reset ID extraction controls
-        self._id_delim_combo.setCurrentText("_")
+        self._id_delim_combo.setCurrentText(";")
         self._id_occ_combo.setCurrentIndex(0)
         self._id_delim_anyset_chk.setChecked(False)
         self._advanced_toggle_btn.setChecked(False)
@@ -1144,6 +1185,193 @@ def _make_unique_labels(file_list: List[str]) -> List[str]:
     return final
 
 
+# ---------------------------------------------------------------------------
+# Short run aliases (A, B, C...) for readable headers and notes
+# ---------------------------------------------------------------------------
+
+_ALIAS_SEPS = "_-./\\ "
+
+
+def _snap_prefix(prefix: str) -> str:
+    """Trim a common prefix back to the last separator, so the distinctive
+    fragment keeps its first characters (``..._20260910_1`` -> ``..._20260910_``)."""
+    for i in range(len(prefix) - 1, -1, -1):
+        if prefix[i] in _ALIAS_SEPS:
+            return prefix[:i + 1]
+    return ""
+
+
+def _snap_suffix(suffix: str) -> str:
+    """Trim a common suffix forward to its first separator."""
+    for i, ch in enumerate(suffix):
+        if ch in _ALIAS_SEPS:
+            return suffix[i:]
+    return ""
+
+
+def _distinctive_parts(labels: List[str]) -> List[str]:
+    """
+    Fragment that actually tells the labels apart: the common prefix and the
+    common suffix shared by every label are stripped away.
+    """
+    if len(labels) < 2:
+        return [os.path.splitext(os.path.basename(l))[0] for l in labels]
+
+    pre = _snap_prefix(os.path.commonprefix(labels))
+    rev = [l[::-1] for l in labels]
+    suf = _snap_suffix(os.path.commonprefix(rev)[::-1])
+
+    out = []
+    for l in labels:
+        if len(pre) + len(suf) < len(l):
+            core = l[len(pre): len(l) - len(suf)] if suf else l[len(pre):]
+        else:
+            core = ""
+        out.append(core.strip(_ALIAS_SEPS))
+    return out
+
+
+def _letter_alias(n: int) -> str:
+    """1-indexed spreadsheet-style column letters: 1->A, 26->Z, 27->AA, ..."""
+    out = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out.append(chr(ord("A") + rem))
+    return "".join(reversed(out))
+
+
+def _make_run_aliases(file_list: List[str],
+                      basenames: List[str],
+                      ref_index: Optional[int] = None) -> List[dict]:
+    """
+    Build one descriptor per input file:
+        {alias, label, display, basename, path, role}
+    ``alias`` is the short key used in column headers and notes (A, B, C...,
+    or REF for the reference file); ``label`` is the distinctive fragment of
+    the file name and ``display`` is what the merged header band shows.
+
+    Runs get single-letter aliases (not R1..Rn) so they never share an
+    alphabet with the numeric variant-group labels used in the Note/Pattern
+    columns (see _group_note) — the two are never ambiguous side by side.
+    """
+    parts = _distinctive_parts(basenames)
+    info: List[dict] = []
+    run_n = 0
+    for i, (path, bn, label) in enumerate(zip(file_list, basenames, parts)):
+        if ref_index is not None and i == ref_index:
+            alias = "REF"
+            role = "reference"
+        else:
+            run_n += 1
+            alias = _letter_alias(run_n)
+            role = "run"
+        info.append({
+            "alias":    alias,
+            "label":    label,
+            "display":  f"{alias} · {label}" if label else alias,
+            "basename": bn,
+            "path":     path,
+            "role":     role,
+        })
+    return info
+
+
+def _compress_aliases(aliases: List[str], run_order: List[str]) -> str:
+    """
+    Compress a subset of run aliases into contiguous ranges based on their
+    position in ``run_order`` (the full list of run aliases in file order),
+    e.g. ``['A','B','C','D']`` with order A..F -> ``'A-D'``. Aliases not
+    found in ``run_order`` (e.g. "REF") are listed as-is.
+    """
+    pos = {al: i for i, al in enumerate(run_order)}
+    idxs = sorted(pos[a] for a in aliases if a in pos)
+    others = [a for a in aliases if a not in pos]
+
+    chunks: List[str] = []
+    i = 0
+    while i < len(idxs):
+        j = i
+        while j + 1 < len(idxs) and idxs[j + 1] == idxs[j] + 1:
+            j += 1
+        if j - i >= 2:
+            chunks.append(f"{run_order[idxs[i]]}-{run_order[idxs[j]]}")
+        else:
+            chunks.extend(run_order[k] for k in idxs[i:j + 1])
+        i = j + 1
+    return ",".join(others + chunks)
+
+
+def _variant_groups(present_bns: List[str],
+                    pair_results: Dict[Tuple[str, str], Tuple]) -> List[List[str]]:
+    """
+    Cluster files that carry exactly the same sequence for an ID.
+    Returns the clusters in the order the files were given, so the first
+    cluster is group A, the second B, and so on.
+    """
+    parent = {bn: bn for bn in present_bns}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for (b1, b2), res in pair_results.items():
+        if res[0] == "identical" and b1 in parent and b2 in parent:
+            r1, r2 = find(b1), find(b2)
+            if r1 != r2:
+                parent[r2] = r1
+
+    members: Dict[str, List[str]] = {}
+    for bn in present_bns:
+        members.setdefault(find(bn), []).append(bn)
+
+    ordered: List[List[str]] = []
+    seen = set()
+    for bn in present_bns:
+        root = find(bn)
+        if root not in seen:
+            seen.add(root)
+            ordered.append(members[root])
+    return ordered
+
+
+def _group_note(groups: List[List[str]],
+                pair_results: Dict[Tuple[str, str], Tuple],
+                alias_of: Dict[str, str],
+                run_order: List[str]) -> Tuple[str, str]:
+    """
+    Compact rendering of the variant groups plus the distances between them.
+    Returns ``(membership, distances)`` as two already formatted strings.
+
+    Groups are labelled 1, 2, 3... — never with letters — so a group label
+    is never mistaken for one of the (letter-aliased) runs it lists, even
+    when the group's members are not contiguous (e.g. "1=A,D,E").
+    """
+    membership = " | ".join(
+        f"{i + 1}={_compress_aliases([alias_of[bn] for bn in grp], run_order)}"
+        for i, grp in enumerate(groups)
+    )
+
+    dist_parts: List[str] = []
+    for i in range(len(groups)):
+        for j in range(i + 1, len(groups)):
+            rep_i, rep_j = groups[i][0], groups[j][0]
+            res = pair_results.get((rep_i, rep_j)) or pair_results.get((rep_j, rep_i))
+            if not res:
+                continue
+            state, d_amb, d_noamb, rc_used = res
+            if state == "compatible":
+                txt = f"{i + 1}~{j + 1} IUPAC={d_noamb}"
+            else:
+                txt = f"{i + 1}-{j + 1} d={d_amb}"
+            if rc_used:
+                txt += " [RC]"
+            dist_parts.append(txt)
+
+    return membership, ", ".join(dist_parts)
+
+
 def _parse_fasta_file(path: str, cfg=None) -> Dict[str, Tuple[str, int, int, int, int]]:
     """
     Reads a FASTA file and returns dict[sample_id] = (seq, length, cov, ambs, gaps).
@@ -1296,6 +1524,7 @@ def _write_outputs(
     all_bns: List[str],
     ref_bn: Optional[str],
     seqs_store: Dict[str, Dict[str, Tuple[str, int, int, int, int]]],
+    runs_info: Optional[List[dict]] = None,
 ) -> None:
     """
     Generate all output files:
@@ -1346,12 +1575,55 @@ def _write_outputs(
             "border_color": "#D0CEC8", "valign": "vcenter",
         })
 
-        ws.set_row(0, 28)
-        id_col = headers.index("ID") if "ID" in headers else -1
-        for j, h in enumerate(headers):
-            ws.write(0, j, h, fmt_hdr)
+        # Two-row header: a band naming each run, then the metric below it.
+        fmt_band = wb.add_format({
+            "bold": True, "font_color": "#FFFFFF", "bg_color": "#123F6E",
+            "border": 1, "border_color": "#2E6FAA",
+            "align": "center", "valign": "vcenter",
+        })
+        fmt_sub = wb.add_format({
+            "bold": True, "font_color": "#FFFFFF", "bg_color": "#185FA5",
+            "border": 1, "border_color": "#2E6FAA",
+            "align": "center", "valign": "vcenter",
+        })
 
-        for i, row in enumerate(rows, 1):
+        # Map each column to the run it belongs to (if any)
+        alias_display = {inf["alias"]: inf["display"] for inf in (runs_info or [])}
+        alias_path    = {inf["alias"]: inf["path"]    for inf in (runs_info or [])}
+
+        def _split_header(h: str) -> Tuple[Optional[str], str]:
+            for al in alias_display:
+                if h.startswith(al + "_"):
+                    return al, h[len(al) + 1:]
+            return None, h
+
+        col_run = [_split_header(h) for h in headers]
+
+        ws.set_row(0, 22)
+        ws.set_row(1, 22)
+        id_col = headers.index("ID") if "ID" in headers else -1
+
+        j = 0
+        while j < len(headers):
+            al, sub = col_run[j]
+            if al is None:
+                ws.merge_range(0, j, 1, j, headers[j], fmt_hdr)
+                j += 1
+                continue
+            k = j
+            while k + 1 < len(headers) and col_run[k + 1][0] == al:
+                k += 1
+            if k > j:
+                ws.merge_range(0, j, 0, k, alias_display[al], fmt_band)
+            else:
+                ws.write(0, j, alias_display[al], fmt_band)
+            if alias_path.get(al):
+                ws.write_comment(0, j, alias_path[al], {"width": 420, "height": 60})
+            for c in range(j, k + 1):
+                ws.write(1, c, col_run[c][1], fmt_sub)
+            j = k + 1
+
+        for i, row in enumerate(rows, 2):
             ws.set_row(i, 18)
             estado = row.get("State", "")
             if estado in fmt_by_estado:
@@ -1372,10 +1644,41 @@ def _write_outputs(
         for j, h in enumerate(headers):
             col_vals = [str(row.get(h, "") or "") for row in rows]
             max_len  = max((len(v) for v in col_vals), default=4)
-            max_len  = max(max_len, len(h))
-            ws.set_column(j, j, min(max_len + 2, 52))
+            # Only the sub-header shares the column now, not the full run name
+            max_len  = max(max_len, len(col_run[j][1]) + 2)
+            ws.set_column(j, j, min(max_len + 2, 60))
 
-        ws.freeze_panes(1, 1)
+        if rows:
+            ws.autofilter(1, 0, len(rows) + 1, len(headers) - 1)
+        # Keep ID (and State, when present) visible while scrolling sideways
+        frozen_cols = 2 if len(headers) > 1 and headers[1] == "State" else 1
+        ws.freeze_panes(2, frozen_cols)
+
+        # ── Legend sheet: alias → file ──────────────────────────────────
+        if runs_info:
+            ws2 = wb.add_worksheet("Runs")
+            leg_headers = ["Alias", "Label", "Role", "File", "Sequences", "Path"]
+            ws2.set_row(0, 22)
+            for j, h in enumerate(leg_headers):
+                ws2.write(0, j, h, fmt_hdr)
+            fmt_alias = wb.add_format({
+                "bold": True, "border": 1, "border_color": "#D0CEC8",
+                "bg_color": "#EDF3FA", "valign": "vcenter",
+            })
+            leg_rows = [
+                [inf["alias"], inf.get("label", ""), inf.get("role", ""),
+                 os.path.basename(inf["path"]), inf.get("nseqs", ""), inf["path"]]
+                for inf in runs_info
+            ]
+            for i, vals in enumerate(leg_rows, 1):
+                ws2.write(i, 0, vals[0], fmt_alias)
+                for j, v in enumerate(vals[1:], 1):
+                    ws2.write(i, j, v, fmt_default)
+            for j, h in enumerate(leg_headers):
+                widest = max([len(h)] + [len(str(r[j])) for r in leg_rows])
+                ws2.set_column(j, j, min(widest + 2, 80))
+            ws2.freeze_panes(1, 1)
+
         wb.close()
     except Exception as exc:
         print(f"[XLSX] Writing error: {exc}")
@@ -1397,7 +1700,9 @@ def _write_outputs(
     for row in rows:
         sid    = row["ID"]
         estado = row.get("State", "")
-        best_bn = row.get("Best_run", "")
+        # Visible columns carry short aliases; the real file name travels in
+        # the private "_best_bn" / "_unique_bn" keys.
+        best_bn = row.get("_best_bn", "") or row.get("Best_run", "")
 
         # Best overall barcode
         candidates: List[_SeqEntry] = []
@@ -1446,7 +1751,7 @@ def _write_outputs(
                     no_ref_entries.append((f"{sid};src={bn}", r[0]))
                     break
         elif estado.startswith("Unique in "):
-            src_bn = estado.replace("Unique in ", "")
+            src_bn = row.get("_unique_bn") or estado.replace("Unique in ", "")
             r = get_seq(src_bn, sid)
             if r and src_bn in unique_entries:
                 unique_entries[src_bn].append((sid, r[0]))
@@ -1480,7 +1785,7 @@ class _CompareWorker(QtCore.QThread):
     and details the result by pair in the Note column.
     """
     notifyProgress = QtCore.pyqtSignal(int)
-    taskFinished   = QtCore.pyqtSignal(list, list)   # rows, headers
+    taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
 
     def __init__(self, file_list: List[str], outdir: str, extract_cfg=None,
                  parent=None):
@@ -1493,10 +1798,17 @@ class _CompareWorker(QtCore.QThread):
         file_list = self.file_list
         basenames = _make_unique_labels(file_list)
 
+        # Short aliases (A, B, C...) used in headers and notes
+        runs_info = _make_run_aliases(file_list, basenames)
+        alias_of  = {inf["basename"]: inf["alias"] for inf in runs_info}
+        run_order = [inf["alias"] for inf in runs_info]
+
         # Parse files
         seqs: Dict[str, Dict[str, Tuple]] = {}
         for fname, bn in zip(file_list, basenames):
             seqs[bn] = _parse_fasta_file(fname, self.extract_cfg)
+        for inf in runs_info:
+            inf["nseqs"] = len(seqs.get(inf["basename"], {}))
 
         pairs = list(itertools.combinations(basenames, 2))
         all_ids = sorted({sid for d in seqs.values() for sid in d})
@@ -1512,23 +1824,30 @@ class _CompareWorker(QtCore.QThread):
 
             row: dict = {"ID": sid}
 
-            # Columns per file
+            # Columns per file (keyed by the short alias)
             for bn in basenames:
+                al = alias_of[bn]
                 entry = seqs.get(bn, {}).get(sid)
                 if entry:
-                    row[f"{bn}_len"]  = entry[1]
-                    row[f"{bn}_cov"]  = entry[2]
-                    row[f"{bn}_ambs"] = entry[3]
-                    row[f"{bn}_gaps"] = entry[4]
+                    row[f"{al}_len"]  = entry[1]
+                    row[f"{al}_cov"]  = entry[2]
+                    row[f"{al}_ambs"] = entry[3]
+                    row[f"{al}_gaps"] = entry[4]
                 else:
-                    row[f"{bn}_len"] = row[f"{bn}_cov"] = \
-                    row[f"{bn}_ambs"] = row[f"{bn}_gaps"] = ""
+                    row[f"{al}_len"] = row[f"{al}_cov"] = \
+                    row[f"{al}_ambs"] = row[f"{al}_gaps"] = ""
 
             if len(present_in) == 1:
-                row["State"]        = f"Unique in {present_in[0]}"
-                row["Best_run"] = present_in[0]
-                row["Diff_bases"]     = ""
-                row["Note"]          = "Not found in other runs"
+                only_bn = present_in[0]
+                row["State"]      = f"Unique in {alias_of[only_bn]}"
+                row["Best_run"]   = alias_of[only_bn]
+                row["Diff_bases"] = ""
+                row["Vars"]       = 1
+                row["Pattern"]    = "".join(
+                    "1" if bn == only_bn else "." for bn in basenames)
+                row["Note"]       = "Not found in other runs"
+                row["_unique_bn"] = only_bn
+                row["_best_bn"]   = only_bn
                 rows.append(row)
                 self.notifyProgress.emit(int((prog_i + 1) / total * 100))
                 continue
@@ -1552,7 +1871,8 @@ class _CompareWorker(QtCore.QThread):
                     l0, l1_ = lens[bns[0]], lens[bns[1]]
                     delta = abs(l0 - l1_)
                     sym = "<" if l0 < l1_ else ">"
-                    row["Length"] = f"{bns[0]} {sym} {bns[1]}: Δ{delta} bp"
+                    row["Length"] = (f"{alias_of[bns[0]]} {sym} "
+                                     f"{alias_of[bns[1]]}: Δ{delta} bp")
                 else:
                     row["Length"] = f"{unique_lens[0]}–{unique_lens[-1]} bp"
             else:
@@ -1570,28 +1890,31 @@ class _CompareWorker(QtCore.QThread):
             }.get(global_raw, global_raw)
             row["State"] = estado_display
 
-            # Note with detail per pair + accumulate Diff_bases and IUPAC_pos
-            detail_parts = []
+            # Worst distances across every pair, for the summary columns
             max_dist = 0
             max_d_noamb = 0
-            for (bn1, bn2), (ep, d_amb, d_noamb, rc_used) in pair_results.items():
-                ep_es = {'identical': 'Identical', 'compatible': 'Compatible (IUPAC)',
-                         'different': 'Different'}.get(ep, ep)
-                nota_par = f"{bn1}↔{bn2}: {ep_es}"
-                if ep == 'different' and d_amb:
-                    nota_par += f" (d={d_amb})"
-                    if d_amb > max_dist:
-                        max_dist = d_amb
-                elif ep == 'compatible' and d_noamb:
-                    nota_par += f" (IUPAC_pos={d_noamb})"
-                    if d_noamb > max_d_noamb:
-                        max_d_noamb = d_noamb
-                if rc_used:
-                    nota_par += " [RC]"
-                detail_parts.append(nota_par)
+            for ep, d_amb, d_noamb, _rc in pair_results.values():
+                if ep == 'different' and d_amb > max_dist:
+                    max_dist = d_amb
+                elif ep == 'compatible' and d_noamb > max_d_noamb:
+                    max_d_noamb = d_noamb
 
             row["Diff_bases"] = max_dist if max_dist else ""
             row["IUPAC_pos"]  = max_d_noamb if max_d_noamb else ""
+
+            # Variant groups: files sharing the very same sequence collapse
+            # into one group, so the note lists groups instead of every pair.
+            # Groups are numbered (1, 2, 3...), never lettered — run aliases
+            # are letters, so the two label systems never collide.
+            groups   = _variant_groups(present_in, pair_results)
+            group_id = {bn: str(i + 1) for i, grp in enumerate(groups) for bn in grp}
+            row["Vars"]    = len(groups)
+            row["Pattern"] = "".join(group_id.get(bn, ".") for bn in basenames)
+
+            membership, distances = _group_note(groups, pair_results, alias_of, run_order)
+            detail_parts = [membership]
+            if distances:
+                detail_parts.append(distances)
 
             # best barcode
             seqs_present: List[_SeqEntry] = [
@@ -1602,9 +1925,10 @@ class _CompareWorker(QtCore.QThread):
             best = _best_barcode(seqs_present)
             if global_raw == 'different':
                 if best:
-                    row["Best_run"] = best[0]
+                    row["Best_run"] = alias_of[best[0]]
+                    row["_best_bn"] = best[0]
                     detail_parts.append(
-                        f"Best: {best[0]} "
+                        f"Best {alias_of[best[0]]} "
                         f"(ambs={best[4]}, gaps={best[5]}, cov={best[3]})"
                     )
                 else:
@@ -1614,22 +1938,24 @@ class _CompareWorker(QtCore.QThread):
                 row["Best_run"] = ""
 
             if absent_from:
-                detail_parts.append(f"Absent from: {', '.join(absent_from)}")
+                detail_parts.append(
+                    "Absent " + _compress_aliases([alias_of[b] for b in absent_from], run_order))
 
-            row["Note"] = " | ".join(detail_parts)
+            row["Note"] = " || ".join(detail_parts)
             rows.append(row)
             self.notifyProgress.emit(int((prog_i + 1) / total * 100))
 
         # Headers — include IUPAC_pos and Length only when present in data
         has_iupac  = any(row.get("IUPAC_pos", "") for row in rows)
         has_length = any(row.get("Length", "")    for row in rows)
-        headers = ["ID", "State", "Best_run", "Diff_bases"]
+        headers = ["ID", "State", "Vars", "Pattern", "Best_run", "Diff_bases"]
         if has_iupac:
             headers.append("IUPAC_pos")
         if has_length:
             headers.append("Length")
-        for bn in basenames:
-            headers += [f"{bn}_len", f"{bn}_cov", f"{bn}_ambs", f"{bn}_gaps"]
+        for inf in runs_info:
+            al = inf["alias"]
+            headers += [f"{al}_len", f"{al}_cov", f"{al}_ambs", f"{al}_gaps"]
         headers.append("Note")
 
         # Outputs
@@ -1637,9 +1963,10 @@ class _CompareWorker(QtCore.QThread):
             rows, headers, self.outdir,
             all_bns=basenames,
             ref_bn=None, seqs_store=seqs,
+            runs_info=runs_info,
         )
 
-        self.taskFinished.emit(rows, headers)
+        self.taskFinished.emit(rows, headers, runs_info)
 
 
 # ---------------------------------------------------------------------------
@@ -1655,7 +1982,7 @@ class _PairCompareWorker(QtCore.QThread):
     Includes reverse complement detection and alignment with edlib.
     """
     notifyProgress = QtCore.pyqtSignal(int)
-    taskFinished   = QtCore.pyqtSignal(list, list)   # rows, headers
+    taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
 
     def __init__(self, file_list: List[str], ref_path: str,
                  outdir: str, extract_cfg=None, parent=None):
@@ -1677,10 +2004,18 @@ class _PairCompareWorker(QtCore.QThread):
         )
         comp_bns = [bn for bn in all_bns if bn != ref_bn]
 
+        # Short aliases: REF for the reference, A, B, C... for the rest
+        runs_info = _make_run_aliases(file_list, all_bns,
+                                      ref_index=all_bns.index(ref_bn))
+        alias_of  = {inf["basename"]: inf["alias"] for inf in runs_info}
+        run_order = [inf["alias"] for inf in runs_info if inf["role"] == "run"]
+
         # Parse files
         seqs: Dict[str, Dict[str, Tuple]] = {}
         for fname, bn in zip(file_list, all_bns):
             seqs[bn] = _parse_fasta_file(fname, self.extract_cfg)
+        for inf in runs_info:
+            inf["nseqs"] = len(seqs.get(inf["basename"], {}))
 
         ref_seqs = seqs.get(ref_bn, {})
         all_ids  = sorted(
@@ -1697,39 +2032,42 @@ class _PairCompareWorker(QtCore.QThread):
             row: dict = {"ID": sid}
 
             # Reference info
+            ref_al = alias_of[ref_bn]
             if sid in ref_seqs:
                 r = ref_seqs[sid]
-                row[f"{ref_bn}_len"]  = r[1]
-                row[f"{ref_bn}_cov"]  = r[2]
-                row[f"{ref_bn}_ambs"] = r[3]
-                row[f"{ref_bn}_gaps"] = r[4]
+                row[f"{ref_al}_len"]  = r[1]
+                row[f"{ref_al}_cov"]  = r[2]
+                row[f"{ref_al}_ambs"] = r[3]
+                row[f"{ref_al}_gaps"] = r[4]
                 ref_seq = r[0]
             else:
-                row[f"{ref_bn}_len"] = row[f"{ref_bn}_cov"] = \
-                row[f"{ref_bn}_ambs"] = row[f"{ref_bn}_gaps"] = ""
+                row[f"{ref_al}_len"] = row[f"{ref_al}_cov"] = \
+                row[f"{ref_al}_ambs"] = row[f"{ref_al}_gaps"] = ""
                 ref_seq = None
 
             # Info files compared
             for bn in comp_bns:
+                al = alias_of[bn]
                 entry = seqs.get(bn, {}).get(sid)
                 if entry:
-                    row[f"{bn}_len"]  = entry[1]
-                    row[f"{bn}_cov"]  = entry[2]
-                    row[f"{bn}_ambs"] = entry[3]
-                    row[f"{bn}_gaps"] = entry[4]
+                    row[f"{al}_len"]  = entry[1]
+                    row[f"{al}_cov"]  = entry[2]
+                    row[f"{al}_ambs"] = entry[3]
+                    row[f"{al}_gaps"] = entry[4]
                 else:
-                    row[f"{bn}_len"] = row[f"{bn}_cov"] = \
-                    row[f"{bn}_ambs"] = row[f"{bn}_gaps"] = ""
-                row[f"{bn}_dif"] = ""
+                    row[f"{al}_len"] = row[f"{al}_cov"] = \
+                    row[f"{al}_ambs"] = row[f"{al}_gaps"] = ""
+                row[f"{al}_dif"] = ""
 
             # ── Only in reference ──────────────────────────────────────────
             if ref_seq is not None and all(
                 sid not in seqs.get(bn, {}) for bn in comp_bns
             ):
-                row["State"]        = "Only in reference"
-                row["Best_run"] = ref_bn
-                row["Diff_bases"]     = ""
-                row["Note"]          = "Not found in any compared file"
+                row["State"]      = "Only in reference"
+                row["Best_run"]   = ref_al
+                row["_best_bn"]   = ref_bn
+                row["Diff_bases"] = ""
+                row["Note"]       = "Not found in any compared file"
                 rows.append(row)
                 self.notifyProgress.emit(int((prog_i + 1) / total * 100))
                 continue
@@ -1737,10 +2075,11 @@ class _PairCompareWorker(QtCore.QThread):
             # ── No reference ──────────────────────────────────────────────
             if ref_seq is None:
                 present_bns = [bn for bn in comp_bns if sid in seqs.get(bn, {})]
-                row["State"]        = "No reference"
-                row["Best_run"] = ""
-                row["Diff_bases"]     = ""
-                row["Note"]          = f"Only in: {', '.join(present_bns)}"
+                row["State"]      = "No reference"
+                row["Best_run"]   = ""
+                row["Diff_bases"] = ""
+                row["Note"]       = "Only in " + _compress_aliases(
+                    [alias_of[b] for b in present_bns], run_order)
                 rows.append(row)
                 self.notifyProgress.emit(int((prog_i + 1) / total * 100))
                 continue
@@ -1760,7 +2099,7 @@ class _PairCompareWorker(QtCore.QThread):
                     dists_por_bn[bn]   = 0
                     noamb_por_bn[bn]   = 0
                     rc_por_bn[bn]      = False
-                    row[f"{bn}_length"] = ""
+                    row[f"{alias_of[bn]}_length"] = ""
                     continue
 
                 comp_seq = seqs[bn][sid][0]
@@ -1772,7 +2111,7 @@ class _PairCompareWorker(QtCore.QThread):
                 noamb_por_bn[bn]   = d_noamb
                 rc_por_bn[bn]      = rc_used
 
-                row[f"{bn}_dif"] = d_amb if d_amb else ""
+                row[f"{alias_of[bn]}_dif"] = d_amb if d_amb else ""
                 if d_amb and d_amb > max_dist:
                     max_dist = d_amb
                 if estado_raw == 'compatible' and d_noamb > max_d_noamb:
@@ -1781,11 +2120,11 @@ class _PairCompareWorker(QtCore.QThread):
                 # Per-file length delta vs reference
                 delta = len(comp_seq) - len(ref_seq)
                 if delta == 0:
-                    row[f"{bn}_length"] = ""
+                    row[f"{alias_of[bn]}_length"] = ""
                 elif delta > 0:
-                    row[f"{bn}_length"] = f"> {delta} bp"
+                    row[f"{alias_of[bn]}_length"] = f"> {delta} bp"
                 else:
-                    row[f"{bn}_length"] = f"< {-delta} bp"
+                    row[f"{alias_of[bn]}_length"] = f"< {-delta} bp"
 
                 if estado_raw == 'different':
                     e = seqs[bn][sid]
@@ -1794,9 +2133,9 @@ class _PairCompareWorker(QtCore.QThread):
 
             # Global Length summary: show when any file differs in length
             length_parts = [
-                f"{bn}: {row[f'{bn}_length']}"
+                f"{alias_of[bn]}: {row[f'{alias_of[bn]}_length']}"
                 for bn in comp_bns
-                if row.get(f"{bn}_length", "")
+                if row.get(f"{alias_of[bn]}_length", "")
             ]
             row["Length"] = " | ".join(length_parts) if length_parts else ""
 
@@ -1816,30 +2155,41 @@ class _PairCompareWorker(QtCore.QThread):
             row["Diff_bases"] = max_dist    if max_dist    else ""
             row["IUPAC_pos"]  = max_d_noamb if max_d_noamb else ""
 
-            # Detailed note per file
-            detail_parts = []
+            # Note: files sharing the same verdict against the reference are
+            # listed together instead of one entry per file.
+            buckets: Dict[Tuple, List[str]] = {}
             for bn in comp_bns:
                 ep = estados_por_bn.get(bn, "Absent")
-                ep_es = {'identical': 'Identical', 'compatible': 'Compatible (IUPAC)',
-                         'different': 'Different'}.get(ep, ep)
-                nota_bn = f"{bn}: {ep_es}"
-                d = dists_por_bn.get(bn, 0)
-                if d:
-                    nota_bn += f" (d={d})"
-                iupac_p = noamb_por_bn.get(bn, 0)
-                if ep == 'compatible' and iupac_p:
-                    nota_bn += f" (IUPAC_pos={iupac_p})"
-                if rc_por_bn.get(bn):
-                    nota_bn += " [RC]"
-                detail_parts.append(nota_bn)
+                key = (ep,
+                       dists_por_bn.get(bn, 0),
+                       noamb_por_bn.get(bn, 0) if ep == 'compatible' else 0,
+                       bool(rc_por_bn.get(bn)))
+                buckets.setdefault(key, []).append(bn)
+
+            order = {'identical': 0, 'compatible': 1, 'different': 2, 'Absent': 3}
+            detail_parts = []
+            for (ep, d, iupac_p, rc_used), bns in sorted(
+                    buckets.items(), key=lambda kv: (order.get(kv[0][0], 9), kv[0][1])):
+                if ep == 'identical':
+                    tag = "= REF"
+                elif ep == 'compatible':
+                    tag = f"~ REF IUPAC={iupac_p}" if iupac_p else "~ REF"
+                elif ep == 'different':
+                    tag = f"≠ REF d={d}" if d else "≠ REF"
+                else:
+                    tag = "Absent"
+                if rc_used:
+                    tag += " [RC]"
+                detail_parts.append(f"{tag}: {_compress_aliases([alias_of[b] for b in bns], run_order)}")
 
             # best barcode
             best = _best_barcode(diff_candidates) if diff_candidates else None
             if global_raw == 'different':
                 if best:
-                    row["Best_run"] = best[0]
+                    row["Best_run"] = alias_of[best[0]]
+                    row["_best_bn"] = best[0]
                     detail_parts.append(
-                        f"Best: {best[0]} "
+                        f"Best {alias_of[best[0]]} "
                         f"(ambs={best[4]}, gaps={best[5]}, cov={best[3]})"
                     )
                 else:
@@ -1848,7 +2198,7 @@ class _PairCompareWorker(QtCore.QThread):
             else:
                 row["Best_run"] = ""
 
-            row["Note"] = " | ".join(detail_parts)
+            row["Note"] = " || ".join(detail_parts)
             rows.append(row)
             self.notifyProgress.emit(int((prog_i + 1) / total * 100))
 
@@ -1860,12 +2210,14 @@ class _PairCompareWorker(QtCore.QThread):
             headers.append("IUPAC_pos")
         if has_length:
             headers.append("Length")
-        headers += [f"{ref_bn}_len", f"{ref_bn}_cov",
-                    f"{ref_bn}_ambs", f"{ref_bn}_gaps"]
+        ref_al = alias_of[ref_bn]
+        headers += [f"{ref_al}_len", f"{ref_al}_cov",
+                    f"{ref_al}_ambs", f"{ref_al}_gaps"]
         for bn in comp_bns:
-            headers += [f"{bn}_len", f"{bn}_cov",
-                        f"{bn}_ambs", f"{bn}_gaps", f"{bn}_dif",
-                        f"{bn}_length"]
+            al = alias_of[bn]
+            headers += [f"{al}_len", f"{al}_cov",
+                        f"{al}_ambs", f"{al}_gaps", f"{al}_dif",
+                        f"{al}_length"]
         headers.append("Note")
 
         # Outputs
@@ -1873,6 +2225,7 @@ class _PairCompareWorker(QtCore.QThread):
             rows, headers, self.outdir,
             all_bns=[ref_bn] + list(comp_bns),
             ref_bn=ref_bn, seqs_store=seqs,
+            runs_info=runs_info,
         )
 
-        self.taskFinished.emit(rows, headers)
+        self.taskFinished.emit(rows, headers, runs_info)

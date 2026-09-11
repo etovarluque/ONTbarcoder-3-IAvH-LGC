@@ -69,10 +69,16 @@ cp -r _mafftfiles          "$DIST/"
 rm -f "$DIST/_mafftfiles/disttbfast.exe"
 [ -d guide ]         && cp -r guide       "$DIST/"
 [ -d translations ]  && cp -r translations "$DIST/"
-# _profiles / _notes / _ui_cache are (re)created at runtime, but ship the ones
-# that already hold content so a fresh install starts with the reference notes
-# (Cytb.md, ITS.md, rbcL.md, ...) and the saved parameter profiles.
-[ -d _profiles ] && cp -r _profiles "$DIST/"
+# _profiles / _notes / _ui_cache are (re)created at runtime, but ship the
+# reference notes (Cytb.md, ITS.md, rbcL.md, ...) so a fresh install starts
+# with them. _profiles ships only its committed template files -- NEVER the
+# whole folder with `cp -r`: _profiles/*.json is gitignored on purpose
+# because it can hold a real, locally-configured NCBI API key
+# (_profiles/blast_config.json), which must not end up in a build.
+mkdir -p "$DIST/_profiles"
+for f in ontbarcoder_batch.cfg blast_config.example.json; do
+    [ -f "_profiles/$f" ] && cp "_profiles/$f" "$DIST/_profiles/"
+done
 [ -d _notes ]    && cp -r _notes    "$DIST/"
 
 echo "==> [5/7] Install the Linux launcher and desktop integration"

@@ -1,18 +1,18 @@
 ---
-title: Nuevos barcodes
+title: New barcodes
 created: 2026-07-31T12:04:10
-updated: 2026-07-31T12:50:23
+updated: 2026-09-11T00:00:00
 tags: 
 ---
 
-- Cuando se analicen nuevos marcadores codificantes, de los que se desconoce el tamaño del fragmento, realizar incialmente un análisis seleccionando el checkbox **Non-Coding marker** .
+- When analyzing new coding markers whose fragment size is unknown, first run an analysis with the **Non-Coding marker** checkbox selected.
 
-- Introducir un valor aproximado de **Barcode length (bp)** (de acuerdo al gel de electroforesis)
+- Enter an approximate **Barcode length (bp)** value (based on the electrophoresis gel).
 
-- El valor de **Minimum length (pb)** no tiene restricción, puede ser bajo (p. ej. Esperado = 1000 pb, Mínimo = 200 pb)
+- The **Minimum length (bp)** value has no restriction — it can be low (e.g. Expected = 1000 bp, Minimum = 200 bp).
 
-- El programa arrojara el resultado del tamaño del barcode de acuerdo a la detección de los primers. 
+- The program will report the barcode size based on primer detection.
 
-- Usar ese valor para realizar nuevamente un **análisis convecional (Coding marker).** Al realizar todas las fases del análisis, con correcciones de la secuencia consenso por longitud y por código genético, los resultados serán mas confiables.
+- Use that value to run a new **conventional analysis (Coding marker)**. Running every phase of the analysis, with consensus sequence corrections by length and by genetic code, gives more reliable results.
 
-- Muy recomendado guardar los valores de los parametros en un perfil (**Parameter profiles**) con el nombre del marcador. Posteriormente, cargar el perfil para nuevos análisis con ese marcador.
+- Strongly recommended: save the parameter values as a profile (**Parameter profiles**) named after the marker. Later, load that profile for new analyses with the same marker.
