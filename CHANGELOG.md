@@ -65,9 +65,13 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
     across runs gets one entry per distinct variant, header suffixed with the
     run number that produced it (`;run3`).
   - `batch_dedup_report.tsv` — one row per sample: how many distinct variants,
-    in how many runs (`N_runs_present`, e.g. `18/40`), and which run numbers
-    (`Runs`, compressed as ranges, e.g. `1-12,15,20-24`) — cross-referenced
-    against `batch_run_summary.tsv` for their parameters.
+    in how many runs (`N_runs_present`/`N_runs_total`, two plain numbers, not
+    `18/40`), and which run numbers (`Runs`, compressed as ranges, e.g.
+    `1..12,15,20..24`) — cross-referenced against `batch_run_summary.tsv` for
+    their parameters. Both choices sidestep a real Excel quirk: a value like
+    `18/40` or `1-9` is read back as a date when the `.tsv` is opened
+    directly, so the counts are split into two columns and ranges use `..`
+    instead of `-`.
 
   BLAST and Best Sequence stay manual steps, run afterwards on the merged
   FASTA — Best Sequence already picks the best variant per sample when there

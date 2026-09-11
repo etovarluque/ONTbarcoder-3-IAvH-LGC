@@ -231,8 +231,10 @@ def _sample_of(header: str) -> str:
 
 
 def _compress_ranges(nums: List[int]) -> str:
-    """[1,2,3,5,7,8,9] -> '1-3,5,7-9'. Keeps the Folders/Runs column readable
-    when a sample is present across dozens of run folders."""
+    """[1,2,3,5,7,8,9] -> '1..3,5,7..9'. Keeps the Runs column readable when a
+    sample is present across dozens of run folders. Uses '..' rather than '-'
+    as the range separator so a value like '1-9' is never read back as a date
+    (e.g. "Jan-09") when the report is opened in Excel."""
     if not nums:
         return ""
     nums = sorted(nums)
@@ -242,9 +244,9 @@ def _compress_ranges(nums: List[int]) -> str:
         if n == prev + 1:
             prev = n
             continue
-        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        parts.append(str(start) if start == prev else f"{start}..{prev}")
         start = prev = n
-    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    parts.append(str(start) if start == prev else f"{start}..{prev}")
     return ",".join(parts)
 
 
@@ -284,7 +286,10 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
     os.makedirs(os.path.dirname(out_fasta), exist_ok=True)
     with open(out_fasta, "w", encoding="utf-8") as fh_fa, \
          open(out_report, "w", encoding="utf-8") as fh_rep:
-        fh_rep.write("Sample\tN_variants\tN_runs_present\tRuns\n")
+        # N_runs_present and N_runs_total are kept as two plain integer columns
+        # rather than one "9/9" string: Excel reads "M/D"-shaped text back as
+        # a date when a TSV/CSV is opened directly.
+        fh_rep.write("Sample\tN_variants\tN_runs_present\tN_runs_total\tRuns\n")
         for sample in sorted(by_sample):
             entries = by_sample[sample]
             # first occurrence per distinct sequence, in run order
@@ -306,7 +311,7 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
                     fh_fa.write(f">{header};run{run_number[tag]}\n{seq}\n")
                     n_sequences_written += 1
 
-            fh_rep.write(f"{sample}\t{len(variants)}\t{len(run_nums)}/{n_runs}\t"
+            fh_rep.write(f"{sample}\t{len(variants)}\t{len(run_nums)}\t{n_runs}\t"
                          f"{_compress_ranges(run_nums)}\n")
 
     return {

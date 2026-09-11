@@ -39,7 +39,9 @@ batch's own output folder, all identifying runs by a short run number
   sample with different sequences across runs gets one entry per variant
   (header tagged `;run3`).
 - `batch_dedup_report.tsv` — one row per sample: how many variants, in how
-  many runs, and which run numbers (compressed as ranges, e.g. `1-12,15`).
+  many runs (as two plain numbers, not `18/40`), and which run numbers
+  (compressed as ranges, e.g. `1..12,15`) — deliberately using `..` instead
+  of `-` so Excel doesn't read a value like `1-9` back as a date.
 
 5- BLAST and Best Sequence stay manual steps — run them afterwards on that
 merged FASTA to pick the best sequence per sample.

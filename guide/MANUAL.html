@@ -1592,11 +1592,16 @@ three files, and keeps things readable even for a sweep of 40+ combinations:</p>
       different sequences across runs gets <b>one entry per distinct variant</b>, header
       suffixed with the run number that produced it (<code>;run3</code>).</li>
   <li><code>batch_dedup_report.tsv</code> — one row per sample: <code>N_variants</code>
-      (how many distinct sequences it had across the sweep), <code>N_runs_present</code>
-      (e.g. <code>18/40</code>) and <code>Runs</code> — the run numbers it appeared in,
-      written as compressed ranges (e.g. <code>1-12,15,20-24</code>) so the column stays
-      short even when a sample is present in most runs of a large sweep. Cross-reference
-      a run number against <code>batch_run_summary.tsv</code> for its parameters.</li>
+      (how many distinct sequences it had across the sweep), <code>N_runs_present</code> /
+      <code>N_runs_total</code> (e.g. <code>18</code> and <code>40</code>, as two plain
+      numbers rather than <code>18/40</code>) and <code>Runs</code> — the run numbers it
+      appeared in, written as compressed ranges (e.g. <code>1..12,15,20..24</code>) so the
+      column stays short even when a sample is present in most runs of a large sweep.
+      Both the two-column count and the <code>..</code> range separator (instead of
+      <code>/</code> or <code>-</code>) are deliberate: Excel reads a plain <code>-</code>-
+      or <code>/</code>-separated value like <code>1-9</code> or <code>9/9</code> back as a
+      date when the <code>.tsv</code> is opened directly. Cross-reference a run number
+      against <code>batch_run_summary.tsv</code> for its parameters.</li>
 </ul>
 <p>BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
 stay manual steps, run afterwards on that merged FASTA — remote BLAST is rate-limited
