@@ -230,20 +230,42 @@ def _sample_of(header: str) -> str:
     return header.split(";", 1)[0].strip()
 
 
+def _compress_ranges(nums: List[int]) -> str:
+    """[1,2,3,5,7,8,9] -> '1-3,5,7-9'. Keeps the Folders/Runs column readable
+    when a sample is present across dozens of run folders."""
+    if not nums:
+        return ""
+    nums = sorted(nums)
+    parts = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = n
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(parts)
+
+
 def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
                               out_fasta: str, out_report: str,
                               fasta_name: str = "consensus_filtered.fa") -> dict:
     """Merge consensus_filtered.fa from every run folder into one FASTA.
 
-    run_folders: [(folder_path, tag), ...] in run order, tag = folder name
-    with the "ont-barcoder_" prefix stripped (used to suffix the header of a
-    sample that has more than one distinct sequence across runs).
+    run_folders: [(folder_path, tag), ...] in run order. Runs are referenced
+    in the report by their 1-based run number (matching batch_run_summary.tsv)
+    rather than by their (timestamped) folder tag, so the Runs column stays
+    short even with dozens of run folders.
 
     A sample whose sequence is identical in every folder it appears in is
     written once, with its original header untouched. A sample with distinct
     sequences across folders gets one record per distinct sequence, header
-    suffixed with ";<tag>" of the folder that first produced it.
+    suffixed with ";run<N>" of the run that first produced it.
     """
+    run_number = {tag: i + 1 for i, (_folder, tag) in enumerate(run_folders)}
+    n_runs = len(run_folders)
+
     # sample -> list of (folder_tag, header, seq), in run order
     by_sample: Dict[str, List[Tuple[str, str, str]]] = {}
     for folder, tag in run_folders:
@@ -262,7 +284,7 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
     os.makedirs(os.path.dirname(out_fasta), exist_ok=True)
     with open(out_fasta, "w", encoding="utf-8") as fh_fa, \
          open(out_report, "w", encoding="utf-8") as fh_rep:
-        fh_rep.write("Sample\tN_variants\tFolders\n")
+        fh_rep.write("Sample\tN_variants\tN_runs_present\tRuns\n")
         for sample in sorted(by_sample):
             entries = by_sample[sample]
             # first occurrence per distinct sequence, in run order
@@ -271,7 +293,7 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
                 if seq not in seen:
                     seen[seq] = (tag, header)
             variants = list(seen.items())  # [(seq, (tag, header)), ...]
-            all_tags = [t for t, _h, _s in entries]
+            run_nums = sorted({run_number[t] for t, _h, _s in entries})
 
             if len(variants) == 1:
                 n_collapsed += 1
@@ -281,10 +303,11 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
             else:
                 n_with_variants += 1
                 for seq, (tag, header) in variants:
-                    fh_fa.write(f">{header};{tag}\n{seq}\n")
+                    fh_fa.write(f">{header};run{run_number[tag]}\n{seq}\n")
                     n_sequences_written += 1
 
-            fh_rep.write(f"{sample}\t{len(variants)}\t{';'.join(all_tags)}\n")
+            fh_rep.write(f"{sample}\t{len(variants)}\t{len(run_nums)}/{n_runs}\t"
+                         f"{_compress_ranges(run_nums)}\n")
 
     return {
         "n_samples": n_samples,

@@ -29,12 +29,17 @@ want to vary.
 **Start batch**. Each combination runs as a normal analysis in its own
 `ont-barcoder_*_conv` folder — nothing about a single run changes.
 
-4- Once every combination finishes, the tool merges all the
-`consensus_filtered.fa` files into one `unique_consensus_filtered.fasta`
-inside the batch's own output folder: a sample whose sequence is identical
-in every run appears once, a sample with different sequences across runs
-gets one entry per variant (header tagged with the run folder that produced
-it), plus a `batch_dedup_report.tsv` summary.
+4- Once every combination finishes, the tool writes three files to the
+batch's own output folder, all identifying runs by a short run number
+(1, 2, 3…) instead of the full timestamped folder name:
+- `batch_run_summary.tsv` — one row per analysis: parameters used and how
+  many sequences its `consensus_filtered.fa` produced.
+- `unique_consensus_filtered.fasta` — every run's `consensus_filtered.fa`
+  merged: a sample whose sequence is identical in every run appears once, a
+  sample with different sequences across runs gets one entry per variant
+  (header tagged `;run3`).
+- `batch_dedup_report.tsv` — one row per sample: how many variants, in how
+  many runs, and which run numbers (compressed as ranges, e.g. `1-12,15`).
 
 5- BLAST and Best Sequence stay manual steps — run them afterwards on that
 merged FASTA to pick the best sequence per sample.

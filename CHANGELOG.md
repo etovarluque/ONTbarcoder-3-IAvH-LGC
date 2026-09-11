@@ -52,20 +52,35 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   from a manual run except for how it was launched. A batch of more than 15
   combinations shows a visible warning (each one is a full analysis); above
   200 the app asks for confirmation before starting anything.
-- Once every combination finishes (or the batch is stopped), the
-  `consensus_filtered.fa` of every completed run is merged into a single
-  `unique_consensus_filtered.fasta` plus a `batch_dedup_report.tsv`, inside the
-  batch's own output folder: a sample whose sequence is identical in every run
-  appears once; a sample with different sequences across runs gets one entry
-  per distinct variant, header tagged with the run folder that produced it
-  (`;20260910_103536_conv`). BLAST and Best Sequence stay manual steps, run
-  afterwards on that merged FASTA — Best Sequence already picks the best
-  variant per sample when there is more than one candidate.
+- Once every combination finishes (or the batch is stopped), three files are
+  written to the batch's own output folder, all identifying runs by a short
+  run number (1, 2, 3…, run order) instead of the full timestamped folder
+  name — readable even for a 40+-combination sweep:
+  - `batch_run_summary.tsv` — one row **per analysis**: the parameters
+    overridden for that combination and how many sequences its own
+    `consensus_filtered.fa` produced.
+  - `unique_consensus_filtered.fasta` — every completed run's
+    `consensus_filtered.fa` merged into one FASTA: a sample whose sequence is
+    identical in every run appears once; a sample with different sequences
+    across runs gets one entry per distinct variant, header suffixed with the
+    run number that produced it (`;run3`).
+  - `batch_dedup_report.tsv` — one row per sample: how many distinct variants,
+    in how many runs (`N_runs_present`, e.g. `18/40`), and which run numbers
+    (`Runs`, compressed as ranges, e.g. `1-12,15,20-24`) — cross-referenced
+    against `batch_run_summary.tsv` for their parameters.
+
+  BLAST and Best Sequence stay manual steps, run afterwards on the merged
+  FASTA — Best Sequence already picks the best variant per sample when there
+  is more than one candidate.
 - Two progress bars track the batch: combinations completed (`i/N`) and the
   current combination's own phase progress (0-100 %, equal weight per active
   phase), the latter driven by a new `ProgressPanel.overallProgressChanged`
   signal so it updates live even though the Progress panel itself stays off
-  screen during a batch.
+  screen during a batch. The per-combination bar is clamped to be monotonic
+  within a run: some phases restart their own sub-progress mid-phase (e.g.
+  phase 1 moving from demultiplexing into file merging, or phase 2a starting
+  a new coverage level), which would otherwise make the overall % briefly
+  jump backwards.
 - Stopping is handled the same way regardless of how it happens: the panel's
   own **Stop** finishes the running combination cleanly before stopping;
   stopping from the Analysis panel's own Stop button, resetting the analysis,

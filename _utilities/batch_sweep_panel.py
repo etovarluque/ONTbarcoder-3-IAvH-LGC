@@ -325,13 +325,23 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._last_outdir = summary.get("outdir", "")
         if self._last_outdir and os.path.isdir(self._last_outdir):
             self._open_folder_btn.show()
-        self.append_log(
-            f"\n✓ Batch completed — {summary.get('n_runs', 0)} run(s), "
-            f"{summary.get('n_samples', 0)} sample(s), "
-            f"{summary.get('n_with_variants', 0)} with more than one variant, "
-            f"{summary.get('n_sequences_written', 0)} sequence(s) written to "
-            f"unique_consensus_filtered.fasta"
-        )
+
+        lines = [f"\n✓ Batch completed — {summary.get('n_runs', 0)} run(s)."]
+        if "n_filt_min" in summary:
+            lo, hi = summary["n_filt_min"], summary["n_filt_max"]
+            rng = f"{lo}" if lo == hi else f"{lo}–{hi}"
+            lines.append(
+                f"  consensus_filtered.fa per run: {rng} barcode(s) — "
+                f"see batch_run_summary.tsv for the per-run parameters/count.")
+        if "n_samples" in summary:
+            lines.append(
+                f"  Deduplication across runs: {summary.get('n_samples', 0)} unique sample(s) "
+                f"total, {summary.get('n_collapsed', 0)} with the same sequence in every run "
+                f"they appear in, {summary.get('n_with_variants', 0)} with 2+ distinct "
+                f"sequences across runs -> {summary.get('n_sequences_written', 0)} sequence(s) "
+                f"written to unique_consensus_filtered.fasta "
+                f"(see batch_dedup_report.tsv for the per-sample breakdown).")
+        self.append_log("\n".join(lines))
 
     def on_error(self, msg: str):
         self.set_running(False)

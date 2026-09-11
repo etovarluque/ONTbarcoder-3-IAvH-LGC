@@ -1574,19 +1574,29 @@ GUI spinboxes, not as a 0–1 fraction.</p>
       combination currently running (its own phase-by-phase progress, 0–100&nbsp;%).</li>
 </ol>
 
-<h4>16.4 Output — deduplicated FASTA</h4>
-<p>Once every combination finishes (or the batch is stopped), the
-<code>consensus_filtered.fa</code> of every completed run is merged into the batch's own
-output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_batch/</code>):</p>
+<h4>16.4 Output — per-run summary and deduplicated FASTA</h4>
+<p>Once every combination finishes (or the batch is stopped), three files are written to
+the batch's own output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_batch/</code>).
+Runs are identified by a short <b>run number</b> (1, 2, 3…, in the order they ran) rather
+than by their timestamped folder name — the same number is used consistently across all
+three files, and keeps things readable even for a sweep of 40+ combinations:</p>
 <ul>
-  <li><code>unique_consensus_filtered.fasta</code> — a sample whose sequence is
-      identical in every run that produced it appears <b>once</b>, header untouched. A
-      sample with different sequences across runs gets <b>one entry per distinct
-      variant</b>, header suffixed with the run folder that produced it
-      (<code>;20260910_103536_conv</code>).</li>
-  <li><code>batch_dedup_report.tsv</code> — one row per sample: how many distinct
-      variants were found and which run folders they came from, so you can see at a
-      glance which samples are worth a closer look before BLASTing.</li>
+  <li><code>batch_run_summary.tsv</code> — one row <b>per analysis</b>: run number, output
+      folder, the exact parameters overridden for that combination, and how many
+      sequences its own <code>consensus_filtered.fa</code> produced
+      (<code>N_consensus_filtered</code>). The quickest way to see which combinations
+      yielded more/fewer barcodes without opening each run folder.</li>
+  <li><code>unique_consensus_filtered.fasta</code> — the <code>consensus_filtered.fa</code>
+      of every completed run merged into one FASTA. A sample whose sequence is identical
+      in every run that produced it appears <b>once</b>, header untouched. A sample with
+      different sequences across runs gets <b>one entry per distinct variant</b>, header
+      suffixed with the run number that produced it (<code>;run3</code>).</li>
+  <li><code>batch_dedup_report.tsv</code> — one row per sample: <code>N_variants</code>
+      (how many distinct sequences it had across the sweep), <code>N_runs_present</code>
+      (e.g. <code>18/40</code>) and <code>Runs</code> — the run numbers it appeared in,
+      written as compressed ranges (e.g. <code>1-12,15,20-24</code>) so the column stays
+      short even when a sample is present in most runs of a large sweep. Cross-reference
+      a run number against <code>batch_run_summary.tsv</code> for its parameters.</li>
 </ul>
 <p>BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
 stay manual steps, run afterwards on that merged FASTA — remote BLAST is rate-limited

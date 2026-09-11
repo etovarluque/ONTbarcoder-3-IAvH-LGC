@@ -3683,6 +3683,12 @@ class ProgressPanel(QtWidgets.QWidget):
         # panel isn't the active QStackedWidget page (e.g. during a
         # Parameter Batch run, where Progress is never switched to).
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
+        # Highest overall % emitted since the last reset(). Some phases
+        # (e.g. "1" moving from demultiplexing into file merging, or "2a"
+        # restarting per coverage level) reset their own bar back to 0
+        # mid-phase, which would otherwise make the overall % briefly go
+        # backwards; clamp emissions to be monotonic within a run instead.
+        self._max_overall_pct = 0
         for pid, pname in self.PHASES:
             row = PhaseRow(pid, pname)
             self._layout.addWidget(row)
@@ -3813,6 +3819,7 @@ class ProgressPanel(QtWidgets.QWidget):
             row.set_progress(0, 0)
             row.setVisible(True)   # all visible until configured_phases filters them out
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
+        self._max_overall_pct = 0
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
@@ -3840,6 +3847,7 @@ class ProgressPanel(QtWidgets.QWidget):
             row.set_progress(0, 0)
             row.setVisible(True)
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
+        self._max_overall_pct = 0
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
@@ -3937,12 +3945,19 @@ class ProgressPanel(QtWidgets.QWidget):
                 if self._phase_rows[pid].property("state") not in ("done", "current"):
                     self._phase_rows[pid].set_state("pending")
         self._phase_lbl.setText(f"Phase {phase_id} · {detail}" if detail else f"Phase {phase_id}")
-        self.overallProgressChanged.emit(self._compute_overall_percent())
+        self._emit_overall_progress()
 
     def update_phase_progress(self, phase_id, value, total, extra=""):
         if phase_id in self._phase_rows:
             self._phase_rows[phase_id].set_progress(value, total, extra)
-            self.overallProgressChanged.emit(self._compute_overall_percent())
+            self._emit_overall_progress()
+
+    def _emit_overall_progress(self):
+        """Computes and emits the overall %, clamped to never go backwards
+        within the current run (see _max_overall_pct)."""
+        pct = max(self._compute_overall_percent(), self._max_overall_pct)
+        self._max_overall_pct = pct
+        self.overallProgressChanged.emit(pct)
 
     def _compute_overall_percent(self) -> int:
         """Rough progress (0-100) of the run in progress: equal weight per
@@ -3967,7 +3982,7 @@ class ProgressPanel(QtWidgets.QWidget):
     def mark_phase_done(self, phase_id, detail=""):
         if phase_id in self._phase_rows:
             self._phase_rows[phase_id].set_state("done", detail)
-            self.overallProgressChanged.emit(self._compute_overall_percent())
+            self._emit_overall_progress()
 
     def get_ok_value(self) -> int:
         try:
@@ -5911,6 +5926,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_queue = combos
         self._batch_index = 0
         self._batch_run_folders = []
+        self._batch_run_meta = {}   # folder tag -> {"label": combo_label, "n_filt": int|None}
+        self._batch_current_tag = None
         self._batch_stop_requested = False
         self._batch_running = True
 
@@ -5987,7 +6004,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stopped = False
         self._analysis_active = True
         self._run_start = time.time()
-        self._batch_run_folders.append((outpath, folder_name[len("ont-barcoder_"):]))
+        tag = folder_name[len("ont-barcoder_"):]
+        self._batch_run_folders.append((outpath, tag))
+        self._batch_run_meta[tag] = {"label": combo_label(combo), "n_filt": None}
+        self._batch_current_tag = tag
 
         self._panel_progress.reset()
         n = len(self._batch_queue)
@@ -6015,6 +6035,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self._panel_batch_sweep.append_log(
             f"    done — consensus_filtered.fa: {n_filt} barcode(s)")
+        if self._batch_current_tag in self._batch_run_meta:
+            self._batch_run_meta[self._batch_current_tag]["n_filt"] = n_filt
         self._batch_index += 1
         self._run_next_batch_combo()
 
@@ -6056,6 +6078,26 @@ class MainWindow(QtWidgets.QMainWindow):
         n_runs = len(self._batch_run_folders)
         summary = {"outdir": self._batch_outdir, "n_runs": n_runs}
         if n_runs:
+            # Per-run breakdown: parameters + consensus_filtered.fa sequence count,
+            # one row per analysis — clearer than digging through the log.
+            run_summary_path = os.path.join(self._batch_outdir, "batch_run_summary.tsv")
+            try:
+                with open(run_summary_path, "w", encoding="utf-8") as fh:
+                    fh.write("Run\tFolder\tParameters\tN_consensus_filtered\n")
+                    for i, (_outpath, tag) in enumerate(self._batch_run_folders, start=1):
+                        meta = self._batch_run_meta.get(tag, {})
+                        n_filt = meta.get("n_filt")
+                        fh.write(f"{i}\t{tag}\t{meta.get('label', '')}\t"
+                                 f"{n_filt if n_filt is not None else ''}\n")
+            except OSError as e:
+                self._panel_batch_sweep.append_log(f"  Warning: could not write run summary: {e}")
+
+            n_filts = [m["n_filt"] for m in self._batch_run_meta.values()
+                       if m.get("n_filt") is not None]
+            if n_filts:
+                summary["n_filt_min"] = min(n_filts)
+                summary["n_filt_max"] = max(n_filts)
+
             out_fasta = os.path.join(self._batch_outdir, "unique_consensus_filtered.fasta")
             out_report = os.path.join(self._batch_outdir, "batch_dedup_report.tsv")
             try:
