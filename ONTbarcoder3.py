@@ -2695,11 +2695,12 @@ class ParamsPanel(BasePanel):
         self.p_resolve_secfrac.setToolTip(_tip_rsec)
 
         _tip_rtol = (
-            "Variant tolerance: maximum percentage of the diagnostic (polymorphic) "
-            "sites at which two reads of the SAME haplotype may disagree — due to "
-            "sequencing error or intrinsic variation — before they are split into "
-            "separate variants. Lower = stricter (more clusters); higher = lumps "
-            "more reads together. Default 10%.")
+            "Variant tolerance: maximum percentage of the diagnostic\n"
+            "(polymorphic) sites at which two reads of the SAME haplotype\n"
+            "may disagree — due to sequencing error or intrinsic variation\n"
+            "— before they are split into separate variants. Lower =\n"
+            "stricter (more clusters); higher = lumps more reads together.\n"
+            "Default 10%.")
         self.p_resolve_tol = _spin(0, 40, self._defaults["resolve_variant_tol"])
         self.p_resolve_tol.setToolTip(_tip_rtol)
         self._resolve_grid = _grid(
