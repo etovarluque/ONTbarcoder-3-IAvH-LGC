@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import csv
 import time
 import datetime
 import threading
@@ -7,6 +8,10 @@ from typing import Dict, List, Optional, Tuple
 from PyQt5 import QtCore, QtGui, QtWidgets
 from .shared import *
 from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
+from .best_seq_panel import (
+    _RefDropZone, read_tax_reference, QUERY_TAX_COLUMNS,
+    sample_id_of, lookup_tax, concordance_level, display_taxon,
+)
 
 
 
@@ -89,13 +94,419 @@ def fasta_lengths(path):
     return lengths
 
 
+# Subject_* (BLAST hit) taxonomy columns, compared against QUERY_TAX_COLUMNS
+# to compute how deep the two agree — see apply_reference_and_tax_match().
+_SUBJECT_TAX_COLUMNS = ("Subject_Order", "Subject_Family", "Subject_Genus", "Subject_organism")
+_TAX_RANK_KEYS = ("order", "family", "genus", "organism")
+
+
+def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
+    """Write the Query_* reference-taxonomy columns into *tsv_path* and, when
+    the table also carries Subject_* (hit) taxonomy, append a 'Tax_level_match'
+    column recording the deepest rank at which the two agree — the same rule
+    Best Sequence uses to judge a hit (`concordance_level`).
+
+    Both additions are made in the same read/rewrite pass, rather than as two
+    separate full read-modify-write passes over the file (one to write the
+    Query_* columns, another to add Tax_level_match).
+
+    Returns (rows seen, rows filled from the reference, sample IDs absent from
+    the reference, rows given a Tax_level_match — or -1 if the table has no
+    Subject_* taxonomy to compare against).
+    """
+    with open(tsv_path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        first = fh.readline()
+        fh.seek(0)
+        sep = "\t" if "\t" in first else ","
+        rows = [r for r in csv.reader(fh, delimiter=sep)]
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        raise ValueError(f"Empty BLAST table: {os.path.basename(tsv_path)}")
+
+    headers = [c.strip() for c in rows[0]]
+    if "Query_name" not in headers:
+        raise ValueError(f"{os.path.basename(tsv_path)} has no 'Query_name' column.")
+    q_i = headers.index("Query_name")
+
+    query_idx = {}
+    for name in QUERY_TAX_COLUMNS:
+        if name in headers:
+            query_idx[name] = headers.index(name)
+        else:
+            query_idx[name] = len(headers)
+            headers.append(name)
+
+    has_subject_tax = all(c in headers for c in _SUBJECT_TAX_COLUMNS)
+    subject_idx = ({c: headers.index(c) for c in _SUBJECT_TAX_COLUMNS}
+                   if has_subject_tax else {})
+    if has_subject_tax:
+        headers = headers + ["Tax_level_match"]
+    width = len(headers)
+
+    out = [headers]
+    n_rows = n_filled = n_match = 0
+    unknown = set()
+    for row in rows[1:]:
+        row = list(row) + [""] * (width - len(row))
+        value = row[q_i] if q_i < len(row) else ""
+        if str(value).strip():
+            n_rows += 1
+            sample = sample_id_of(value)
+            tax = lookup_tax(sample, ref, ref_lower)
+            if tax is None:
+                unknown.add(sample)
+                tax = ("", "", "", "")
+            else:
+                n_filled += 1
+            for name, val in zip(QUERY_TAX_COLUMNS, tax):
+                row[query_idx[name]] = val
+        if has_subject_tax:
+            qtax = {k: display_taxon(row[query_idx[c]])
+                    for k, c in zip(_TAX_RANK_KEYS, QUERY_TAX_COLUMNS)}
+            hit = {k: display_taxon(row[subject_idx[c]])
+                   for k, c in zip(_TAX_RANK_KEYS, _SUBJECT_TAX_COLUMNS)}
+            row[-1] = concordance_level(hit, qtax)
+            n_match += 1
+        out.append(row)
+
+    tmp = tsv_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh, delimiter=sep, lineterminator="\n").writerows(out)
+    os.replace(tmp, tsv_path)
+    return n_rows, n_filled, sorted(unknown), (n_match if has_subject_tax else -1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLAST RESULT FILE DROP ZONE
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _BlastFileDropZone(QtWidgets.QFrame):
+    """Drop zone for one or more downloaded NCBI BLAST result files.
+
+    Accepts the Hit Table exported from blast.ncbi.nlm.nih.gov after running a
+    search on the NCBI website ('Download All' → 'Hit Table(text)' or
+    'Hit Table(csv)'), so several jobs can be combined in one run.
+    """
+
+    filesDropped = QtCore.pyqtSignal(list)
+
+    _SUPPORTED_EXT = (".txt", ".csv")
+    _EMPTY_H = 160
+    _ROW_H   = 40
+    _CHROME  = 140
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("drop_zone")
+        self.setAcceptDrops(True)
+        self.setFixedHeight(self._EMPTY_H)
+        self._files: List[str] = []
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
+
+        self._lbl_src_empty  = "Drag/Add BLAST result files here (.txt, .csv)"
+        self._lbl_src_filled = "Result files"
+        self._lbl = make_label(self._lbl_src_empty, size=18, color=TEXT_SEC)
+        self._lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self._lbl.setToolTip(
+            "Drop the Hit Table exported from blast.ncbi.nlm.nih.gov after running\n"
+            "a search on the NCBI website: 'Download All' → 'Hit Table(text)' or\n"
+            "'Hit Table(csv)'. You can drop more than one file at a time."
+        )
+
+        self._files_container = QtWidgets.QWidget()
+        self._files_layout = QtWidgets.QVBoxLayout(self._files_container)
+        self._files_layout.setContentsMargins(0, 0, 0, 0)
+        self._files_layout.setSpacing(6)
+        self._files_container.hide()
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout.setSpacing(8)
+        btn_layout.setAlignment(QtCore.Qt.AlignCenter)
+        self._browse_btn = QtWidgets.QPushButton("Add")
+        self._browse_btn.setObjectName("secondary_btn")
+        self._browse_btn.setFixedWidth(130)
+        self._browse_btn.clicked.connect(self._browse_files)
+        self._clear_btn = QtWidgets.QPushButton("Clear")
+        self._clear_btn.setObjectName("danger_btn")
+        self._clear_btn.setFixedWidth(130)
+        self._clear_btn.clicked.connect(self.clear)
+        self._clear_btn.hide()
+        btn_layout.addWidget(self._browse_btn)
+        btn_layout.addWidget(self._clear_btn)
+
+        _exp = QtWidgets.QSizePolicy
+        self._top_spacer = QtWidgets.QSpacerItem(0, 0, _exp.Minimum, _exp.Expanding)
+        self._bot_spacer = QtWidgets.QSpacerItem(0, 0, _exp.Minimum, _exp.Expanding)
+        layout.addSpacerItem(self._top_spacer)
+        layout.addWidget(self._lbl)
+        layout.addWidget(self._files_container)
+        layout.addLayout(btn_layout)
+        layout.addSpacerItem(self._bot_spacer)
+
+    @property
+    def files(self):
+        return self._files
+
+    def retranslateUi(self):
+        ctx = "BlastFileDropZone"
+        self._browse_btn.setText(_tr(ctx, "Add"))
+        self._clear_btn.setText(_tr(ctx, "Clear"))
+        if not self._files:
+            self._lbl.setText(_tr(ctx, self._lbl_src_empty))
+        else:
+            self._lbl.setText(
+                f"{_tr(ctx, self._lbl_src_filled)} ({len(self._files)} file(s))"
+            )
+
+    def changeEvent(self, event):
+        if event.type() == QtCore.QEvent.LanguageChange:
+            self.retranslateUi()
+        super().changeEvent(event)
+
+    def _create_file_row(self, filepath):
+        row = QtWidgets.QWidget()
+        row.setObjectName("file_row")
+        row.setStyleSheet(f"""
+            QWidget#file_row {{
+                background-color: {GRAY_BG};
+                border-radius: 7px;
+                border: 1px solid {GRAY_LINE};
+            }}
+        """)
+        row.setToolTip(filepath)
+        rl = QtWidgets.QHBoxLayout(row)
+        rl.setContentsMargins(12, 6, 10, 6)
+        rl.setSpacing(10)
+        icon = make_label("📄", size=15)
+        icon.setFixedWidth(24)
+        name = make_label(os.path.basename(filepath), size=15, color=TEXT_PRI)
+        remove_btn = QtWidgets.QPushButton("✕")
+        remove_btn.setFixedSize(26, 26)
+        remove_btn.setToolTip("Remove file")
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{ background-color: transparent; color:{TEXT_HINT};
+                border:none; border-radius:5px; font-size:13px; font-weight:bold; }}
+            QPushButton:hover {{ background-color:{RED_LT}; color:{RED}; }}
+        """)
+        remove_btn.clicked.connect(lambda checked=False, f=filepath: self._remove(f))
+        rl.addWidget(icon)
+        rl.addWidget(name, 1)
+        rl.addWidget(remove_btn)
+        return row
+
+    def _update_display(self):
+        n = len(self._files)
+        while self._files_layout.count() > 0:
+            item = self._files_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        if n == 0:
+            self._files_container.hide()
+            self._clear_btn.hide()
+            self._lbl.setText(_tr("BlastFileDropZone", self._lbl_src_empty))
+            self.setFixedHeight(self._EMPTY_H)
+            self.setProperty("filled", "false")
+        else:
+            for f in self._files:
+                self._files_layout.addWidget(self._create_file_row(f))
+            self._files_container.show()
+            self._clear_btn.show()
+            self._lbl.setText(
+                f"{_tr('BlastFileDropZone', self._lbl_src_filled)} ({n} file(s))"
+            )
+            self.setFixedHeight(self._CHROME + n * self._ROW_H)
+            self.setProperty("filled", "true")
+        refresh_style(self)
+
+    def _add_files(self, paths):
+        added = 0
+        for p in paths:
+            if p not in self._files:
+                self._files.append(p)
+                added += 1
+        if added:
+            self._update_display()
+            self.filesDropped.emit(self._files.copy())
+
+    def _remove(self, filepath):
+        if filepath in self._files:
+            self._files.remove(filepath)
+            self._update_display()
+            self.filesDropped.emit(self._files.copy())
+
+    def clear(self):
+        self._files = []
+        self._update_display()
+        self.filesDropped.emit([])
+
+    def _browse_files(self):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, _tr("BlastFileDropZone", "Select BLAST result files"), "",
+            "BLAST hit table (*.txt *.csv);;All (*)"
+        )
+        if files:
+            self._add_files(files)
+
+    def _dropped_paths(self, mime) -> List[str]:
+        paths = [u.toLocalFile() for u in mime.urls()]
+        return [p for p in paths
+                if p and p.lower().endswith(self._SUPPORTED_EXT)]
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self.setProperty("dragging", "true")
+            refresh_style(self)
+
+    def dragLeaveEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+
+    def dropEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+        paths = self._dropped_paths(e.mimeData())
+        if paths:
+            self._add_files(paths)
+
+
+class _ReferenceFileGroup:
+    """The optional 'query taxonomy reference file' control: a checkbox, a
+    _RefDropZone and a description/validation label, together with the
+    toggle/describe/validate logic that goes with them.
+
+    Both BLAST tabs offer this exact feature (add Query_Order/Query_Family/
+    Query_Genus/Query_organism from a reference list, the same way Best
+    Sequence does), so it is built once here and used twice — one instance
+    per tab — instead of duplicating the widgets and their logic in each.
+    """
+
+    def __init__(self):
+        self.check = QtWidgets.QCheckBox(
+            "I have a reference file with the query taxonomy")
+        self.check.setToolTip(
+            "Adds Query_Order / Query_Family / Query_Genus / Query_organism to the\n"
+            "results table from a single reference list, keyed by the sample ID\n"
+            "(the text before the first ';' in the query name)."
+        )
+        self.check.toggled.connect(self._on_toggled)
+
+        self.zone = _RefDropZone()
+        self.zone.fileChanged.connect(self._on_file_changed)
+        self.zone.hide()
+
+        self.info_label = QtWidgets.QLabel("")
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+        self.info_label.hide()
+
+        self.ok = False
+        self._describe()   # seed the hint text shown before any file is set
+
+    def add_to(self, form: QtWidgets.QFormLayout):
+        """Add the three rows to a QFormLayout, in the order they're meant to appear."""
+        form.addRow(self.check)
+        form.addRow(self.zone)
+        form.addRow(self.info_label)
+
+    @property
+    def checked(self) -> bool:
+        return self.check.isChecked()
+
+    @property
+    def path(self) -> str:
+        """The reference file path, or '' when the checkbox is off."""
+        return self.zone.path if self.checked else ""
+
+    def _on_toggled(self, checked: bool):
+        self.zone.setVisible(checked)
+        self.info_label.setVisible(checked)
+        self._describe()
+
+    def _on_file_changed(self, _path: str):
+        self._describe()
+
+    def _describe(self):
+        """Validate the reference file and describe how it will be read."""
+        self.ok = False
+        path = self.zone.path
+        if not path:
+            self.info_label.setText(
+                "The identifier must be the same sample ID as in the query name "
+                "(the text before the first ';'). The <b>4 columns following it</b> "
+                "are read, in this order, as <b>Order, Family, Genus and Organism</b>."
+            )
+            self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+            return
+        try:
+            id_col, tax_cols, table = read_tax_reference(path)
+        except Exception as exc:
+            self.info_label.setText(f"⚠  {exc}")
+            self.info_label.setStyleSheet(f"color:{RED}; font-size:14px;")
+            return
+        self.ok = True
+        self.info_label.setText(
+            f"{len(table):,} entries  ·  identifier: <b>{id_col}</b>  ·  "
+            f"<b>{' · '.join(tax_cols)}</b> → Query_Order · Query_Family · "
+            f"Query_Genus · Query_organism.<br>"
+            f"These columns will be added to the results table."
+        )
+        self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+
+    def validate_or_warn(self, parent: QtWidgets.QWidget) -> bool:
+        """True if the run may proceed; warns and returns False when the
+        checkbox is on but no valid reference file has been supplied."""
+        if self.checked and not self.ok:
+            QtWidgets.QMessageBox.warning(
+                parent, "Reference file",
+                "Add a valid query taxonomy reference file, or uncheck "
+                "'I have a reference file with the query taxonomy'."
+            )
+            return False
+        return True
+
+    def retranslateUi(self, ctx: str):
+        self.check.setText(_tr(ctx, "I have a reference file with the query taxonomy"))
+        self.zone.retranslateUi()
+        self._describe()
+
+
+class _FullWidthTabBar(QtWidgets.QTabBar):
+    """Tab bar that always splits the full width of the tab widget evenly
+    across its tabs, instead of leaving them hugging their own text."""
+
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        bar_width = self.width()
+        if bar_width <= 0:
+            return size
+        count = max(self.count(), 1)
+        return QtCore.QSize(bar_width // count, size.height())
+
+
+class _FullWidthTabWidget(QtWidgets.QTabWidget):
+    """QTabWidget whose tab bar is forced to the widget's own width on every
+    resize, so _FullWidthTabBar has the full width to split across tabs
+    (QTabWidget otherwise only ever sizes the bar to its tabs' own hints)."""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        bar = self.tabBar()
+        bar.resize(self.width(), bar.sizeHint().height())
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # BLAST PANEL
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BlastPanel(QtWidgets.QWidget):
-    blastRequested = QtCore.pyqtSignal(list, dict)   # files, config dict
-    stopRequested  = QtCore.pyqtSignal()             # user clicked Stop
+    blastRequested     = QtCore.pyqtSignal(list, dict)   # files, config dict
+    stopRequested      = QtCore.pyqtSignal()             # user clicked Stop (tab 1)
+    blastFileRequested = QtCore.pyqtSignal(list, dict)   # result files, config dict (tab 2)
+    stopFileRequested  = QtCore.pyqtSignal()             # user clicked Stop (tab 2)
 
     _DATABASES        = ["core_nt", "nt", "refseq_rna", "16S_ribosomal_RNA"]
     _PROGRAMS         = ["blastn&MEGABLAST=on", "blastn", "megablast"]
@@ -103,11 +514,17 @@ class BlastPanel(QtWidgets.QWidget):
 
     # Live-log slot keys (fixed lines, updated in place)
     _SLOT_KEYS = ("info", "blast", "organism", "taxonomy", "progress", "result")
+    # Same shape for tab 2 (file parsing), "blast" slot relabelled to "parse"
+    _FILE_SLOT_KEYS = ("info", "parse", "organism", "taxonomy", "progress", "result")
 
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        outer_layout = QtWidgets.QVBoxLayout(self)
+        # Page 1 ("BLAST API Search") holds everything this panel used to be,
+        # unchanged, so behaviour and layout for the live NCBI search stay
+        # identical to before the tab was introduced.
+        self._page1 = QtWidgets.QWidget()
+        outer_layout = QtWidgets.QVBoxLayout(self._page1)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
@@ -123,7 +540,7 @@ class BlastPanel(QtWidgets.QWidget):
         outer_layout.addWidget(scroll, 0)   # scroll takes only what content needs
 
         # ── Title + description ──
-        self._lbl_title = make_label("BLAST NCBI Search", size=19, bold=True)
+        self._lbl_title = make_label("BLAST API Search", size=19, bold=True)
         self._lbl_desc = make_label(
             "BLAST sequences in NCBI. "
             "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta).\n"
@@ -220,7 +637,7 @@ class BlastPanel(QtWidgets.QWidget):
         # IP moved to the slow queue.
         self._batch_mode = QtWidgets.QComboBox()
         self._batch_mode.addItems(["Automatic", "Manual"])
-        self._batch_mode.setFixedWidth(130)
+        self._batch_mode.setFixedWidth(140)
         self._batch_mode.currentIndexChanged.connect(self._on_batch_mode)
         bl2.addWidget(self._batch_mode)
 
@@ -265,6 +682,12 @@ class BlastPanel(QtWidgets.QWidget):
         self._tax_check.setChecked(True)
         self._lbl_tax = QtWidgets.QLabel("Taxonomy lookup:")
         sg.addRow(self._lbl_tax, self._tax_check)
+
+        # ── Optional query-taxonomy reference file ──
+        # Adds Query_Order/Query_Family/Query_Genus/Query_organism to every hit
+        # row, exactly like the Best Sequence utility does for its own tables.
+        self._ref_group = _ReferenceFileGroup()
+        self._ref_group.add_to(sg)
 
         self._layout.addWidget(self._settings_box)
 
@@ -362,12 +785,26 @@ class BlastPanel(QtWidgets.QWidget):
         self._last_outdir = ""
         self._last_tsv    = ""
 
+        # ── Page 2: parse local NCBI web-BLAST result files ──
+        self._page2 = self._build_file_tab()
+
+        self._tabs = _FullWidthTabWidget()
+        self._tabs.setTabBar(_FullWidthTabBar())
+        self._tabs.addTab(self._page1, "BLAST API Search")
+        self._tabs.addTab(self._page2, "BLAST web results")
+
+        root_layout = QtWidgets.QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._tabs)
+
         self.installEventFilter(self)
-    
+
     def eventFilter(self, obj, event):
         """Detect when the panel is resized to adjust the log height."""
         if obj == self and event.type() == QtCore.QEvent.Resize:
             self._adjust_log_height()
+            self._adjust_file_log_height()
         return super().eventFilter(obj, event)
 
     def _adjust_log_height(self):
@@ -377,11 +814,12 @@ class BlastPanel(QtWidgets.QWidget):
             # Enforce minimum height
             target_height = max(target_height, 200)
             self._log.setFixedHeight(target_height)
-    
+
     def showEvent(self, event):
         """Cuando el panel se muestra por primera vez."""
         super().showEvent(event)
         self._adjust_log_height()
+        self._adjust_file_log_height()
 
     # ── Batch planning ───────────────────────────────────────────
 
@@ -560,7 +998,7 @@ class BlastPanel(QtWidgets.QWidget):
 
     def retranslateUi(self):
         ctx = "BlastPanel"
-        self._lbl_title.setText(_tr(ctx, "BLAST NCBI Search"))
+        self._lbl_title.setText(_tr(ctx, "BLAST API Search"))
         self._lbl_desc.setText(_tr(ctx,
             "BLAST multiFASTA sequences against NCBI. "
             "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta). "
@@ -585,11 +1023,38 @@ class BlastPanel(QtWidgets.QWidget):
         self._update_batch_plan()
         self._lbl_tax.setText(_tr(ctx, "Taxonomy lookup:"))
         self._tax_check.setText(_tr(ctx, "Fetch organism + taxonomy"))
+        self._ref_group.retranslateUi(ctx)
         self._clear_btn.setText(_tr(ctx, "Clear"))
         self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
         self._open_results_btn.setText(_tr(ctx, "Open results  📄"))
         self._blast_btn.setText(_tr(ctx, "Run BLAST  →"))
         self._drop.retranslateUi()
+
+        self._tabs.setTabText(0, _tr(ctx, "BLAST API Search"))
+        self._tabs.setTabText(1, _tr(ctx, "BLAST web results"))
+
+        self._file_lbl_title.setText(_tr(ctx, "BLAST Web Results"))
+        self._file_lbl_desc.setText(_tr(ctx,
+            "Parse a Hit Table already downloaded from blast.ncbi.nlm.nih.gov "
+            "(website BLAST → Download All → 'Hit Table(text)' or 'Hit Table(csv)'), "
+            "instead of submitting a new search — useful when NCBI has throttled this "
+            "IP. The same per-query hit selection and organism/taxonomy lookup as "
+            "'BLAST API Search' are applied, without a new BLAST search.\n"
+            "No FASTA of queried sequences is produced (the file has no sequences, "
+            "only hits), so the table cannot be paired in Best Sequence unless you "
+            "already have a matching FASTA under the same base name."))
+        self._file_settings_box.setTitle(_tr(ctx, "BLAST File Settings"))
+        self._file_lbl_hits.setText(_tr(ctx, "Hits per sequence to keep (1–100):"))
+        self._file_lbl_tax.setText(_tr(ctx, "Taxonomy lookup:"))
+        self._file_tax_check.setText(_tr(ctx, "Fetch organism + taxonomy"))
+        self._file_lbl_api_note.setText(_tr(ctx,
+            "Uses the NCBI API key configured in the 'BLAST API Search' tab."))
+        self._file_ref_group.retranslateUi(ctx)
+        self._file_clear_btn.setText(_tr(ctx, "Clear"))
+        self._file_open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
+        self._file_open_results_btn.setText(_tr(ctx, "Open results  📄"))
+        self._file_run_btn.setText(_tr(ctx, "Parse results  →"))
+        self._file_drop.retranslateUi()
 
     def changeEvent(self, event):
         if event.type() == QtCore.QEvent.LanguageChange:
@@ -615,6 +1080,8 @@ class BlastPanel(QtWidgets.QWidget):
         self._update_batch_plan()
 
     def _emit_blast(self):
+        if not self._ref_group.validate_or_warn(self):
+            return
         cfg = {
             "api_key":        self._api_key_edit.text().strip(),
             "database":       self._DATABASES[self._db_combo.currentIndex()],
@@ -622,6 +1089,7 @@ class BlastPanel(QtWidgets.QWidget):
             "nhits":          self._hits_spin.value(),
             "nseq":           self._effective_nseq(),
             "fetch_taxonomy": self._tax_check.isChecked(),
+            "tax_reference":  self._ref_group.path,
         }
         self.blastRequested.emit(list(self._drop.files), cfg)
 
@@ -747,6 +1215,327 @@ class BlastPanel(QtWidgets.QWidget):
                 f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
                 f"QPushButton:hover {{ background-color: #0C4A82; }}"
             )
+
+
+    # ── Tab 2: parse local NCBI BLAST result files ──────────────────────────
+
+    def _build_file_tab(self):
+        page = QtWidgets.QWidget()
+        outer_layout = QtWidgets.QVBoxLayout(page)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+
+        inner = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(inner)
+        lay.setContentsMargins(20, 20, 20, 8)
+        lay.setSpacing(14)
+        scroll.setWidget(inner)
+        outer_layout.addWidget(scroll, 0)
+
+        # ── Title + description ──
+        self._file_lbl_title = make_label("BLAST Web Results", size=19, bold=True)
+        self._file_lbl_desc = make_label(
+            "Parse a Hit Table already downloaded from blast.ncbi.nlm.nih.gov "
+            "(website BLAST → Download All → 'Hit Table(text)' or 'Hit Table(csv)'), "
+            "instead of submitting a new search — useful when NCBI has throttled this "
+            "IP. The same per-query hit selection and organism/taxonomy lookup as "
+            "'BLAST API Search' are applied, without a new BLAST search.\n"
+            "No FASTA of queried sequences is produced (the file has no sequences, "
+            "only hits), so the table cannot be paired in Best Sequence unless you "
+            "already have a matching FASTA under the same base name.",
+            color=TEXT_SEC
+        )
+        self._file_lbl_desc.setWordWrap(True)
+        lay.addWidget(self._file_lbl_title)
+        lay.addWidget(self._file_lbl_desc)
+
+        # ── Settings group ──
+        self._file_settings_box = QtWidgets.QGroupBox("BLAST File Settings")
+        self._file_settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        sg = QtWidgets.QFormLayout(self._file_settings_box)
+        sg.setLabelAlignment(QtCore.Qt.AlignRight)
+        sg.setSpacing(10)
+        sg.setContentsMargins(16, 16, 16, 16)
+
+        hits_row = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(hits_row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        self._file_hits_spin = QtWidgets.QSpinBox()
+        self._file_hits_spin.setRange(1, 100)
+        self._file_hits_spin.setValue(5)
+        self._file_hits_spin.setFixedWidth(80)
+        self._file_hits_spin.setToolTip(
+            "Keeps only the top N hits per query, as ranked in the file. If a query\n"
+            "has fewer hits than this in the file, all of them are kept."
+        )
+        hl.addWidget(self._file_hits_spin)
+        hl.addStretch()
+        self._file_lbl_hits = QtWidgets.QLabel("Hits per sequence to keep (1–100):")
+        sg.addRow(self._file_lbl_hits, hits_row)
+
+        self._file_tax_check = QtWidgets.QCheckBox("Fetch organism + taxonomic classification")
+        self._file_tax_check.setChecked(True)
+        self._file_lbl_tax = QtWidgets.QLabel("Taxonomy lookup:")
+        sg.addRow(self._file_lbl_tax, self._file_tax_check)
+
+        self._file_lbl_api_note = QtWidgets.QLabel(
+            "Uses the NCBI API key configured in the 'BLAST API Search' tab."
+        )
+        self._file_lbl_api_note.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+        sg.addRow("", self._file_lbl_api_note)
+
+        # ── Optional query-taxonomy reference file ──
+        self._file_ref_group = _ReferenceFileGroup()
+        self._file_ref_group.add_to(sg)
+
+        lay.addWidget(self._file_settings_box)
+
+        # ── Drop zone ──
+        self._file_drop = _BlastFileDropZone()
+        self._file_drop.filesDropped.connect(self._on_file_files)
+        lay.addWidget(self._file_drop)
+        lay.addStretch()
+
+        # ── Live progress display ──
+        self._file_log_slots = {k: "" for k in self._FILE_SLOT_KEYS}
+        self._file_log = QtWidgets.QPlainTextEdit()
+        self._file_log.setReadOnly(True)
+        self._file_log.setFont(QtGui.QFont("Consolas", 9))
+        self._file_log.setMinimumHeight(200)
+        self._file_log.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self._file_log.setStyleSheet(
+            f"QPlainTextEdit {{ background:{GRAY_BG}; border:1px solid {GRAY_LINE}; "
+            f"border-radius:6px; padding:6px; color:{TEXT_PRI}; margin:0 20px 8px 20px; "
+            f"font-family:'Consolas','Courier New',monospace; }}"
+        )
+        self._file_log.hide()
+        outer_layout.addWidget(self._file_log, 0)
+
+        # ── Elapsed-time timer ──
+        self._file_info_base     = ""
+        self._file_start_time    = 0.0
+        self._file_elapsed_timer = QtCore.QTimer(self)
+        self._file_elapsed_timer.setInterval(1000)
+        self._file_elapsed_timer.timeout.connect(self._tick_file_elapsed)
+
+        # ── Footer ──
+        footer = QtWidgets.QWidget()
+        footer.setObjectName("blast_footer")
+        footer.setStyleSheet(f"""
+            QWidget#blast_footer {{
+                background: {GRAY_CARD};
+                border-top: 1px solid {GRAY_LINE};
+            }}
+        """)
+        fl = QtWidgets.QHBoxLayout(footer)
+        fl.setContentsMargins(20, 10, 20, 10)
+
+        self._file_clear_btn = QtWidgets.QPushButton("Clear")
+        self._file_clear_btn.setObjectName("danger_btn")
+        self._file_clear_btn.setFixedHeight(44)
+        self._file_clear_btn.setFixedWidth(140)
+        self._file_clear_btn.clicked.connect(self._reset_file_tab)
+        fl.addWidget(self._file_clear_btn)
+
+        self._file_open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._file_open_folder_btn.setObjectName("secondary_btn")
+        self._file_open_folder_btn.setFixedHeight(44)
+        self._file_open_folder_btn.hide()
+        self._file_open_folder_btn.clicked.connect(self._open_file_output_folder)
+        fl.addWidget(self._file_open_folder_btn)
+
+        self._file_open_results_btn = QtWidgets.QPushButton("Open results  📄")
+        self._file_open_results_btn.setObjectName("secondary_btn")
+        self._file_open_results_btn.setFixedHeight(44)
+        self._file_open_results_btn.hide()
+        self._file_open_results_btn.clicked.connect(self._open_file_results_file)
+        fl.addWidget(self._file_open_results_btn)
+
+        self._file_stop_btn = QtWidgets.QPushButton("Stop")
+        self._file_stop_btn.setObjectName("danger_btn")
+        self._file_stop_btn.setFixedHeight(44)
+        self._file_stop_btn.setFixedWidth(120)
+        self._file_stop_btn.hide()
+        self._file_stop_btn.clicked.connect(self.stopFileRequested)
+        fl.addWidget(self._file_stop_btn)
+
+        fl.addStretch()
+
+        self._file_run_btn = QtWidgets.QPushButton("Parse results  →")
+        self._file_run_btn.setObjectName("primary_btn")
+        self._file_run_btn.setFixedHeight(44)
+        self._file_run_btn.setFixedWidth(300)
+        self._file_run_btn.setEnabled(False)
+        self._file_run_btn.clicked.connect(self._emit_blast_file)
+        self._file_run_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
+            f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+        )
+        fl.addWidget(self._file_run_btn)
+        outer_layout.addWidget(footer)
+
+        self._file_last_outdir = ""
+        self._file_last_tsv    = ""
+        # Set once a run finishes/errors; only Clear lifts it, so the button
+        # cannot be clicked again (even by dropping more files) until the
+        # user deliberately resets the tab.
+        self._file_run_locked  = False
+
+        return page
+
+    def _adjust_file_log_height(self):
+        if self._file_log.isVisible():
+            target_height = int(self.height() * 0.3)
+            target_height = max(target_height, 200)
+            self._file_log.setFixedHeight(target_height)
+
+    def _on_file_files(self, paths):
+        enabled = len(paths) >= 1 and not self._file_run_locked
+        self._file_run_btn.setEnabled(enabled)
+        if enabled:
+            self._file_run_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {BLUE}; color: white; border:none; "
+                f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+                f"QPushButton:hover {{ background-color: #0C4A82; }}"
+            )
+        else:
+            self._file_run_btn.setStyleSheet(
+                f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
+                f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+            )
+
+    def _emit_blast_file(self):
+        if not self._file_ref_group.validate_or_warn(self):
+            return
+        cfg = {
+            "api_key":        self._api_key_edit.text().strip(),
+            "nhits":          self._file_hits_spin.value(),
+            "fetch_taxonomy": self._file_tax_check.isChecked(),
+            "tax_reference":  self._file_ref_group.path,
+        }
+        self.blastFileRequested.emit(list(self._file_drop.files), cfg)
+
+    def _open_file_output_folder(self):
+        if self._file_last_outdir and os.path.isdir(self._file_last_outdir):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._file_last_outdir))
+
+    def _open_file_results_file(self):
+        if self._file_last_tsv and os.path.isfile(self._file_last_tsv):
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._file_last_tsv))
+
+    def _reset_file_tab(self):
+        self._file_drop.clear()
+        for k in self._FILE_SLOT_KEYS:
+            self._file_log_slots[k] = ""
+        self._file_info_base = ""
+        self._file_elapsed_timer.stop()
+        self._file_log.clear()
+        self._file_log.hide()
+        self._file_open_folder_btn.hide()
+        self._file_open_results_btn.hide()
+        self._file_stop_btn.hide()
+        self._file_run_btn.show()
+        self._file_run_btn.setEnabled(False)
+        self._file_run_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
+            f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+        )
+        self._file_last_outdir = ""
+        self._file_last_tsv    = ""
+        self._file_run_locked  = False
+        self._file_clear_btn.setEnabled(True)
+
+    def _rebuild_file_log(self):
+        sep = "─" * 56
+        lines = [
+            self._file_log_slots.get("info",     ""),
+            sep,
+            self._file_log_slots.get("parse",    ""),
+            self._file_log_slots.get("organism", ""),
+            self._file_log_slots.get("taxonomy", ""),
+            self._file_log_slots.get("progress", ""),
+            sep,
+            self._file_log_slots.get("result",   ""),
+        ]
+        self._file_log.setPlainText("\n".join(lines))
+
+    def _tick_file_elapsed(self):
+        elapsed = int(time.monotonic() - self._file_start_time)
+        h, rem  = divmod(elapsed, 3600)
+        m, s    = divmod(rem, 60)
+        t_str   = f"{h}h {m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        self._file_log_slots["info"] = f"{self._file_info_base}  │  Time: {t_str}"
+        self._rebuild_file_log()
+
+    # ── Public API for tab 2 (called by MainWindow) ─────────────────────────
+
+    def update_file_status(self, key: str, text: str):
+        self._file_log.show()
+        self._adjust_file_log_height()
+        if key == "info":
+            self._file_info_base = text
+        self._file_log_slots[key] = text
+        self._rebuild_file_log()
+
+    def set_file_progress(self, current: int, total: int):
+        if total > 0:
+            pct = int(current * 100 / total)
+            bar_len = 28
+            filled = int(bar_len * current / total)
+            bar = "█" * filled + " " * (bar_len - filled)
+            self.update_file_status("progress", f"Progress    │ [{bar}] {pct}%")
+
+    def set_file_running(self, running: bool):
+        self._file_run_btn.setVisible(not running)
+        self._file_stop_btn.setVisible(running)
+        self._file_clear_btn.setEnabled(not running)
+        if running:
+            self._file_start_time = time.monotonic()
+            self._file_elapsed_timer.start()
+            self._file_log.show()
+            self._adjust_file_log_height()
+        else:
+            self._file_elapsed_timer.stop()
+
+    def on_file_finished(self, outdir: str):
+        self.set_file_running(False)
+        self._file_last_outdir = outdir
+        if outdir and os.path.isdir(outdir):
+            self._file_open_folder_btn.show()
+            for ext in (".xlsx", ".tsv"):
+                matches = sorted(
+                    (os.path.join(outdir, f) for f in os.listdir(outdir)
+                     if f.endswith(ext) and f.startswith("blastfile-")),
+                    key=os.path.getmtime, reverse=True
+                )
+                if matches:
+                    self._file_last_tsv = matches[0]
+                    self._file_open_results_btn.show()
+                    break
+        # Stays disabled until Clear is pressed, so the same run cannot be
+        # launched again by accident (dropping more files does not lift this).
+        self._file_run_locked = True
+        self._file_run_btn.setEnabled(False)
+        self._file_run_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
+            f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+        )
+
+    def on_file_error(self, msg: str):
+        self.set_file_running(False)
+        self.update_file_status("result", f"ERROR       │ {msg[:80]}")
+        self._file_run_locked = True
+        self._file_run_btn.setEnabled(False)
+        self._file_run_btn.setStyleSheet(
+            f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
+            f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1962,12 +2751,35 @@ class _BlastWorker(QtCore.QThread):
                 nohit_path = ""
                 nohit_msg  = f"Could not write no-hit FASTA: {exc}"
 
+        # ── Query taxonomy from a reference file, plus Tax_level_match ──
+        # Written into the TSV before the xlsx conversion, so both carry them.
+        # Tax_level_match (deepest rank where Subject and Query agree) is only
+        # possible once both sides of the taxonomy are in the table
+        # (Subject_* from fetch_taxonomy, Query_* from the reference here) —
+        # both are added in the same read/rewrite pass over the file.
+        ref_msg = ""
+        tax_match_msg = ""
+        ref_path = cfg.get("tax_reference", "")
+        if ref_path and not self._stop and total_hits_done > 0:
+            try:
+                _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
+                ref_lower = {k.lower(): v for k, v in ref_table.items()}
+                n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
+                    tsv_path, ref_table, ref_lower)
+                ref_msg = f"Reference query taxonomy: {n_filled}/{n_rows} rows filled"
+                if unknown:
+                    ref_msg += f" · {len(unknown)} sample(s) not in the reference"
+                if n_match >= 0:
+                    tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+            except Exception as exc:
+                ref_msg = f"Reference query taxonomy skipped: {exc}"
+
         # ── Convert TSV → XLSX ──
         xlsx_path = ""
         if not self._stop and total_hits_done > 0:
             xlsx_path = self._tsv_to_xlsx(tsv_path)
 
-        extra_msgs = [m for m in (miss_msg, nohit_msg) if m]
+        extra_msgs = [m for m in (miss_msg, nohit_msg, ref_msg, tax_match_msg) if m]
         if self._stop:
             result_msg = (
                 "Stopped     │ " + "  │  ".join(extra_msgs)
@@ -2036,6 +2848,10 @@ class _BlastWorker(QtCore.QThread):
             log_lines.append(f"  Missing seqs      : {miss_msg}")
         if nohit_msg:
             log_lines.append(f"  No-hit seqs       : {nohit_msg}")
+        if ref_msg:
+            log_lines.append(f"  Reference tax     : {ref_msg}")
+        if tax_match_msg:
+            log_lines.append(f"  Tax level match   : {tax_match_msg}")
         if nohit_pairs:
             log_lines += ["", "Sequences with no BLAST hit:"]
             for h, _sq in nohit_pairs:
@@ -2063,4 +2879,325 @@ class _BlastWorker(QtCore.QThread):
             f"{self._rate_limit_count} rate limit(s) (429) · "
             f"{self._server_err_count} server error(s) (5xx)"
         )
+        self.taskFinished.emit(output_dir)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BLAST FILE WORKER — parse an already-downloaded NCBI Hit Table
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _BlastFileWorker(_BlastWorker):
+    """Builds the same kind of results table as `_BlastWorker`, but from a Hit
+    Table already downloaded from blast.ncbi.nlm.nih.gov instead of submitting
+    a new search — useful when NCBI has throttled this IP's search traffic.
+
+    Reuses `_BlastWorker`'s NCBI-metadata primitives as-is (rate limiting,
+    `_fetch_organisms_batch`/`_fetch_taxonomy_batch`, the `.dbx` caches,
+    `_rank_rows`, `_parse_tabular`, `_tsv_to_xlsx`) — only the search step is
+    replaced by reading local files, so `_BlastWorker._run_blast` (the live
+    search) is never touched.
+    """
+
+    def run(self):
+        try:
+            self._run_blast_file()
+        except Exception as e:
+            import traceback
+            self.taskError.emit(f"{e}\n{traceback.format_exc()}")
+
+    # ── Parsing ──────────────────────────────────────────────────────────
+
+    def _parse_hit_csv(self, text: str) -> List[str]:
+        """Headerless comma-delimited Hit Table (NCBI 'Hit Table(csv)' export).
+
+        Rows already arrive best-hit-first per query, so hits are kept in the
+        order they appear and simply capped at cfg['nhits'] per query.
+        """
+        import csv, io
+        nhits = self.cfg["nhits"]
+        counts: Dict[str, int] = {}
+        rows: List[str] = []
+        for fields in csv.reader(io.StringIO(text)):
+            if not fields or not any(f.strip() for f in fields):
+                continue
+            query = fields[0]
+            n = counts.get(query, 0)
+            if n >= nhits:
+                continue
+            counts[query] = n + 1
+            rows.append("\t".join(fields))
+        return rows
+
+    def _read_hit_file(self, path: str) -> List[str]:
+        """Rows of one result file, in whichever of the two NCBI export shapes
+        it uses: '#'-commented tabular text, or headerless CSV."""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except Exception as e:
+            self.statusUpdated.emit(
+                "parse",
+                f"Parse       │ Warning: could not read {os.path.basename(path)}: {e}"
+            )
+            return []
+        if text.lstrip("﻿").lstrip().startswith("#"):
+            return self._parse_tabular(text)
+        return self._parse_hit_csv(text)
+
+    # ── Main run ─────────────────────────────────────────────────────────
+
+    def _run_blast_file(self):
+        cfg       = self.cfg
+        nhits     = cfg["nhits"]
+        run_start = datetime.datetime.now()
+        mydate    = run_start.strftime("%Y%m%d-%H%M%S")
+
+        output_dir = cfg["outdir"]
+        os.makedirs(output_dir, exist_ok=True)
+
+        taxadb_path = os.path.join(output_dir, "taxadb.dbx")
+        accdb_path  = os.path.join(output_dir, "accdb.dbx")
+        fetch_tax = cfg.get("fetch_taxonomy", True)
+        if fetch_tax:
+            parent = os.path.dirname(output_dir)
+            for root_dir, _dirs, fnames in os.walk(parent):
+                if "taxadb.dbx" in fnames:
+                    self._taxadb.update(
+                        self._load_cache(os.path.join(root_dir, "taxadb.dbx")))
+                if "accdb.dbx" in fnames:
+                    self._accdb.update(
+                        self._load_cache(os.path.join(root_dir, "accdb.dbx")))
+            self._saved_tax_keys = set(self._taxadb.keys())
+            self._saved_acc_keys = set(self._accdb.keys())
+
+        # ── Parse every result file ──
+        self.statusUpdated.emit(
+            "parse", f"Parse       │ Reading {len(self.files)} file(s)…")
+        blast_rows: List[str] = []
+        for f in self.files:
+            if self._stop:
+                break
+            rows = self._read_hit_file(f)
+            blast_rows.extend(rows)
+            self.statusUpdated.emit(
+                "parse",
+                f"Parse       │ {os.path.basename(f)}: {len(rows)} hit row(s) kept"
+            )
+
+        if not blast_rows:
+            if self._stop:
+                self.taskFinished.emit(output_dir)
+            else:
+                self.taskError.emit(
+                    "No hit rows could be parsed from the provided file(s). Make "
+                    "sure they are the NCBI 'Hit Table(text)' or 'Hit Table(csv)' export."
+                )
+            return
+
+        n_queries = len({r.split("\t", 1)[0] for r in blast_rows})
+        self.statusUpdated.emit(
+            "info",
+            f"Queries: {n_queries}  │  Hits kept: {len(blast_rows)}  │  Hits/query: {nhits}"
+        )
+
+        _blast_cols = (
+            "Query_name\tSubject_accession.ver\tP_identity\tAlignment_length\t"
+            "Num_mismatches\tGap_opens\tQuery_start\tQuery_end\t"
+            "Subject_start\tSubject_end\tEvalue\tBit_score"
+        )
+        headings = (
+            _blast_cols + "\tSubject_Kingdom\tSubject_Class\tSubject_Order\t"
+            "Subject_Family\tSubject_Genus\tSubject_organism"
+            if fetch_tax else _blast_cols
+        )
+        headings = "Hit_rank\t" + headings
+
+        total_expected = 1000
+        self.progressUpdated.emit(50, total_expected)
+
+        if fetch_tax and not self._stop:
+            accessions = [
+                (row.split("\t")[1] if "\t" in row else "") for row in blast_rows
+            ]
+            unique_accs = list(dict.fromkeys(a for a in accessions if a))
+            self.statusUpdated.emit(
+                "organism", f"Organism ID │ Fetching {len(unique_accs)} accessions…")
+            self._fetch_organisms_batch(unique_accs)
+            n_org_found = sum(1 for a in unique_accs if a in self._accdb)
+            self.statusUpdated.emit(
+                "organism", f"Organism ID │ {n_org_found}/{len(unique_accs)} resolved  ✓")
+            self.progressUpdated.emit(400, total_expected)
+
+            organisms = [(self._accdb.get(acc, "") if acc else "") for acc in accessions]
+
+            if not self._stop:
+                unique_orgs = list(dict.fromkeys(o for o in organisms if o))
+                self.statusUpdated.emit(
+                    "taxonomy", f"Taxonomy    │ Fetching {len(unique_orgs)} organisms…")
+                self._fetch_taxonomy_batch(unique_orgs)
+
+                for attempt in range(1, self._TAX_RETRIES + 1):
+                    if self._stop:
+                        break
+                    retry_orgs = [
+                        org for org in unique_orgs
+                        if self._taxadb.get(org) == "Not_found_in_Taxonomy"
+                    ]
+                    if not retry_orgs:
+                        break
+                    with self._cache_lock:
+                        for org in retry_orgs:
+                            del self._taxadb[org]
+                    self.statusUpdated.emit(
+                        "taxonomy",
+                        f"Taxonomy    │ Retry {attempt}/{self._TAX_RETRIES}: "
+                        f"{len(retry_orgs)} not-found…"
+                    )
+                    self._fetch_taxonomy_batch(retry_orgs)
+
+                n_tax_found = sum(
+                    1 for o in unique_orgs
+                    if self._taxadb.get(o, "Not_found_in_Taxonomy") != "Not_found_in_Taxonomy"
+                )
+                self.statusUpdated.emit(
+                    "taxonomy", f"Taxonomy    │ {n_tax_found}/{len(unique_orgs)} resolved  ✓")
+                self.progressUpdated.emit(800, total_expected)
+
+                with self._cache_lock:
+                    new_tax = {k: self._taxadb[k] for k in self._taxadb
+                               if k not in self._saved_tax_keys
+                               and k not in self._tax_unconfirmed}
+                    new_acc = {k: self._accdb[k] for k in self._accdb
+                               if k not in self._saved_acc_keys}
+                    self._append_cache(new_tax, taxadb_path)
+                    self._append_cache(new_acc, accdb_path)
+                    self._saved_tax_keys.update(new_tax.keys())
+                    self._saved_acc_keys.update(new_acc.keys())
+
+            taxonomies = [
+                (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
+                for o in organisms
+            ]
+            ranked_rows = self._rank_rows([
+                f"{row}\t{tax}\t{org}"
+                for row, tax, org in zip(blast_rows, taxonomies, organisms)
+            ])
+        else:
+            ranked_rows = self._rank_rows(blast_rows)
+
+        tsv_path = os.path.join(output_dir, f"blastfile-{mydate}.tsv")
+        for _attempt in range(10):
+            try:
+                with open(tsv_path, "w", encoding="utf-8") as tsv_fh:
+                    tsv_fh.write(headings + "\n")
+                    for r in ranked_rows:
+                        tsv_fh.write(r + "\n")
+                break
+            except PermissionError:
+                self.statusUpdated.emit(
+                    "result",
+                    f"⚠ Output file locked — close it to continue… ({_attempt + 1}/10)"
+                )
+                self._interruptible_sleep(0.5)
+        else:
+            self.taskError.emit(
+                f"Could not write output file (locked/permission denied):\n{tsv_path}"
+            )
+            return
+
+        self.progressUpdated.emit(900, total_expected)
+
+        # ── Query taxonomy from a reference file, plus Tax_level_match ──
+        # Both are added in the same read/rewrite pass over the file.
+        ref_msg = ""
+        tax_match_msg = ""
+        ref_path = cfg.get("tax_reference", "")
+        if ref_path and ranked_rows and not self._stop:
+            try:
+                _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
+                ref_lower = {k.lower(): v for k, v in ref_table.items()}
+                n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
+                    tsv_path, ref_table, ref_lower)
+                ref_msg = f"Reference query taxonomy: {n_filled}/{n_rows} rows filled"
+                if unknown:
+                    ref_msg += f" · {len(unknown)} sample(s) not in the reference"
+                if n_match >= 0:
+                    tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+            except Exception as exc:
+                ref_msg = f"Reference query taxonomy skipped: {exc}"
+
+        xlsx_path = ""
+        if ranked_rows and not self._stop:
+            xlsx_path = self._tsv_to_xlsx(tsv_path)
+        self.progressUpdated.emit(total_expected, total_expected)
+
+        extra_msgs = [m for m in (ref_msg, tax_match_msg) if m]
+        if self._stop:
+            result_msg = (
+                "Stopped     │ " + "  │  ".join(extra_msgs)
+                if extra_msgs else "Stopped by user."
+            )
+        else:
+            out_name = os.path.basename(xlsx_path if xlsx_path else tsv_path)
+            head = f"{len(ranked_rows)} hits written → {out_name}"
+            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs)
+        self.statusUpdated.emit("result", result_msg)
+
+        # ── Run log ──────────────────────────────────────────────────────
+        elapsed   = datetime.datetime.now() - run_start
+        total_sec = int(elapsed.total_seconds())
+        h, rem    = divmod(total_sec, 3600)
+        m, s      = divmod(rem, 60)
+        elapsed_str = f"{h}h {m:02d}m {s:02d}s" if h else f"{m:02d}m {s:02d}s"
+        status_str  = "Stopped" if self._stop else "Completed"
+
+        log_lines = [
+            "BLAST Web Results Run Log",
+            "=" * 60,
+            f"Date/Time  : {run_start.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Status     : {status_str}",
+            f"Total time : {elapsed_str}",
+            "",
+            "Input files:",
+        ]
+        for f in self.files:
+            log_lines.append(f"  {os.path.abspath(f)}")
+        log_lines += [
+            "",
+            "Parameters:",
+            f"  Hits per query kept : {nhits}",
+            f"  Fetch taxonomy      : {'Yes' if fetch_tax else 'No'}",
+            "",
+            "Results:",
+            f"  Queries           : {n_queries}",
+            f"  Hits written      : {len(ranked_rows)}",
+            f"  Output folder     : {output_dir}",
+            f"  TSV file          : {os.path.basename(tsv_path)}",
+            f"  XLSX file         : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
+        ]
+        if ref_msg:
+            log_lines.append(f"  Reference tax     : {ref_msg}")
+        if tax_match_msg:
+            log_lines.append(f"  Tax level match   : {tax_match_msg}")
+        log_lines += [
+            "",
+            "NOTE: this tab does not produce a FASTA of queried sequences (the input",
+            "      file carries hits only, not sequences), so the table can only be",
+            "      paired in Best Sequence if a matching FASTA already exists under",
+            "      the same base name.",
+            "",
+            "NOTE: Do not delete the .dbx cache files (accdb.dbx, taxadb.dbx).",
+            "      They store organism and taxonomy lookups already performed and",
+            "      will significantly speed up future BLAST runs on the same or",
+            "      overlapping accession numbers.",
+            "",
+        ]
+
+        log_path = os.path.join(output_dir, f"blastfile_run_log_{mydate}.txt")
+        try:
+            with open(log_path, "w", encoding="utf-8") as lf:
+                lf.write("\n".join(log_lines))
+        except Exception as exc:
+            self.statusUpdated.emit("result", f"{result_msg}  │  Log error: {exc}")
+
         self.taskFinished.emit(output_dir)

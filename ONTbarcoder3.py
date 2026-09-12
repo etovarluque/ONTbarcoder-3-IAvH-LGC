@@ -221,7 +221,7 @@ import _utilities.pipeline as _ont_mp
 
 
 from _utilities.compare_panel import ComparePanel, _CompareWorker, _PairCompareWorker
-from _utilities.blast_panel import BlastPanel, _BlastWorker
+from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
 from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.fastq_inspector import FastqInspectorPanel
 from _utilities.fasta_tools import FastaToolsPanel
@@ -5255,6 +5255,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.finalizeRequested.connect(self._finalize_live)
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
+        self._panel_blast.blastFileRequested.connect(self._start_blast_file)
         self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
         self._panel_batch_sweep.sweepRequested.connect(self._start_batch_sweep)
         self._panel_batch_sweep.stopRequested.connect(self._stop_batch_sweep)
@@ -10655,6 +10656,21 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.blast_worker = None
 
+    def _stop_blast_file_worker(self):
+        """Same as _stop_blast_worker, for the 'BLAST web results' worker."""
+        w = getattr(self, "blast_file_worker", None)
+        if w is None:
+            return
+        try:
+            if w.isRunning():
+                w.stop()
+                if not w.wait(8000):
+                    w.terminate()
+                    w.wait(2000)
+        except Exception:
+            pass
+        self.blast_file_worker = None
+
     def _on_reset_analysis(self):
         # Before wiping state: a batch in progress must be closed out, or its
         # queue stays armed and a later single run would resume it.
@@ -10711,8 +10727,9 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-        # Stop the BLAST worker so it releases its NCBI connections.
+        # Stop the BLAST worker(s) so they release their NCBI connections.
         self._stop_blast_worker()
+        self._stop_blast_file_worker()
 
         # Fully tear down the multiprocessing pool/queue (terminate + join +
         # close), not just terminate(): otherwise child processes and the Queue
@@ -11206,6 +11223,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(list, dict)
     def _start_blast(self, files: list, cfg: dict):
+        # A live search and the file-parsing tab each run their own NCBI rate
+        # limiter; running both at once would double the request rate against
+        # the same IP and risk 429s on both. Block one while the other runs.
+        other = getattr(self, "blast_file_worker", None)
+        if other is not None and other.isRunning():
+            self._panel_blast.on_error(
+                "The 'BLAST web results' tab is still running. Wait for it to "
+                "finish, or click its Stop button, before starting a new BLAST search."
+            )
+            return
+
         # ── Output folder dialog (same pattern as _start_comparison) ──
         ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"ont-barcoder_{ts}_blast"
@@ -11316,6 +11344,127 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blast_worker.taskFinished.connect(self._panel_blast.on_finished)
         self.blast_worker.taskError.connect(self._panel_blast.on_error)
         self.blast_worker.start()
+
+    def _start_blast_file(self, files: list, cfg: dict):
+        # See _start_blast: the two tabs must not run concurrently, since each
+        # keeps its own independent NCBI rate limiter against the same IP.
+        other = getattr(self, "blast_worker", None)
+        if other is not None and other.isRunning():
+            self._panel_blast.on_file_error(
+                "The 'BLAST API Search' tab is still running. Wait for it to "
+                "finish, or click its Stop button, before parsing a result file."
+            )
+            return
+
+        # ── Output folder dialog (same pattern as _start_blast) ──
+        ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_name = f"ont-barcoder_{ts}_blastfile"
+        program_dir = _get_base_dir()
+        default_out = os.path.join(program_dir, "output", folder_name)
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Output folder")
+        dlg.setMinimumWidth(480)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background-color: {GRAY_CARD}; }}
+            QLabel {{ color: {TEXT_PRI}; background-color: transparent; }}
+            QRadioButton {{
+                color: {TEXT_PRI}; background-color: transparent;
+                font-size: 15px; padding: 6px 0;
+            }}
+            QRadioButton::indicator {{ width: 16px; height: 16px; }}
+            QPushButton {{
+                border-radius: 8px; padding: 8px 20px;
+                font-size: 15px; font-weight: 500;
+            }}
+            #dlg_ok_btn {{ background-color: {BLUE}; color: white; border: none; }}
+            #dlg_ok_btn:hover {{ background-color: #0C4A82; }}
+            #dlg_cancel_btn {{
+                background-color: transparent; color: {BLUE};
+                border: 1px solid {BLUE};
+            }}
+            #dlg_cancel_btn:hover {{ background-color: {BLUE_LIGHT}; }}
+        """)
+        vlay = QtWidgets.QVBoxLayout(dlg)
+        vlay.setSpacing(16)
+        vlay.setContentsMargins(24, 24, 24, 20)
+        title_lbl = QtWidgets.QLabel("Where to save the results?")
+        title_lbl.setStyleSheet(
+            f"font-size:17px; font-weight:700; color:{TEXT_PRI};"
+        )
+        vlay.addWidget(title_lbl)
+        radio_default = QtWidgets.QRadioButton(
+            f"Automatic folder (recommended)\n  …/output/{folder_name}"
+        )
+        radio_default.setChecked(True)
+        radio_custom = QtWidgets.QRadioButton("Select folder manually")
+        vlay.addWidget(radio_default)
+        vlay.addWidget(radio_custom)
+        vlay.addSpacing(8)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QtWidgets.QPushButton("Cancel")
+        btn_cancel.setObjectName("dlg_cancel_btn")
+        btn_cancel.setFixedHeight(38)
+        btn_ok = QtWidgets.QPushButton("Continue")
+        btn_ok.setObjectName("dlg_ok_btn")
+        btn_ok.setFixedHeight(38)
+        btn_ok.setDefault(True)
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addSpacing(8)
+        btn_row.addWidget(btn_ok)
+        vlay.addLayout(btn_row)
+
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            return
+
+        if radio_default.isChecked():
+            outdir = default_out
+        else:
+            parent_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Select the output folder"
+            )
+            if not parent_dir:
+                return
+            outdir = os.path.join(parent_dir, folder_name)
+
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            self._panel_blast.on_file_error(f"Could not create output folder: {e}")
+            return
+
+        cfg["outdir"] = outdir
+
+        self._panel_blast.set_file_running(True)
+        self._panel_blast.update_file_status("result", f"Output    │ {outdir}")
+
+        # Disconnect any leftover stop/signal connections from a previous run
+        try:
+            self._panel_blast.stopFileRequested.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        if hasattr(self, "blast_file_worker") and self.blast_file_worker is not None:
+            try:
+                self.blast_file_worker.statusUpdated.disconnect()
+                self.blast_file_worker.progressUpdated.disconnect()
+                self.blast_file_worker.taskFinished.disconnect()
+                self.blast_file_worker.taskError.disconnect()
+            except RuntimeError:
+                pass
+            # Same reasoning as _start_blast: two live workers would double the
+            # NCBI request rate and trigger 429s.
+            self._stop_blast_file_worker()
+
+        self.blast_file_worker = _BlastFileWorker(files, cfg)
+        self._panel_blast.stopFileRequested.connect(self.blast_file_worker.stop)
+        self.blast_file_worker.statusUpdated.connect(self._panel_blast.update_file_status)
+        self.blast_file_worker.progressUpdated.connect(self._panel_blast.set_file_progress)
+        self.blast_file_worker.taskFinished.connect(self._panel_blast.on_file_finished)
+        self.blast_file_worker.taskError.connect(self._panel_blast.on_file_error)
+        self.blast_file_worker.start()
 
     def _start_best_seq(self, pairs: list, cfg: dict):
         # ── Output folder dialog (same pattern as _start_blast) ──

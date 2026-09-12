@@ -194,8 +194,9 @@ specimen-level barcode sequences — with no command line required.
 Version 3.x preserves the algorithmic logic of ONTbarcoder 2.0 (Srivathsan <i>et al.</i>,
 2024) while adding a redesigned graphical interface, deterministic multiprocessing, a
 real-time (live sequencing) mode, a non-coding marker mode, and a set of integrated utilities
-(FASTA comparison, FASTA tools, a FASTQ inspector, an NCBI BLAST client and a
-best-sequence selector that merges several runs).
+(FASTA comparison, FASTA tools, a FASTQ inspector, an NCBI BLAST client — live search or
+parsing an already-downloaded result file — and a best-sequence selector that merges several
+runs).
 </p>
 <p>This manual targets researchers already familiar with amplicon sequencing and DNA
 barcoding. It documents every parameter, each pipeline phase, and all output files.</p>
@@ -1059,6 +1060,14 @@ length, quality and GC. Large uncompressed files are processed in parallel acros
 cores; gzip files are streamed sequentially.</p>
 
 <h2 id="util-blast">13. Utility — BLAST</h2>
+<p>The BLAST utility has two tabs, for the two ways of getting NCBI hits into ONTbarcoder:
+submit sequences directly to NCBI (<b>BLAST API Search</b>), or parse a Hit Table already
+downloaded from the BLAST website (<b>BLAST web results</b>) — useful when NCBI has throttled
+this IP's search traffic, since it does not submit a new search. Both tabs write the same kind
+of results table and offer the same optional query-taxonomy reference file (§13.3), but only
+one of the two can run at a time (§13.2).</p>
+
+<h3>13.1 BLAST API Search</h3>
 <p>Submit barcode FASTA files to NCBI BLAST (remote URL API) for taxonomic identification.
 Sequences are merged, normalized and split into batches; each batch is submitted, polled
 and its hits written incrementally to a timestamped <code>.tsv</code> (and an
@@ -1067,7 +1076,7 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
 
 <figure class="">
   <img src="images/util-blast.png" alt="BLAST utility">
-  <figcaption><b>Figure 10.</b> The BLAST utility: batch submission and taxonomy options.</figcaption>
+  <figcaption><b>Figure 10.</b> BLAST API Search: batch submission and taxonomy options.</figcaption>
 </figure>
 <ul>
   <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> &mdash; recommended,
@@ -1139,14 +1148,15 @@ The FASTA and the results table share the same base name on purpose
 (<code>blast-20260908-210439.fa</code> + <code>.xlsx</code>), which is how
 <a href="#util-best">§14</a> pairs a run's sequences with its BLAST table. Running BLAST on
 each parameter set therefore leaves the input for that utility ready, with no renaming.
-Remember that &sect;14 additionally requires the <code>Query_*</code> taxonomy columns, which
-you either add to the table yourself or let it write from a taxonomy reference file.
+Remember that &sect;14 additionally requires the <code>Query_*</code> taxonomy columns — tick
+the reference-file option below (§13.3) and this tab writes them into the table itself, so it
+already satisfies that requirement by the time it reaches Best Sequence.
 </div>
 <div class="note">
 <b>NCBI API key required</b>
 The panel requires a personal NCBI API key before it will submit queries (registered free
 at NCBI); it is saved automatically once entered so you only need to set it up once per
-machine.
+machine — <b>BLAST web results</b> (§13.2) reuses the same key for its own taxonomy lookups.
 </div>
 <div class="warn">
 <b>Network &amp; usage policy</b>
@@ -1157,6 +1167,75 @@ projects &mdash; weekends, or 21:00&ndash;05:00 US Eastern. Be mindful of submit
 unpublished or sensitive sequence data to a third-party service. For recurring high volume,
 NCBI asks that you use standalone BLAST+ or a cloud instance instead of the public service.
 </div>
+
+<h3>13.2 BLAST web results</h3>
+<p>When NCBI has moved this IP to its slow queue (or you simply already ran the search on the
+website), this tab gets the same kind of results table without submitting a new search: run
+BLAST manually at <code>blast.ncbi.nlm.nih.gov</code>, then use <b>Download All &rarr; Hit
+Table(text)</b> or <b>Hit Table(csv)</b> and drop the downloaded file here. Both export shapes
+are accepted and auto-detected from the file content — the <code>#</code>-commented tabular
+<code>.txt</code> and the headerless <code>.csv</code> &mdash; and more than one file can be
+dropped at once to combine several jobs.</p>
+
+<figure class="ph">
+  <img src="images/util-blast-file.png" alt="BLAST web results tab">
+  PLACEHOLDER &middot; drop images/util-blast-file.png here
+</figure>
+<ul>
+  <li><b>Hits per sequence to keep</b> caps how many of the file's hits are kept per query,
+      the same idea as the "Hits per sequence" spin of BLAST API Search. If a query has fewer
+      hits than that in the file, all of them are kept.</li>
+  <li><b>Fetch organism + taxonomic classification</b> uses the same NCBI E-utilities lookups
+      (and the same <code>accdb.dbx</code>/<code>taxadb.dbx</code> caches) as BLAST API
+      Search, since the downloaded file only carries accession numbers, not organism names.
+      E-utilities is a separate, low-volume NCBI service from the BLAST search queue this tab
+      exists to avoid, so using it here does not add to the 100-searches-per-day count.</li>
+  <li>The tab writes <code>blastfile-&lt;ts&gt;.tsv</code>/<code>.xlsx</code> and its own
+      <code>blastfile_run_log_&lt;ts&gt;.txt</code>. Unlike BLAST API Search, it produces
+      <b>no FASTA</b> of queried sequences — the input file carries hits only, never sequences
+      — so the table can only be paired in Best Sequence (§14) if a matching FASTA already
+      exists under the same base name.</li>
+  <li><b>Parse results</b> is disabled again as soon as a run finishes or errors, and stays
+      disabled — even if more files are dropped in the meantime — until <b>Clear</b> is
+      pressed, so the same run cannot be launched a second time by accident.</li>
+</ul>
+<div class="note">
+<b>The two tabs cannot run at the same time</b>
+BLAST API Search and BLAST web results each keep their own independent NCBI rate limiter
+against the same IP address; running both at once would double the request rate and risk 429
+errors on both. Starting one while the other is still running is refused, with a message asking
+you to wait for it to finish or to press its Stop button first.
+</div>
+
+<h3>13.3 Query taxonomy reference file (both tabs)</h3>
+<p>Both tabs offer the same optional
+<b>&laquo;I have a reference file with the query taxonomy&raquo;</b> checkbox that Best
+Sequence (§14.1) uses: tick it, drop a single reference table
+(<code>.csv</code>, <code>.xlsx</code> or <code>.tsv</code>), and the four
+<code>Query_Order</code> / <code>Query_Family</code> / <code>Query_Genus</code> /
+<code>Query_organism</code> columns are written into the results table before it is converted
+to <code>.xlsx</code> &mdash; keyed by the sample ID (the text before the first
+<code>;</code> in the query name). The reference file format is exactly the one described in
+§14.1: an identifier column followed immediately by four columns read, in that order, as
+Order, Family, Genus and Organism.</p>
+<pre>Sample,Order,Family,Genus,Organism
+DNS-1343,Asterales,Asteraceae,Baccharis,Baccharis latifolia
+DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
+<p>Filling these columns in directly from BLAST means the table already satisfies Best
+Sequence's own requirement (§14.1) with no further editing — the tip above (§13.1) relies on
+exactly this.</p>
+
+<h4>The Tax_level_match column</h4>
+<p>When a run has <b>both</b> sides of the taxonomy — hit taxonomy from "Fetch organism +
+taxonomy" (<code>Subject_Order</code>/<code>Family</code>/<code>Genus</code>/<code>organism</code>)
+and expected taxonomy from the reference file above (<code>Query_Order</code>/<code>Family</code>/
+<code>Genus</code>/<code>organism</code>) &mdash; the table gains one more column at its right
+end, <code>Tax_level_match</code>, recording the deepest rank at which the two agree:
+<code>organism</code>, <code>genus</code>, <code>family</code>, <code>order</code>, or
+<code>none</code>. This is the same rule Best Sequence's own <code>Tax_level</code> column
+(§14.2) uses to judge a hit, so a BLAST table already shows whether a hit taxonomically
+supports the sample without waiting for Best Sequence to run. If either side of the taxonomy
+is missing, no column is added.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="util-best">14. Utility — Best Sequence</h2>
@@ -1209,12 +1288,13 @@ matching table (or a table with no matching FASTA) is listed in red and ignored.
 <b>Required columns — expected taxonomy of the query</b>
 Every BLAST table must carry the expected classification of the sample in
 <b>each hit row</b>: <code>Query_Order</code>, <code>Query_Family</code>,
-<code>Query_Genus</code> and <code>Query_organism</code>. These are <i>not</i> produced by
-the BLAST utility (§13), which only writes the <code>Subject_*</code> taxonomy of each hit —
-you add them from your own collection/voucher data before using this panel. Ranks you do
-not know may be left blank or as <code>0</code>. Files missing any of these columns are
-rejected in the drop zone, before the run starts &mdash; unless you supply the reference
-file described below, which writes them for you.
+<code>Query_Genus</code> and <code>Query_organism</code>. The BLAST utility (§13) writes the
+<code>Subject_*</code> taxonomy of each hit on its own, but the <code>Query_*</code> side is
+your own collection/voucher data — add it by hand, or have either BLAST tab write it for you
+from a reference file (§13.3), which produces a table that already satisfies this requirement.
+Ranks you do not know may be left blank or as <code>0</code>. Files missing any of these
+columns are rejected in the drop zone, before the run starts &mdash; unless you supply the
+reference file described below, which writes them for you.
 </div>
 
 <h4>Adding the columns automatically &mdash; taxonomy reference file</h4>

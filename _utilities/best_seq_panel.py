@@ -71,8 +71,194 @@ def read_tax_reference(path: str):
     return str(headers[id_i]).strip(), tax_cols, table
 
 
+# ── Writing the reference taxonomy into a BLAST table ───────────────────────
+# Module-level so both Best Sequence and the BLAST panel can apply a reference
+# file to a table without duplicating the matching/writing logic.
+
+def sample_id_of(query_name, strip_suffix: str = "") -> str:
+    """Sample ID of a BLAST Query_name: the text before the first ';',
+    with the configured suffix removed if present."""
+    sample = str(query_name).split(";", 1)[0].strip()
+    if strip_suffix and sample.endswith(strip_suffix):
+        sample = sample[:-len(strip_suffix)]
+    return sample
+
+
+def lookup_tax(sample: str, ref: dict, ref_lower: dict):
+    """Reference row of *sample*, matched exactly then case-insensitively."""
+    tax = ref.get(sample)
+    if tax is None:
+        tax = ref_lower.get(sample.lower())
+    return tax
+
+
+def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str = ""):
+    """Write the four Query_* columns into a BLAST table, in place.
+
+    Every row is keyed by the sample ID of its Query_name (the text before
+    the first ';', with the configured suffix removed), which is the
+    identifier the reference file is expected to use. Columns already in the
+    table are overwritten; the missing ones are appended at its right end,
+    so the original layout and formatting are left alone.
+
+    Returns (rows seen, rows filled, sample IDs absent from the reference).
+    """
+    if path.lower().endswith(".xlsx"):
+        return _apply_reference_xlsx(path, ref, ref_lower, strip_suffix)
+    return _apply_reference_text(path, ref, ref_lower, strip_suffix)
+
+
+def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = ""):
+    import openpyxl
+    from copy import copy
+    wb = openpyxl.load_workbook(path)
+    sheet = wb[wb.sheetnames[0]]
+    header_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
+    headers = [(str(c.value).strip() if c.value is not None else "")
+               for c in header_row]
+    if "Query_name" not in headers:
+        wb.close()
+        raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
+    q_i = headers.index("Query_name")
+
+    # Trailing blank headers are not part of the table: append after the
+    # last named column, so no empty column is left in between.
+    next_col = max((i for i, h in enumerate(headers, 1) if h), default=0)
+    style_src = sheet.cell(row=1, column=q_i + 1)
+    col_idx = {}
+    for name in QUERY_TAX_COLUMNS:
+        if name in headers:
+            col_idx[name] = headers.index(name) + 1
+        else:
+            next_col += 1
+            col_idx[name] = next_col
+            cell = sheet.cell(row=1, column=next_col, value=name)
+            cell._style = copy(style_src._style)
+
+    n_rows = n_filled = 0
+    unknown = set()
+    for row in sheet.iter_rows(min_row=2):
+        value = row[q_i].value if q_i < len(row) else None
+        if value is None or str(value).strip() == "":
+            continue
+        n_rows += 1
+        sample = sample_id_of(value, strip_suffix)
+        tax = lookup_tax(sample, ref, ref_lower)
+        if tax is None:
+            unknown.add(sample)
+            tax = ("", "", "", "")
+        else:
+            n_filled += 1
+        for name, val in zip(QUERY_TAX_COLUMNS, tax):
+            sheet.cell(row=row[0].row, column=col_idx[name], value=val)
+
+    tmp = path + ".tmp"
+    wb.save(tmp)
+    wb.close()
+    os.replace(tmp, path)
+    return n_rows, n_filled, sorted(unknown)
+
+
+def _apply_reference_text(path, ref, ref_lower, strip_suffix: str = ""):
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        first = fh.readline()
+        fh.seek(0)
+        sep = "\t" if "\t" in first else ","
+        rows = [r for r in csv.reader(fh, delimiter=sep)]
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        raise ValueError(f"Empty BLAST table: {os.path.basename(path)}")
+    headers = [c.strip() for c in rows[0]]
+    if "Query_name" not in headers:
+        raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
+    q_i = headers.index("Query_name")
+    col_idx = {}
+    for name in QUERY_TAX_COLUMNS:
+        if name in headers:
+            col_idx[name] = headers.index(name)
+        else:
+            col_idx[name] = len(headers)
+            headers.append(name)
+    width = len(headers)
+
+    out = [headers]
+    n_rows = n_filled = 0
+    unknown = set()
+    for row in rows[1:]:
+        row = list(row) + [""] * (width - len(row))
+        value = row[q_i] if q_i < len(row) else ""
+        if str(value).strip():
+            n_rows += 1
+            sample = sample_id_of(value, strip_suffix)
+            tax = lookup_tax(sample, ref, ref_lower)
+            if tax is None:
+                unknown.add(sample)
+                tax = ("", "", "", "")
+            else:
+                n_filled += 1
+            for name, val in zip(QUERY_TAX_COLUMNS, tax):
+                row[col_idx[name]] = val
+        out.append(row)
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh, delimiter=sep, lineterminator="\n").writerows(out)
+    os.replace(tmp, path)
+    return n_rows, n_filled, sorted(unknown)
+
+
 # Taxonomic rank reached by the best concordant hit, deepest first.
 TAX_LEVELS = ("organism", "genus", "family", "order", "none")
+
+
+def display_taxon(value) -> str:
+    """Readable form of a taxon name, kept for the report.
+
+    Empty taxonomic cells may be written as 0 / '-' / '' in the tables.
+    NCBI writes organism names with the genus capitalised and underscores
+    instead of spaces (Palicourea_purpurea), so the underscores go and the
+    original capitalisation is preserved. A name that arrives entirely in
+    lower case is capitalised, so the genus reads correctly
+    (epidendrum fimbriatum -> Epidendrum fimbriatum).
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text in ("0", "0.0", "-", "", "N/A", "NA", "nan", "None"):
+        return ""
+    text = text.replace("_", " ")
+    if text == text.lower():
+        text = text[:1].upper() + text[1:]
+    return text
+
+
+def concordance_level(hit: dict, qtax: dict) -> str:
+    """Deepest rank shared by the expected query taxonomy and the subject.
+
+    Both `hit` and `qtax` are dicts with "order"/"family"/"genus"/"organism"
+    keys; both sides are compared in normalised (lower-case) form. Module-level
+    so both Best Sequence and the BLAST panel can compute it without
+    duplicating the comparison rules.
+    """
+    def same(rank):
+        a = qtax.get(rank, "").lower()
+        b = hit.get(rank, "").lower()
+        return bool(a) and a == b
+
+    q_sp = qtax.get("organism", "").lower()
+    s_sp = hit.get("organism", "").lower()
+    if q_sp and s_sp:
+        # species names may carry authors or suffixes: compare the first two words
+        if " ".join(q_sp.split()[:2]) == " ".join(s_sp.split()[:2]):
+            return "organism"
+    if same("genus"):
+        return "genus"
+    if same("family"):
+        return "family"
+    if same("order"):
+        return "order"
+    return "none"
+
 
 # Fallback for a query that appears in no BLAST table at all: its expected
 # taxonomy is simply unknown, since the tables are the only source for it.
@@ -1323,29 +1509,12 @@ class _BestSeqWorker(QtCore.QThread):
 
     @staticmethod
     def _display(value) -> str:
-        """Readable form of a taxon name, kept for the report.
-
-        Empty taxonomic cells may be written as 0 / '-' / '' in the tables.
-        NCBI writes organism names with the genus capitalised and underscores
-        instead of spaces (Palicourea_purpurea), so the underscores go and the
-        original capitalisation is preserved. A name that arrives entirely in
-        lower case is capitalised, so the genus reads correctly
-        (epidendrum fimbriatum -> Epidendrum fimbriatum).
-        """
-        if value is None:
-            return ""
-        text = str(value).strip()
-        if text in ("0", "0.0", "-", "", "N/A", "NA", "nan", "None"):
-            return ""
-        text = text.replace("_", " ")
-        if text == text.lower():
-            text = text[:1].upper() + text[1:]
-        return text
+        return display_taxon(value)
 
     @staticmethod
     def _clean(value) -> str:
         """Normalised form used for comparisons only (never shown)."""
-        return _BestSeqWorker._display(value).lower()
+        return display_taxon(value).lower()
 
     @staticmethod
     def _to_float(value) -> float:
@@ -1358,126 +1527,11 @@ class _BestSeqWorker(QtCore.QThread):
 
     def _sample_of(self, query_name) -> str:
         """Sample ID of a BLAST Query_name, parsed like a FASTA header."""
-        return self._parse_header(str(query_name))["sample"]
+        return sample_id_of(query_name, self.cfg.get("strip_suffix", ""))
 
     def _apply_reference_tax(self, path: str, ref: dict, ref_lower: dict):
-        """Write the four Query_* columns into a BLAST table, in place.
-
-        Every row is keyed by the sample ID of its Query_name (the text before
-        the first ';', with the configured suffix removed), which is the
-        identifier the reference file is expected to use. Columns already in the
-        table are overwritten; the missing ones are appended at its right end,
-        so the original layout and formatting are left alone.
-
-        Returns (rows seen, rows filled, sample IDs absent from the reference).
-        """
-        if path.lower().endswith(".xlsx"):
-            return self._apply_reference_xlsx(path, ref, ref_lower)
-        return self._apply_reference_text(path, ref, ref_lower)
-
-    def _lookup_tax(self, sample: str, ref: dict, ref_lower: dict):
-        """Reference row of *sample*, matched exactly then case-insensitively."""
-        tax = ref.get(sample)
-        if tax is None:
-            tax = ref_lower.get(sample.lower())
-        return tax
-
-    def _apply_reference_xlsx(self, path, ref, ref_lower):
-        import openpyxl
-        from copy import copy
-        wb = openpyxl.load_workbook(path)
-        sheet = wb[wb.sheetnames[0]]
-        header_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
-        headers = [(str(c.value).strip() if c.value is not None else "")
-                   for c in header_row]
-        if "Query_name" not in headers:
-            wb.close()
-            raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
-        q_i = headers.index("Query_name")
-
-        # Trailing blank headers are not part of the table: append after the
-        # last named column, so no empty column is left in between.
-        next_col = max((i for i, h in enumerate(headers, 1) if h), default=0)
-        style_src = sheet.cell(row=1, column=q_i + 1)
-        col_idx = {}
-        for name in QUERY_TAX_COLUMNS:
-            if name in headers:
-                col_idx[name] = headers.index(name) + 1
-            else:
-                next_col += 1
-                col_idx[name] = next_col
-                cell = sheet.cell(row=1, column=next_col, value=name)
-                cell._style = copy(style_src._style)
-
-        n_rows = n_filled = 0
-        unknown = set()
-        for row in sheet.iter_rows(min_row=2):
-            value = row[q_i].value if q_i < len(row) else None
-            if value is None or str(value).strip() == "":
-                continue
-            n_rows += 1
-            sample = self._sample_of(value)
-            tax = self._lookup_tax(sample, ref, ref_lower)
-            if tax is None:
-                unknown.add(sample)
-                tax = ("", "", "", "")
-            else:
-                n_filled += 1
-            for name, val in zip(QUERY_TAX_COLUMNS, tax):
-                sheet.cell(row=row[0].row, column=col_idx[name], value=val)
-
-        tmp = path + ".tmp"
-        wb.save(tmp)
-        wb.close()
-        os.replace(tmp, path)
-        return n_rows, n_filled, sorted(unknown)
-
-    def _apply_reference_text(self, path, ref, ref_lower):
-        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
-            first = fh.readline()
-            fh.seek(0)
-            sep = "\t" if "\t" in first else ","
-            rows = [r for r in csv.reader(fh, delimiter=sep)]
-        rows = [r for r in rows if any(c.strip() for c in r)]
-        if not rows:
-            raise ValueError(f"Empty BLAST table: {os.path.basename(path)}")
-        headers = [c.strip() for c in rows[0]]
-        if "Query_name" not in headers:
-            raise ValueError(f"{os.path.basename(path)} has no 'Query_name' column.")
-        q_i = headers.index("Query_name")
-        col_idx = {}
-        for name in QUERY_TAX_COLUMNS:
-            if name in headers:
-                col_idx[name] = headers.index(name)
-            else:
-                col_idx[name] = len(headers)
-                headers.append(name)
-        width = len(headers)
-
-        out = [headers]
-        n_rows = n_filled = 0
-        unknown = set()
-        for row in rows[1:]:
-            row = list(row) + [""] * (width - len(row))
-            value = row[q_i] if q_i < len(row) else ""
-            if str(value).strip():
-                n_rows += 1
-                sample = self._sample_of(value)
-                tax = self._lookup_tax(sample, ref, ref_lower)
-                if tax is None:
-                    unknown.add(sample)
-                    tax = ("", "", "", "")
-                else:
-                    n_filled += 1
-                for name, val in zip(QUERY_TAX_COLUMNS, tax):
-                    row[col_idx[name]] = val
-            out.append(row)
-
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="") as fh:
-            csv.writer(fh, delimiter=sep, lineterminator="\n").writerows(out)
-        os.replace(tmp, path)
-        return n_rows, n_filled, sorted(unknown)
+        """Write the four Query_* columns into a BLAST table, in place."""
+        return apply_reference_tax(path, ref, ref_lower, self.cfg.get("strip_suffix", ""))
 
     def _load_blast(self, path: str) -> Tuple[Dict[str, List[dict]],
                                               Dict[str, dict],
@@ -1554,39 +1608,13 @@ class _BestSeqWorker(QtCore.QThread):
 
     # ── Scoring ───────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _concordance(hit: dict, qtax: dict) -> str:
-        """Deepest rank shared by the expected query taxonomy and the subject.
-
-        Both sides are compared in normalised (lower-case) form; the report
-        keeps the original spelling.
-        """
-        def same(rank):
-            a = qtax.get(rank, "").lower()
-            b = hit.get(rank, "").lower()
-            return bool(a) and a == b
-
-        q_sp = qtax.get("organism", "").lower()
-        s_sp = hit.get("organism", "").lower()
-        if q_sp and s_sp:
-            # species names may carry authors or suffixes: compare the first two words
-            if " ".join(q_sp.split()[:2]) == " ".join(s_sp.split()[:2]):
-                return "organism"
-        if same("genus"):
-            return "genus"
-        if same("family"):
-            return "family"
-        if same("order"):
-            return "order"
-        return "none"
-
     def _evaluate(self, hits: List[dict],
                   qtax: dict) -> Tuple[Optional[dict], str]:
         """Best taxonomically concordant hit of one candidate sequence."""
         best = None
         best_level = "none"
         for hit in hits:
-            level = self._concordance(hit, qtax)
+            level = concordance_level(hit, qtax)
             deeper = self.TAX_BONUS[level] > self.TAX_BONUS[best_level]
             same_level_better_bit = (level == best_level and best is not None
                                      and hit["bit"] > best["bit"])
