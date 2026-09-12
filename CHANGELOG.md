@@ -127,6 +127,25 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   to judge a hit, computed in the same read/rewrite pass that applies the
   reference file rather than as a separate pass over the table.
 
+#### BOLD Formatter utility (sidebar, right below Best Sequence)
+- New **"BOLD Formatter"** panel (`_utilities/bold_formatter.py`) that takes a
+  BOLD Systems "Barcode ID" results export (`.xlsx`) and restyles it to match
+  the look of the BLAST results workbook, rather than adding another
+  from-scratch report format: a per-group **Hit rank** column, the same
+  navy/teal/burnt-orange column colour coding, banded fills per Query ID
+  group, a bold first hit, a frozen header row and column filters.
+- Groups every row by `Query ID` and sorts each group by `ID%` descending
+  itself — the input does not need to already be sorted or grouped — logging
+  any group it had to re-sort so a malformed export is never silently
+  reordered without a trace.
+- **"Hits to keep per Query ID"** caps the output to each query's top-N hits
+  (default 5, same idea as BLAST's "Hits per sequence"), or **"Keep all
+  hits"** to skip the cap entirely.
+- Writes `<input name>_formatted.xlsx` to the automatic
+  `output/ont-barcoder_<timestamp>_bold_format/` folder or a manually chosen
+  one, the same output-folder choice offered by the other export tools.
+- New manual section (§15) and screenshot.
+
 ---
 
 ## [3.3b] — 2026-09

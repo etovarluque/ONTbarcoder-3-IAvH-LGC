@@ -141,12 +141,13 @@
     <a href="#util-fastq">12. FASTQ Inspector</a>
     <a href="#util-blast">13. BLAST</a>
     <a href="#util-best">14. Best Sequence</a>
-    <a href="#util-notes">15. Notes</a>
-    <a href="#util-batch">16. Parameter Batch</a>
+    <a href="#util-bold">15. BOLD Formatter</a>
+    <a href="#util-notes">16. Notes</a>
+    <a href="#util-batch">17. Parameter Batch</a>
     <div class="sec">Reference</div>
-    <a href="#performance">17. Performance &amp; threads</a>
-    <a href="#troubleshoot">18. Troubleshooting</a>
-    <a href="#credits">19. Credits &amp; citation</a>
+    <a href="#performance">18. Performance &amp; threads</a>
+    <a href="#troubleshoot">19. Troubleshooting</a>
+    <a href="#credits">20. Credits &amp; citation</a>
   </nav>
 </aside>
 
@@ -195,8 +196,9 @@ Version 3.x preserves the algorithmic logic of ONTbarcoder 2.0 (Srivathsan <i>et
 2024) while adding a redesigned graphical interface, deterministic multiprocessing, a
 real-time (live sequencing) mode, a non-coding marker mode, and a set of integrated utilities
 (FASTA comparison, FASTA tools, a FASTQ inspector, an NCBI BLAST client — live search or
-parsing an already-downloaded result file — and a best-sequence selector that merges several
-runs).
+parsing an already-downloaded result file — a best-sequence selector that merges several
+runs, and a BOLD Formatter that restyles BOLD identification exports to match the BLAST
+report look).
 </p>
 <p>This manual targets researchers already familiar with amplicon sequencing and DNA
 barcoding. It documents every parameter, each pipeline phase, and all output files.</p>
@@ -257,7 +259,8 @@ python ONTbarcoder3.py</pre>
   <tr><td>biopython</td><td>Translation / genetic-code validation (<code>Bio.Seq</code>)</td></tr>
   <tr><td>edlib</td><td>Fast pairwise sequence alignment (demultiplexing &amp; comparison)</td></tr>
   <tr><td>xlsxwriter</td><td>Excel report generation (<code>runsummary.xlsx</code>, BLAST/Compare reports)</td></tr>
-  <tr><td>openpyxl</td><td>Reading <code>.xlsx</code> files (FASTA Tools "Append info to headers from .xlsx")</td></tr>
+  <tr><td>openpyxl</td><td>Reading/writing <code>.xlsx</code> files (FASTA Tools "Append info to headers
+      from .xlsx", BLAST report styling, BOLD Formatter)</td></tr>
 </table>
 
 <!-- ════════════════════════════════════════════════════ -->
@@ -622,7 +625,7 @@ to be residual error, heteroplasmy or a NUMT than a real variant.
       <td>1 … logical CPUs</td>
       <td>Parallel workers. The analysis is internally capped at the number of physical
           cores; higher values oversubscribe the CPU and run slower. See
-          <a href="#performance">§17</a>.</td></tr>
+          <a href="#performance">§18</a>.</td></tr>
   <tr><td><b>Minimum mean read quality (Q, 0 = off)</b></td><td>0</td><td>0 … 50</td>
       <td>Discards input reads whose mean quality is below this Q value before
           demultiplexing. Mean read quality is computed the ONT/NanoPlot way
@@ -1177,7 +1180,7 @@ are accepted and auto-detected from the file content — the <code>#</code>-comm
 <code>.txt</code> and the headerless <code>.csv</code> &mdash; and more than one file can be
 dropped at once to combine several jobs.</p>
 
-<figure class="ph">
+<figure class="">
   <img src="images/util-blast-file.png" alt="BLAST web results tab">
   PLACEHOLDER &middot; drop images/util-blast-file.png here
 </figure>
@@ -1535,14 +1538,54 @@ shown in bold, and the flags in amber.
 </div>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="util-notes">15. Utility — Notes</h2>
+<h2 id="util-bold">15. Utility — BOLD Formatter</h2>
+<p>Restyles a BOLD Systems <b>"Barcode ID"</b> results export (<code>.xlsx</code>) to match
+the look of the <a href="#util-blast">BLAST utility's (§13)</a> results workbook: a per-group
+<b>Hit rank</b> column, the top-N hits kept per query, the same navy/teal/burnt-orange colour
+coding, banded fills, a frozen header row and column filters. Open it from <b>BOLD
+Formatter</b> in the sidebar, just below <b>Best Sequence</b>.</p>
+
+<figure class="">
+  <img src="images/util-bold.png" alt="BOLD Formatter utility">
+  PLACEHOLDER &middot; drop images/util-bold.png here
+</figure>
+
+<h4>15.1 Input</h4>
+<p>Drag in (or browse to) a BOLD "Barcode ID" workbook exactly as downloaded from BOLD: a
+title row, a header row containing at least a <code>Query ID</code> and an <code>ID%</code>
+column, followed by hit rows. Hits do not need to already be sorted or grouped — the tool
+groups every row by <code>Query ID</code> and sorts each group by <code>ID%</code>
+descending itself, flagging in the log any group it had to re-sort.</p>
+
+<h4>15.2 Options</h4>
+<table>
+  <tr><th>Option</th><th>Description</th></tr>
+  <tr><td><b>Hits to keep per Query ID</b></td>
+      <td>Caps how many of each query's best hits are kept in the output, same idea as the
+          "Hits per sequence" setting in <a href="#util-blast">BLAST</a>. Default 5.</td></tr>
+  <tr><td><b>Keep all hits</b></td>
+      <td>Ignores the limit above and keeps every hit of every query.</td></tr>
+</table>
+
+<h4>15.3 Output and colour coding</h4>
+<p>The formatted copy is written as <code>&lt;input name&gt;_formatted.xlsx</code> to the
+chosen output folder — automatic (<code>output/ont-barcoder_&lt;timestamp&gt;_bold_format/</code>)
+or a manually picked one, the same choice offered by the other export tools. The first hit of
+each query is shown in bold, and a heavier top border separates one query's block of hits from
+the next. Columns are coloured by role, exactly as in the BLAST workbook: <b>navy</b> for the
+identifiers (<code>Hit rank</code>, <code>Query ID</code>), <b>teal</b> for the BOLD match
+metrics (<code>PID [BIN]</code>, <code>Indels</code>, <code>ID%</code>), and <b>burnt-orange</b>
+for the taxonomy columns (<code>Phylum</code> … <code>Species</code>).</p>
+
+<!-- ════════════════════════════════════════════════════ -->
+<h2 id="util-notes">16. Utility — Notes</h2>
 <p>A lightweight, file-based Markdown notebook built into the app — a place to keep
 run-specific observations, protocols or lab notes without leaving ONTbarcoder. Open it
 from the <b>NOTES 📝</b> item at the bottom of the sidebar.</p>
 
 <figure class="">
   <img src="images/util-notes.png" alt="Notes utility">
-  <figcaption><b>Figure 12.</b> The Notes utility: note list on the left, Markdown editor
+  <figcaption><b>Figure 13.</b> The Notes utility: note list on the left, Markdown editor
   and preview on the right.</figcaption>
 </figure>
 
@@ -1593,7 +1636,7 @@ notes are ordinary text files:</p>
 </ul>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="util-batch">16. Utility — Parameter Batch <span class="pill def">Optional</span> <span class="pill coi">Conventional only</span></h2>
+<h2 id="util-batch">17. Utility — Parameter Batch <span class="pill def">Optional</span> <span class="pill coi">Conventional only</span></h2>
 <p>Runs the currently loaded dataset once per combination of a small parameter grid —
 e.g. several <i>Main consensus calling frequency</i> / <i>Min. secondary variant
 fraction</i> / <i>Variant tolerance</i> values — instead of changing them by hand in
@@ -1607,7 +1650,7 @@ Not available in Real-Time mode.</p>
   PLACEHOLDER · drop images/util-batch.png here
 </figure>
 
-<h4>16.1 The <code>.cfg</code> grid file</h4>
+<h4>17.1 The <code>.cfg</code> grid file</h4>
 <p>A batch is defined by a plain-text file: one parameter per line, values separated by
 commas, <code>#</code> for comments. Only the parameters <i>listed</i> are overridden —
 on top of whatever is currently set in the Parameters panel — so a sweep of 3
@@ -1622,7 +1665,7 @@ list, ready to uncomment and edit. Percent fields (<i>Min. secondary variant
 fraction</i>, <i>Variant tolerance</i>) are written on the same 0–100 scale as their
 GUI spinboxes, not as a 0–1 fraction.</p>
 
-<h4>16.2 Validation</h4>
+<h4>17.2 Validation</h4>
 <p>The file is checked as soon as it is loaded — before anything runs:</p>
 <ul>
   <li>Every key must be a recognised parameter name (a typo is rejected immediately,
@@ -1640,7 +1683,7 @@ GUI spinboxes, not as a 0–1 fraction.</p>
       full analysis); above 200 the app asks for confirmation before starting anything.</li>
 </ul>
 
-<h4>16.3 Running a batch</h4>
+<h4>17.3 Running a batch</h4>
 <ol>
   <li>Load a dataset and set every parameter you want to keep <b>fixed</b> as usual, in
       <a href="#inputs">Input files</a> and <a href="#params">Parameters</a>.</li>
@@ -1654,7 +1697,7 @@ GUI spinboxes, not as a 0–1 fraction.</p>
       combination currently running (its own phase-by-phase progress, 0–100&nbsp;%).</li>
 </ol>
 
-<h4>16.4 Output — per-run summary and deduplicated FASTA</h4>
+<h4>17.4 Output — per-run summary and deduplicated FASTA</h4>
 <p>Once every combination finishes (or the batch is stopped), three files are written to
 the batch's own output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_batch/</code>).
 Runs are identified by a short <b>run number</b> (1, 2, 3…, in the order they ran) rather
@@ -1690,7 +1733,7 @@ per combination automatically. Best Sequence already picks the best-scoring vari
 sample when a sample carries more than one candidate, exactly the case a batch with
 variants produces.</p>
 
-<h4>16.5 Stopping a batch</h4>
+<h4>17.5 Stopping a batch</h4>
 <p>Stopping is handled the same way no matter how it happens — every path still writes
 the deduplicated FASTA from whatever combinations completed:</p>
 <ul>
@@ -1702,7 +1745,7 @@ the deduplicated FASTA from whatever combinations completed:</p>
 </ul>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="performance">17. Performance &amp; threads</h2>
+<h2 id="performance">18. Performance &amp; threads</h2>
 <p>The heavy work is many short alignment subprocesses (<code>disttbfast.exe</code>, each
 forced to a single internal thread). Optimal concurrency therefore tracks the number of
 <b>physical</b> cores, not logical (hyperthreaded) processors.</p>
@@ -1715,7 +1758,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
       keeps results deterministic and avoids disk contention.</li>
 </ul>
 
-<h2 id="troubleshoot">18. Troubleshooting</h2>
+<h2 id="troubleshoot">19. Troubleshooting</h2>
 <table>
   <tr><th>Symptom</th><th>Cause &amp; fix</th></tr>
   <tr><td>App fails to write output / profiles</td>
@@ -1763,7 +1806,7 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
 </table>
 
 <!-- ════════════════════════════════════════════════════ -->
-<h2 id="credits">19. Credits &amp; citation</h2>
+<h2 id="credits">20. Credits &amp; citation</h2>
 <p><b>Original software:</b> Amrita Srivathsan, V. Feng, D. Suárez, B. Emerson &amp;
 R. Meier.</p>
 <p><b>Version 3 development:</b> Eduardo Tovar Luque · Instituto Humboldt (2026).</p>

@@ -225,6 +225,7 @@ from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
 from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.fastq_inspector import FastqInspectorPanel
 from _utilities.fasta_tools import FastaToolsPanel
+from _utilities.bold_formatter import BoldFormatterPanel
 from _utilities.notes_panel import NotesPanel
 from _utilities.batch_sweep_panel import BatchSweepPanel
 from _utilities.batch_sweep import (parse_sweep_config, expand_grid, apply_overrides,
@@ -768,6 +769,7 @@ class SidebarWidget(QtWidgets.QWidget):
         ("fastq_inspector", "FASTQ Inspector"),
         ("blast",           "BLAST"),
         ("best_seq",        "Best Sequence"),
+        ("bold_formatter",  "BOLD Formatter"),
         ("notes",           "NOTES 📝"),
     ]
 
@@ -5210,6 +5212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_best_seq        = BestSeqPanel()
         self._panel_fastq_inspector = FastqInspectorPanel()
         self._panel_fasta_tools     = FastaToolsPanel()
+        self._panel_bold_formatter  = BoldFormatterPanel()
         self._panel_notes           = NotesPanel()
         self._panel_batch_sweep     = BatchSweepPanel()
 
@@ -5235,7 +5238,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._results_container, self._panel_compare,
             self._panel_blast, self._panel_best_seq,
             self._panel_fastq_inspector,
-            self._panel_fasta_tools, self._panel_notes,
+            self._panel_fasta_tools, self._panel_bold_formatter,
+            self._panel_notes,
             self._panel_batch_sweep,
         ):
             self._stack.addWidget(panel)
@@ -5244,7 +5248,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "setup": 0, "params": 1, "progress": 2,
             "live_chart": 3, "results": 4, "compare": 5,
             "blast": 6, "best_seq": 7, "fastq_inspector": 8,
-            "fasta_tools": 9, "notes": 10, "batch_sweep": 11,
+            "fasta_tools": 9, "bold_formatter": 10, "notes": 11,
+            "batch_sweep": 12,
         }
 
     def _connect_signals(self):
