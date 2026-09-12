@@ -93,6 +93,40 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   batch's internal queue silently stuck.
 - New **Notes** entry ("Parameter Batch") walking through the workflow.
 
+#### BLAST utility — a second tab, a shared taxonomy reference, Tax_level_match
+- The BLAST utility is now two tabs. **BLAST API Search** is the existing live
+  NCBI search, unchanged in behaviour. **BLAST web results** is new: it parses
+  a Hit Table already downloaded from `blast.ncbi.nlm.nih.gov` (website
+  **Download All → Hit Table(text)** or **Hit Table(csv)**, both formats
+  auto-detected) instead of submitting a new search — for when NCBI has
+  throttled this IP's search traffic. It still fetches organism/taxonomy via
+  NCBI E-utilities (a separate, low-volume service from the search queue this
+  tab exists to avoid), reusing `_BlastWorker`'s rate limiting, `.dbx` caches
+  and XLSX export through a subclass rather than a second implementation. It
+  writes `blastfile-<ts>.tsv`/`.xlsx` and its own run log; unlike a live
+  search it produces no FASTA of queried sequences, since the input file
+  carries hits only. Its **Parse results** button stays disabled once a run
+  finishes or errors — even if more files are dropped — until **Clear** is
+  pressed, so the same run cannot be launched twice by accident. The two tabs
+  refuse to run at the same time (each keeps an independent NCBI rate
+  limiter against the same IP; starting one while the other is still running
+  is blocked with a message instead of doubling the request rate).
+- Both tabs can now add the expected (query) taxonomy from a reference file —
+  the same **"I have a reference file with the query taxonomy"** feature Best
+  Sequence (§14.1) already offered, writing `Query_Order`/`Query_Family`/
+  `Query_Genus`/`Query_organism` into the results table before it is converted
+  to `.xlsx`. The matching/writing logic itself is not duplicated: it was
+  extracted out of `_BestSeqWorker` into module-level functions in
+  `best_seq_panel.py` that both utilities call, so a BLAST table can already
+  satisfy Best Sequence's own required columns by the time it gets there.
+- When a run has both sides of the taxonomy — hit taxonomy from "Fetch
+  organism + taxonomy" and expected taxonomy from the reference file above —
+  the table gains one more column, **`Tax_level_match`**, recording the
+  deepest rank at which the two agree (`organism`/`genus`/`family`/`order`/
+  `none`) — the same rule Best Sequence's own `Tax_level` column (§14.2) uses
+  to judge a hit, computed in the same read/rewrite pass that applies the
+  reference file rather than as a separate pass over the table.
+
 ---
 
 ## [3.3b] — 2026-09
