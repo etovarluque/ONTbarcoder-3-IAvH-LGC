@@ -68,6 +68,24 @@ PARAM_SPECS: Dict[str, tuple] = {
     "resolve_mixed.tolerance":          ("percent", 0, 40),
 }
 
+# Parameters that change what Phase 1 (demultiplexing) actually does — i.e.
+# which reads pass the length/quality filter and how tags/primers are
+# matched. Every other sweepable key only affects phase 2a/2b/3 (consensus
+# calling), so when two consecutive combinations agree on all of these,
+# ONTbarcoder3._run_next_batch_combo() reuses the previous combination's
+# "demultiplexed" output instead of re-running demultiplexing from scratch.
+PHASE1_PARAM_KEYS: Tuple[str, ...] = (
+    "minlen", "explen", "demlen", "minq", "tagmm",
+    "primersearchlen", "primermismatch",
+)
+
+
+def phase1_key(params: dict) -> tuple:
+    """Snapshot of the Phase-1-affecting parameters, for equality comparison
+    between consecutive batch combinations (see PHASE1_PARAM_KEYS)."""
+    return tuple(params.get(k) for k in PHASE1_PARAM_KEYS)
+
+
 _BOOL_TRUE = ("1", "true", "yes", "on")
 _BOOL_FALSE = ("0", "false", "no", "off")
 

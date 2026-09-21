@@ -91,6 +91,21 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   or closing the app mid-batch all still deduplicate and write the merged
   FASTA from whatever combinations completed — none of them can leave the
   batch's internal queue silently stuck.
+- Demultiplexing (Phase 1) is skipped and reused from the previous
+  combination whenever all 7 parameters that actually affect it (`minlen`,
+  `explen`, `demlen`, `minq`, `tagmm`, `primersearchlen`, `primermismatch`)
+  are unchanged — the common case of a sweep that only varies consensus
+  parameters (`consfreqfixed`, `resolve_mixed.*`, etc.) no longer repeats the
+  slowest phase for nothing. Reuse hard-links `demultiplexed/` from the prior
+  combination's folder (falling back to a copy if that's not possible, e.g.
+  across filesystems), so it's automatic and needs no `.cfg` changes —
+  though ordering the 7 demultiplex parameters before consensus ones in the
+  `.cfg` groups matching combinations together and reuses the most.
+- Each combination's log line now shows its wall-clock start time and the
+  batch's total elapsed time so far (`[3/90] started 14:32:05 (batch elapsed
+  00:41:12) ...`), and its "done" line shows how long that combination itself
+  took — previously only the `i/N` counter was shown, with elapsed time
+  available solely as a tooltip on the progress bar.
 - New **Notes** entry ("Parameter Batch") walking through the workflow.
 
 #### BLAST utility — a second tab, a shared taxonomy reference, Tax_level_match
@@ -145,6 +160,22 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   `output/ont-barcoder_<timestamp>_bold_format/` folder or a manually chosen
   one, the same output-folder choice offered by the other export tools.
 - New manual section (§15) and screenshot.
+
+### Fixed
+- Phase 2a's progress bar (and the overall run % derived from it) could reach
+  100% while the phase itself still had work left: when it loops over several
+  coverage levels (`coveragelist`), each level's own 0→100% sub-progress was
+  being read directly as "phase 2a done", and the row was explicitly marked
+  done after every level, not just the last one. The overall % never decreases
+  (by design, to avoid visibly jumping backwards between phases), so it
+  latched at 100% at the end of the *first* level and stayed there through
+  every remaining level. Most visible in Non-Coding analyses (ITS, etc.),
+  where phase 2a is the last active phase and a descending `coveragelist`
+  commonly has several levels — a run could sit at "100%" for minutes while
+  still genuinely in phase 2a. Progress is now reported as a fraction of all
+  levels combined, and the phase is only marked done once the last level
+  actually finishes. Affects every analysis with more than one coverage
+  level, not just Parameter Batch.
 
 ---
 

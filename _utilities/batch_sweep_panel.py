@@ -313,12 +313,23 @@ class BatchSweepPanel(QtWidgets.QWidget):
             self._elapsed_timer.stop()
             self._run_progress.hide()
 
-    def _tick_elapsed(self):
-        elapsed = int(time.monotonic() - self._start_time)
-        h, rem = divmod(elapsed, 3600)
+    @staticmethod
+    def format_elapsed(seconds: int) -> str:
+        """"Xh MM:SS" (or "MM:SS" under an hour) — shared by the batch-elapsed
+        tooltip/log timestamps and by MainWindow's per-combination duration."""
+        h, rem = divmod(max(0, seconds), 3600)
         m, s = divmod(rem, 60)
-        t_str = f"{h}h {m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
-        self._progress.setToolTip(f"Elapsed: {t_str}")
+        return f"{h}h {m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def elapsed_str(self) -> str:
+        """Wall-clock time elapsed since the batch started (set_running(True))
+        — used to timestamp each combination's log line."""
+        if not self._start_time:
+            return "00:00"
+        return self.format_elapsed(int(time.monotonic() - self._start_time))
+
+    def _tick_elapsed(self):
+        self._progress.setToolTip(f"Elapsed: {self.elapsed_str()}")
 
     def on_finished(self, summary: dict):
         self.set_running(False)

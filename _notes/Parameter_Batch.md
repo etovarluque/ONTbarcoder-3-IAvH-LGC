@@ -29,6 +29,17 @@ want to vary.
 **Start batch**. Each combination runs as a normal analysis in its own
 `ont-barcoder_*_conv` folder — nothing about a single run changes.
 
+**Demultiplexing reuse:** Phase 1 (demultiplexing) only depends on 7 of the
+sweepable parameters — `minlen`, `explen`, `demlen`, `minq`, `tagmm`,
+`primersearchlen`, `primermismatch`. When a combination has the exact same
+values for all 7 as the *previous* one in the queue, its `demultiplexed`
+output is reused (hard-linked, or copied if that's not possible) instead of
+demultiplexing again from scratch — only phases 2a/2b/3 re-run. This is
+automatic and needs no configuration; it only kicks in for *consecutive*
+combinations, so listing the 7 demultiplex parameters before any consensus
+parameter in the `.cfg` groups matching combinations together and reuses the
+most.
+
 4- Once every combination finishes, the tool writes three files to the
 batch's own output folder, all identifying runs by a short run number
 (1, 2, 3…) instead of the full timestamped folder name:

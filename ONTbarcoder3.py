@@ -229,7 +229,8 @@ from _utilities.bold_formatter import BoldFormatterPanel
 from _utilities.notes_panel import NotesPanel
 from _utilities.batch_sweep_panel import BatchSweepPanel
 from _utilities.batch_sweep import (parse_sweep_config, expand_grid, apply_overrides,
-                                     validate_sweep, combo_label, dedup_consensus_filtered)
+                                     validate_sweep, combo_label, dedup_consensus_filtered,
+                                     phase1_key)
 # ── i18n ──────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import xml.etree.ElementTree as _ET
@@ -5937,6 +5938,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_current_tag = None
         self._batch_stop_requested = False
         self._batch_running = True
+        # Phase-1 output of the last combination that actually ran demultiplexing,
+        # reused by the next combination when its phase1_key() matches (see
+        # _run_next_batch_combo / _reuse_phase1_from_batch).
+        self._batch_prev_phase1 = None
+        self._batch_reuse_phase1_source = None
+        self._batch_current_phase1_key = None
 
         self.analysisFinished.connect(self._on_batch_combo_finished)
         self._panel_progress.overallProgressChanged.connect(self._on_batch_run_progress)
@@ -6016,11 +6023,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_run_meta[tag] = {"label": combo_label(combo), "n_filt": None}
         self._batch_current_tag = tag
 
+        self._batch_current_phase1_key = phase1_key(params)
+        if (self._batch_prev_phase1 is not None
+                and self._batch_prev_phase1["key"] == self._batch_current_phase1_key):
+            self._batch_reuse_phase1_source = self._batch_prev_phase1
+        else:
+            self._batch_reuse_phase1_source = None
+
         self._panel_progress.reset()
         n = len(self._batch_queue)
+        self._batch_combo_start = time.monotonic()
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
         self._panel_batch_sweep.set_progress(self._batch_index, n)
         self._panel_batch_sweep.append_log(
-            f"[{self._batch_index + 1}/{n}] {combo_label(combo)} -> {folder_name}")
+            f"[{self._batch_index + 1}/{n}] started {now_str} "
+            f"(batch elapsed {self._panel_batch_sweep.elapsed_str()}) "
+            f"{combo_label(combo)} -> {folder_name}")
+        if self._batch_reuse_phase1_source is not None:
+            self._panel_batch_sweep.append_log(
+                "  Demultiplex parameters unchanged from the previous combination "
+                "— reusing its Phase 1 output.")
 
         self._run_full_pipeline()
 
@@ -6040,10 +6062,26 @@ class MainWindow(QtWidgets.QMainWindow):
                     n_filt = sum(1 for line in fh if line.startswith(">"))
             except OSError:
                 pass
+        combo_elapsed = int(time.monotonic() - getattr(self, "_batch_combo_start", time.monotonic()))
         self._panel_batch_sweep.append_log(
-            f"    done — consensus_filtered.fa: {n_filt} barcode(s)")
+            f"    done in {self._panel_batch_sweep.format_elapsed(combo_elapsed)} "
+            f"— consensus_filtered.fa: {n_filt} barcode(s)")
         if self._batch_current_tag in self._batch_run_meta:
             self._batch_run_meta[self._batch_current_tag]["n_filt"] = n_filt
+
+        # Snapshot this combination's Phase 1 output so the next combination can
+        # reuse it if its phase1_key() matches (see _run_next_batch_combo).
+        self._batch_prev_phase1 = {
+            "key": self._batch_current_phase1_key,
+            "outpath": self._outpath,
+            "sampleids": dict(self.sampleids),
+            "totalseqs": getattr(self, "totalseqs", 0),
+            "ndemultiplexed": getattr(self, "ndemultiplexed", 0),
+            "nsampledemultiplexed5": getattr(self, "nsampledemultiplexed5", 0),
+            "nseqspasslen": getattr(self, "nseqspasslen", 0),
+            "nseqsfordemultiplexing": getattr(self, "nseqsfordemultiplexing", 0),
+        }
+
         self._batch_index += 1
         self._run_next_batch_combo()
 
@@ -6117,6 +6155,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── Conventional pipeline ──────────────────────── ────────────────────────
     def _run_conventional_pipeline(self, params, outpath, logfile):
+        reuse = getattr(self, "_batch_reuse_phase1_source", None)
+        if reuse is not None:
+            self._reuse_phase1_from_batch(reuse, params, outpath, logfile)
+            return
+
         self.worker_prep = prepdemultiplex(
             self._demfile, self._fastq,
             os.path.join(outpath, "1_demultiplexing"),
@@ -6132,6 +6175,71 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.set_phase("1", "Preparing demultiplexing...")
         if not self._is_live():
             self._panel_progress._start_timer()   # only in conventional mode; in RT the timer starts at the beginning of the analysis
+
+    def _reuse_phase1_from_batch(self, reuse, params, outpath, logfile):
+        """Batch mode only: this combination's Phase 1 (demultiplex) parameters
+        are identical to the previous combination's (see phase1_key() /
+        _run_next_batch_combo), so its 'demultiplexed' output is hard-linked
+        (or copied, if hard-linking fails, e.g. across filesystems) into this
+        combination's output folder instead of re-running prepdemultiplex and
+        the demultiplexing pool from scratch. Only phase 2a/2b/3 parameters
+        differ between the two, and those are read fresh from `params`/
+        `outpath` by _run_consensus_by_length() and everything after it."""
+        src_outpath = reuse["outpath"]
+        src_demux = os.path.join(src_outpath, "demultiplexed")
+        dst_demux = os.path.join(outpath, "demultiplexed")
+
+        def _link_or_copy(src, dst, *, follow_symlinks=True):
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+            return dst
+
+        shutil.copytree(src_demux, dst_demux, dirs_exist_ok=True,
+                         copy_function=_link_or_copy)
+
+        self.sampleids = dict(reuse["sampleids"])
+        self.totalseqs = reuse["totalseqs"]
+        self.ndemultiplexed = reuse["ndemultiplexed"]
+        self.nsampledemultiplexed5 = reuse["nsampledemultiplexed5"]
+        self.nseqspasslen = reuse["nseqspasslen"]
+        self.nseqsfordemultiplexing = reuse["nseqsfordemultiplexing"]
+
+        logfile.write(
+            f"Phase 1 (demultiplexing) skipped: same demultiplex parameters as "
+            f"the previous combination — reused output from "
+            f"{os.path.basename(src_outpath)}\n\n")
+        logfile.flush()
+
+        if not self._is_live():
+            self._panel_progress._start_timer()
+        self._panel_progress.stat_total.update_value(f"{self.totalseqs:,}")
+        self._panel_progress.set_phase("1", "Reusing previous combination's output...")
+        self._panel_progress.update_phase_progress(
+            "1", self.nseqsfordemultiplexing or 1, self.nseqsfordemultiplexing or 1)
+        self._panel_progress.mark_phase_done("1", "Demultiplexing reused (parameters unchanged)")
+        self._panel_progress.append_log(
+            "Reusing Phase 1 output from the previous combination (demultiplex "
+            "parameters unchanged) — demultiplexing skipped.", "info")
+        self._panel_progress.append_log(f"Demultiplexed reads: {self.ndemultiplexed:,}", "ok")
+        self._panel_progress.append_log(f"Samples with ≥5 reads: {self.nsampledemultiplexed5}", "ok")
+        self._panel_progress.update_stat_dem(self.ndemultiplexed, self.totalseqs, final=True)
+
+        try:
+            demsheet = self.wb.add_worksheet("1. Demultiplexing")
+            demsheet.write(0, 0, "SpecimenID")
+            demsheet.write(0, 1, "Number of sequences demultiplexed")
+            for i, (sample, count) in enumerate(self.sampleids.items()):
+                demsheet.write(i + 1, 0, sample)
+                demsheet.write(i + 1, 1, count)
+        except Exception as e:
+            self._panel_progress.append_log(f"  Warning Excel 1. Demultiplexing: {e}", "warn")
+
+        if params["run_phase2a"]:
+            self._run_consensus_by_length()
+        else:
+            self._finish_analysis()
 
     # ── Real time pipeline ──────────────────────── ─────────────────────────
     def _run_live_pipeline(self, params, outpath, logfile):
@@ -7194,8 +7302,19 @@ class MainWindow(QtWidgets.QMainWindow):
         _cov_now = self.selectlens[self.selectlenscounter] if self.selectlens else ""
         n_ok = sum(1 for v in self.con200flags.values() if v)
         floor = getattr(self, "_live_ok_floor", 0)
-        _extra = (f"coverage {_cov_now} → {n} samples" if _cov_now else "")
-        self._panel_progress.update_phase_progress("2a", i, n, extra=_extra)
+        # Phase 2a can loop over several coverage levels (params["coveragelist"]):
+        # report progress as a fraction of ALL levels, not just this one, so the
+        # phase's own bar — which _compute_overall_percent() reads directly for
+        # the "current" phase's contribution — doesn't hit 100% at the end of
+        # the first level while more levels are still pending. This is what
+        # previously made the overall % latch at 100% mid-phase in Non-Coding
+        # mode, where phase 2a is the last active phase.
+        n_levels = len(self.selectlens) if self.selectlens else 1
+        level_frac = (i / n) if n else 1.0
+        pct_2a = max(0, min(100, int((self.selectlenscounter + level_frac) / n_levels * 100)))
+        _extra = (f"coverage {_cov_now}, level {self.selectlenscounter + 1}/{n_levels} "
+                  f"→ {n} samples" if _cov_now else "")
+        self._panel_progress.update_phase_progress("2a", pct_2a, 100, extra=_extra)
         self._panel_progress.update_stat_ok(max(n_ok, floor))
 
     @_phase_callback
@@ -7398,15 +7517,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.append_log(
             f"  Coverage {current_cov}: {n_good_this} {label_tipo} "
             f"(accumulated: {n_good_accum})", "ok")
-        self._panel_progress.mark_phase_done(
-            "2a",
-            f"Coverage {current_cov}: {n_good_this} {label_tipo} — {n_good_accum} accumulated"
-        )
 
         if len(self.inlistforconsensus) > 0 and \
                 self.selectlenscounter < len(self.selectlens):
+            # More coverage levels remain — phase 2a is NOT done yet. Marking
+            # it "done" here (as used to happen unconditionally) forced its
+            # full weight into _compute_overall_percent() after only the
+            # FIRST level, latching the overall % at 100% (via the
+            # never-decreases clamp) while later, often much longer, levels
+            # were still running — most visible in Non-Coding mode, where
+            # phase 2a is the last active phase.
             self._run_consensus_by_length()
         else:
+            self._panel_progress.mark_phase_done(
+                "2a",
+                f"Coverage {current_cov}: {n_good_this} {label_tipo} — {n_good_accum} accumulated"
+            )
             all_step1 = os.path.join(outpath, "barcodesets", "consensus_by_length",
                                      "consensus_all_step1.fa")
             all_prederr = os.path.join(outpath, "barcodesets", "consensus_by_length",
