@@ -3693,6 +3693,10 @@ class ProgressPanel(QtWidgets.QWidget):
         # mid-phase, which would otherwise make the overall % briefly go
         # backwards; clamp emissions to be monotonic within a run instead.
         self._max_overall_pct = 0
+        # phase_id -> fraction override used only by _compute_overall_percent()
+        # for a "current" phase whose own displayed bar isn't a safe proxy for
+        # how much of the whole phase is done (see set_phase_true_fraction).
+        self._phase_true_frac = {}
         for pid, pname in self.PHASES:
             row = PhaseRow(pid, pname)
             self._layout.addWidget(row)
@@ -3824,6 +3828,7 @@ class ProgressPanel(QtWidgets.QWidget):
             row.setVisible(True)   # all visible until configured_phases filters them out
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
         self._max_overall_pct = 0
+        self._phase_true_frac = {}
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
@@ -3852,6 +3857,7 @@ class ProgressPanel(QtWidgets.QWidget):
             row.setVisible(True)
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
         self._max_overall_pct = 0
+        self._phase_true_frac = {}
         self._finalize_btn.setVisible(False)
         self._finalize_btn.setEnabled(True)
         self._stop_btn.setEnabled(True)
@@ -3969,7 +3975,16 @@ class ProgressPanel(QtWidgets.QWidget):
         running one counts by its own bar %, pending phases count as 0.
         Uses _active_phase_ids rather than PhaseRow.isVisible(), since the
         latter is always False while this panel isn't the current
-        QStackedWidget page (e.g. during a Parameter Batch run)."""
+        QStackedWidget page (e.g. during a Parameter Batch run).
+
+        A "current" phase normally counts by its own displayed bar value, but
+        a phase can register a separate _phase_true_frac override (see
+        set_phase_true_fraction) when its displayed bar isn't a safe proxy for
+        how much of the WHOLE phase is done — e.g. phase 2a's bar shows
+        progress within the current coverage level only (a locally steady,
+        easy-to-read rate), which reaches 100 at the end of EVERY level, not
+        just the last one; without the override this would make the overall %
+        latch at "phase 2a done" after just the first of several levels."""
         order = [pid for pid, _ in self.PHASES if pid in self._active_phase_ids]
         if not order:
             return 0
@@ -3980,12 +3995,21 @@ class ProgressPanel(QtWidgets.QWidget):
             if state == "done":
                 total_frac += 1.0
             elif state == "current":
-                total_frac += row._bar.value() / 100.0
+                override = self._phase_true_frac.get(pid)
+                total_frac += override if override is not None else row._bar.value() / 100.0
         return max(0, min(100, int(total_frac / len(order) * 100)))
+
+    def set_phase_true_fraction(self, phase_id, frac):
+        """Overrides, for _compute_overall_percent() only, how much of
+        `phase_id` (still "current") is actually done — independent of what
+        its row displays. See _compute_overall_percent()'s docstring."""
+        self._phase_true_frac[phase_id] = max(0.0, min(1.0, frac))
+        self._emit_overall_progress()
 
     def mark_phase_done(self, phase_id, detail=""):
         if phase_id in self._phase_rows:
             self._phase_rows[phase_id].set_state("done", detail)
+            self._phase_true_frac.pop(phase_id, None)
             self._emit_overall_progress()
 
     def get_ok_value(self) -> int:
@@ -6157,8 +6181,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run_conventional_pipeline(self, params, outpath, logfile):
         reuse = getattr(self, "_batch_reuse_phase1_source", None)
         if reuse is not None:
-            self._reuse_phase1_from_batch(reuse, params, outpath, logfile)
-            return
+            try:
+                self._reuse_phase1_from_batch(reuse, params, outpath, logfile)
+                return
+            except Exception as e:
+                # Never let a reuse failure leave the batch queue stuck (this
+                # runs inside a Qt slot invoked via a signal — an uncaught
+                # exception here is swallowed by PyQt5 with no dialog, and the
+                # packaged app has no console to show its traceback either,
+                # so the batch would just silently stop advancing). Fall back
+                # to a normal Phase 1 run for this combination instead.
+                self._panel_progress.append_log(
+                    f"  Could not reuse the previous combination's Phase 1 "
+                    f"output ({e}) — re-running demultiplexing for this "
+                    f"combination instead.", "warn")
+                logfile.write(f"Phase 1 reuse failed: {e} — running a normal "
+                              f"demultiplex for this combination.\n")
+                logfile.flush()
 
         self.worker_prep = prepdemultiplex(
             self._demfile, self._fastq,
@@ -6196,8 +6235,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
             return dst
 
-        shutil.copytree(src_demux, dst_demux, dirs_exist_ok=True,
-                         copy_function=_link_or_copy)
+        if os.path.isdir(src_demux):
+            shutil.copytree(src_demux, dst_demux, dirs_exist_ok=True,
+                             copy_function=_link_or_copy)
+        else:
+            # _organize_output_folder() runs at the end of EVERY analysis
+            # (batch or not) and, by the time this next combination starts,
+            # has already compressed the previous combination's demultiplexed/
+            # into intermediate_files/demultiplexed.zip and deleted the
+            # original folder. Unpack that zip instead of re-demultiplexing.
+            import zipfile
+            src_zip = os.path.join(src_outpath, "intermediate_files", "demultiplexed.zip")
+            if not os.path.isfile(src_zip):
+                raise FileNotFoundError(
+                    f"neither {src_demux} nor {src_zip} exist")
+            with zipfile.ZipFile(src_zip) as zf:
+                zf.extractall(outpath)
 
         self.sampleids = dict(reuse["sampleids"])
         self.totalseqs = reuse["totalseqs"]
@@ -7302,19 +7355,23 @@ class MainWindow(QtWidgets.QMainWindow):
         _cov_now = self.selectlens[self.selectlenscounter] if self.selectlens else ""
         n_ok = sum(1 for v in self.con200flags.values() if v)
         floor = getattr(self, "_live_ok_floor", 0)
-        # Phase 2a can loop over several coverage levels (params["coveragelist"]):
-        # report progress as a fraction of ALL levels, not just this one, so the
-        # phase's own bar — which _compute_overall_percent() reads directly for
-        # the "current" phase's contribution — doesn't hit 100% at the end of
-        # the first level while more levels are still pending. This is what
-        # previously made the overall % latch at 100% mid-phase in Non-Coding
-        # mode, where phase 2a is the last active phase.
         n_levels = len(self.selectlens) if self.selectlens else 1
-        level_frac = (i / n) if n else 1.0
-        pct_2a = max(0, min(100, int((self.selectlenscounter + level_frac) / n_levels * 100)))
+
+        # The card shows progress WITHIN the current coverage level only — a
+        # locally steady rate, since every sample in a level shares the same
+        # coverage/cost — same as before coverage levels had an overall-%
+        # override (below).
         _extra = (f"coverage {_cov_now}, level {self.selectlenscounter + 1}/{n_levels} "
                   f"→ {n} samples" if _cov_now else "")
-        self._panel_progress.update_phase_progress("2a", pct_2a, 100, extra=_extra)
+        self._panel_progress.update_phase_progress("2a", i, n, extra=_extra)
+
+        # Overall %: a SEPARATE fraction across ALL levels, decoupled from the
+        # card above, so phase 2a's contribution to the run's overall % never
+        # hits 100% just because the FIRST of several levels finished (its own
+        # card bar reaches 100 at the end of every level, not just the last).
+        level_frac = (i / n) if n else 1.0
+        true_frac = (self.selectlenscounter + level_frac) / n_levels
+        self._panel_progress.set_phase_true_fraction("2a", true_frac)
         self._panel_progress.update_stat_ok(max(n_ok, floor))
 
     @_phase_callback

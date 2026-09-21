@@ -176,6 +176,28 @@ a batch with an empty `.cfg` reproduces a normal single run exactly.
   levels combined, and the phase is only marked done once the last level
   actually finishes. Affects every analysis with more than one coverage
   level, not just Parameter Batch.
+- Parameter Batch's Phase 1 reuse (same section, "Demultiplexing reuse")
+  froze the batch on the second combination whenever reuse actually applied:
+  `_organize_output_folder()`, which runs at the end of every analysis, had
+  already compressed the previous combination's `demultiplexed/` into
+  `intermediate_files/demultiplexed.zip` and deleted the original folder by
+  the time the next combination looked for it, so the copy raised
+  `FileNotFoundError`. That exception was thrown from inside a Qt slot
+  invoked via a signal, which PyQt5 swallows silently with no dialog — and
+  the packaged app has no console to print the traceback to either — so the
+  batch simply stopped advancing with no visible error. Reuse now unpacks
+  `demultiplexed.zip` when the raw folder is already gone, and any further
+  failure in the reuse path now logs a warning and falls back to a normal
+  Phase 1 run for that combination instead of silently stalling the batch.
+- Fixing the above made phase 2a's own progress card jump unevenly (slow
+  through the first, most expensive coverage level, then fast through the
+  smaller ones) instead of the locally steady per-level rate it showed
+  before, since its displayed bar was repurposed to also drive the overall
+  run %. The two are now decoupled: the card goes back to showing plain
+  progress within the current coverage level (`ProgressPanel.
+  set_phase_true_fraction()`), while a separate, level-aware fraction feeds
+  only the overall % — so the overall % still can't reach 100% early, without
+  making the card itself uneven.
 
 ---
 
