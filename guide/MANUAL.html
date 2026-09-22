@@ -1104,37 +1104,53 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
 </ul>
 <h4>Batch size &mdash; Automatic and Manual</h4>
 <p>Every batch is submitted to NCBI as <b>one BLAST search</b>, so the way the run is split
-decides how much of your NCBI quota it spends. Two limits matter, and they are not the ones
-most users assume:</p>
+decides how much of your NCBI quota it spends. Three limits matter, and the third is not one
+most users expect:</p>
 <table>
   <tr><th>Limit</th><th>Value</th><th>Counted against</th></tr>
   <tr><td>Length of a single query</td><td>1,000,000 bases (<code>blastn</code>)</td>
-      <td>The search &mdash; NCBI rejects anything longer.</td></tr>
+      <td>The search &mdash; NCBI rejects anything longer, with an explicit error.</td></tr>
   <tr><td>Searches in 24&nbsp;h</td><td>100</td>
       <td>Your <b>IP address</b>. Beyond it NCBI moves your traffic to a slower queue and,
           in extreme cases, blocks it.</td></tr>
+  <tr><td>CPU time per search (undocumented)</td>
+      <td>Not published by NCBI &mdash; in practice, far below 1,000,000 bases</td>
+      <td>The search itself, silently: NCBI answers with no RID and no error text the panel
+          can show, which just looks like "no response". A heavy program+database
+          combination (<code>blastn + MEGABLAST</code> against <code>core_nt</code>) hits
+          this far sooner than the base-length limit above.</td></tr>
 </table>
-<p>Because the penalty counts <b>searches, not sequences</b>, larger batches are <i>safer</i>,
-not riskier &mdash; NCBI's own developer guidance is that several queries sent as one search
-run more efficiently than one search each. A second API key does not lift the limit: it
-applies to the IP, not the account.</p>
+<p>The <b>searches-per-day</b> penalty counts searches, not sequences, so a larger batch is
+still lighter on that quota. But in practice, testing a real run against <code>core_nt</code>
+with MEGABLAST showed batches of 500 and even 250 sequences silently rejected by the
+undocumented CPU-time limit, while <b>100 sequences per search</b> worked reliably &mdash; so
+that is both the ceiling Automatic mode uses and the default Manual starts from, well under
+the base-length or daily-searches limits. A second API key does not lift either NCBI limit:
+it applies to the IP, not the account.</p>
 <p>The <b>Sequences per BLAST search</b> row therefore offers two modes:</p>
 <ul>
   <li><b>Automatic</b> (default) &mdash; the program reads the loaded FASTA files and picks
       the size that uses the <b>fewest searches</b>, then spreads the sequences evenly over
       them so the last batch is not a remainder of two or three. It respects both the
-      1,000,000-base ceiling (a margin below it, for encoding overhead) and a cap of 1000
+      1,000,000-base ceiling (a margin below it, for encoding overhead) and a cap of 100
       sequences per search, so that one failure never costs the whole run. There is no number
       to set, so the box is hidden; the plan line below states the result.</li>
   <li><b>Manual</b> &mdash; the number box appears and you set it yourself, from 1 to 1000.
-      It starts from the value Automatic had computed, so you adjust from a sensible
-      figure rather than from scratch.</li>
+      It starts from the value Automatic had computed (100, by default), so you adjust from a
+      sensible figure rather than from scratch. Raising it well above 100 risks the
+      undocumented CPU-time rejection above, especially against <code>core_nt</code>.</li>
 </ul>
 <p>In both modes a line under the row shows the resulting plan before you run anything, for
-example <code>516 sequences &middot; 429,647 bases &rarr; 1 search of 516 sequences</code>. In
-Manual it also warns when the chosen value wastes quota (<i>&laquo;Automatic would use 1
-instead&raquo;</i>) or exceeds the 100-searches limit outright. The preview and the run share
+example <code>516 sequences &middot; 429,647 bases &rarr; 6 searches of ~86 sequences</code>.
+In Manual it also warns when the chosen value wastes quota (<i>&laquo;Automatic would use 1
+instead&raquo;</i>) or exceeds the 100-<b>searches-per-day</b> limit outright &mdash; a
+separate number from the 100-sequences-per-batch default above. The preview and the run share
 the same splitting code, so what is shown is what is submitted.</p>
+<p>If NCBI still rejects a batch outright (no RID, or a failed search status), the panel
+halves it and retries automatically &mdash; down to 20 sequences or three halvings, whichever
+comes first &mdash; instead of losing the whole batch. Each retry is logged together with
+NCBI's own reason when it gives one, so a rejection reads as a specific cause rather than a
+plain "no response".</p>
 
 <h4>Waiting for results</h4>
 <p>A BLAST job is a queued search, not a request that fails after N retries: how long it takes
@@ -1227,6 +1243,14 @@ DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
 <p>Filling these columns in directly from BLAST means the table already satisfies Best
 Sequence's own requirement (§14.1) with no further editing — the tip above (§13.1) relies on
 exactly this.</p>
+<p>Below the reference file drop zone, <b>Strip suffix from sample ID</b> (default
+<code>_all.fa</code>) is removed from that sample ID before the lookup, since consensus-building
+pipelines commonly carry it as part of the query name:
+<code>DNS-1343_all.fa;758;807 &rarr; DNS-1343</code>. Leave it blank if the query name's sample
+ID already matches the reference file's identifier exactly. A match is tried on the ID as
+typed first, then case-insensitively; a sample ID not found in the reference is left blank
+rather than guessed, and is counted in the run's result message so mismatches are visible
+immediately rather than discovered later as empty <code>Query_*</code> columns.</p>
 
 <h4>The Tax_level_match column</h4>
 <p>When a run has <b>both</b> sides of the taxonomy — hit taxonomy from "Fetch organism +
@@ -1239,6 +1263,23 @@ end, <code>Tax_level_match</code>, recording the deepest rank at which the two a
 (§14.2) uses to judge a hit, so a BLAST table already shows whether a hit taxonomically
 supports the sample without waiting for Best Sequence to run. If either side of the taxonomy
 is missing, no column is added.</p>
+
+<h3>13.4 Fixing or adding query taxonomy after a run</h3>
+<p>The <b>Apply reference taxonomy to a results file&hellip;</b> link, under the checkbox in
+§13.3 on either tab, re-applies a reference file to an already-finished results table
+&mdash; <b>without submitting a new BLAST search</b>. It exists for the two situations that
+otherwise leave a finished table without query taxonomy even though a reference file exists:
+the reference wasn't ready yet when the search ran, or the match needed a
+<b>Strip suffix</b> that wasn't set at the time. Since a BLAST run can take a long time and
+counts against the daily searches limit (§13.1), re-running it just to fix these two columns
+is wasteful; this tool only repeats the local, offline matching step.</p>
+<p>It opens a small dialog: drag or browse to the <code>.tsv</code>/<code>.csv</code> results
+table to update, then the reference file and suffix exactly as in §13.3. <b>Apply</b> writes
+the <code>Query_*</code> columns (and <code>Tax_level_match</code>, if the table already
+carries hit taxonomy) into that file in place, and regenerates its matching
+<code>.xlsx</code> &mdash; overwriting the previous one, so both files reflect the corrected
+taxonomy. Running it more than once on the same table is safe: a rematch reuses the existing
+<code>Tax_level_match</code> column instead of adding another one.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="util-best">14. Utility — Best Sequence</h2>

@@ -27,9 +27,14 @@ from .best_seq_panel import (
 # Cap for one query, a little below NCBI's 1,000,000 so headers and percent
 # encoding cannot push a batch over the line.
 MAX_QUERY_BASES = 900_000
-# Ceiling on sequences in one search. Not an NCBI rule: it keeps a single job
-# from growing so large that one failure costs the whole run.
-MAX_QUERY_SEQS  = 1000
+# Ceiling on sequences in one search. Not a documented NCBI limit but a
+# practical one: NCBI also enforces an undocumented CPU-time budget per web
+# BLAST job (independent of MAX_QUERY_BASES), and a MEGABLAST search of a few
+# hundred sequences against a huge database like core_nt can exceed it,
+# leaving the submission to time out with no usable reply. In testing, 500
+# and 250 both still failed against core_nt; 100 was the first size that
+# worked reliably. _BlastWorker also auto-splits a batch NCBI still rejects.
+MAX_QUERY_SEQS  = 100
 
 
 def plan_batch_sizes(lengths, nseq, max_bases=MAX_QUERY_BASES):
@@ -100,7 +105,8 @@ _SUBJECT_TAX_COLUMNS = ("Subject_Order", "Subject_Family", "Subject_Genus", "Sub
 _TAX_RANK_KEYS = ("order", "family", "genus", "organism")
 
 
-def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
+def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict,
+                                   strip_suffix: str = ""):
     """Write the Query_* reference-taxonomy columns into *tsv_path* and, when
     the table also carries Subject_* (hit) taxonomy, append a 'Tax_level_match'
     column recording the deepest rank at which the two agree — the same rule
@@ -126,6 +132,20 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
     headers = [c.strip() for c in rows[0]]
     if "Query_name" not in headers:
         raise ValueError(f"{os.path.basename(tsv_path)} has no 'Query_name' column.")
+
+    # A version of this function used to append a new Tax_level_match column
+    # on every re-run instead of reusing the existing one. Clean up any
+    # leftover duplicates from that now, keeping only the last (most recently
+    # written) one.
+    dup_positions = [i for i, h in enumerate(headers) if h == "Tax_level_match"]
+    if len(dup_positions) > 1:
+        drop = set(dup_positions[:-1])
+        keep = [i for i in range(len(headers)) if i not in drop]
+        headers = [headers[i] for i in keep]
+        rows = [rows[0]] + [
+            [r[i] if i < len(r) else "" for i in keep] for r in rows[1:]
+        ]
+
     q_i = headers.index("Query_name")
 
     query_idx = {}
@@ -139,8 +159,15 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
     has_subject_tax = all(c in headers for c in _SUBJECT_TAX_COLUMNS)
     subject_idx = ({c: headers.index(c) for c in _SUBJECT_TAX_COLUMNS}
                    if has_subject_tax else {})
+    match_idx = None
     if has_subject_tax:
-        headers = headers + ["Tax_level_match"]
+        # Reuse an existing Tax_level_match column (e.g. from a previous run
+        # of this same function) instead of appending a second one.
+        if "Tax_level_match" in headers:
+            match_idx = headers.index("Tax_level_match")
+        else:
+            match_idx = len(headers)
+            headers.append("Tax_level_match")
     width = len(headers)
 
     out = [headers]
@@ -151,7 +178,7 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
         value = row[q_i] if q_i < len(row) else ""
         if str(value).strip():
             n_rows += 1
-            sample = sample_id_of(value)
+            sample = sample_id_of(value, strip_suffix)
             tax = lookup_tax(sample, ref, ref_lower)
             if tax is None:
                 unknown.add(sample)
@@ -165,7 +192,7 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
                     for k, c in zip(_TAX_RANK_KEYS, QUERY_TAX_COLUMNS)}
             hit = {k: display_taxon(row[subject_idx[c]])
                    for k, c in zip(_TAX_RANK_KEYS, _SUBJECT_TAX_COLUMNS)}
-            row[-1] = concordance_level(hit, qtax)
+            row[match_idx] = concordance_level(hit, qtax)
             n_match += 1
         out.append(row)
 
@@ -174,6 +201,175 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict):
         csv.writer(fh, delimiter=sep, lineterminator="\n").writerows(out)
     os.replace(tmp, tsv_path)
     return n_rows, n_filled, sorted(unknown), (n_match if has_subject_tax else -1)
+
+
+class _XlsxBuildError(Exception):
+    """openpyxl missing, or the TSV could not be read — not the write itself."""
+
+
+def build_xlsx_from_tsv(tsv_path: str) -> str:
+    """Convert *tsv_path* to a formatted .xlsx next to it, overwriting any
+    existing file of that name (e.g. from an earlier run, or before the
+    reference/Tax_level_match columns were updated by _ApplyReferenceDialog).
+
+    Module-level (rather than a _BlastWorker method) so both the worker and
+    _ApplyReferenceDialog — which runs on the UI thread with no worker
+    instance to call it on — can regenerate the xlsx after editing the TSV.
+
+    Raises _XlsxBuildError if openpyxl isn't available or the TSV can't be
+    read, or whatever exception wb.save() raises (e.g. the xlsx is open
+    elsewhere) — the caller decides how to report those.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError as e:
+        raise _XlsxBuildError(f"openpyxl not available: {e}")
+    try:
+        with open(tsv_path, "r", encoding="utf-8") as fh:
+            lines = [l for l in fh.read().splitlines() if l.strip()]
+    except Exception as e:
+        raise _XlsxBuildError(f"could not read TSV: {e}")
+    if not lines:
+        return ""
+
+    # The TSV already carries Hit_rank (per-sample 1..N, best hit = 1) as its
+    # first column, so the layout is read as-is.
+    headers = lines[0].split("\t")
+    n_cols  = len(headers)
+
+    # openpyxl 3.x requires 8-char ARGB hex strings (alpha + RGB).
+    # Zone 1 → cols 0-1   : Hit_rank, Query_name
+    # Zone 2 → cols 2-12  : BLAST metric columns (accession … bit-score)
+    # Zone 3 → cols 13+   : Taxonomy columns (only when fetch_taxonomy=True)
+    H1 = PatternFill(patternType="solid", fgColor="FF1A365D")   # header navy
+    H2 = PatternFill(patternType="solid", fgColor="FF0D5E6E")   # header teal
+    H3 = PatternFill(patternType="solid", fgColor="FF7C3200")   # header burnt-orange
+    D1 = PatternFill(patternType="solid", fgColor="FFE8F1FB")   # data light-blue
+    D2 = PatternFill(patternType="solid", fgColor="FFE8F5F6")   # data light-teal
+    D3 = PatternFill(patternType="solid", fgColor="FFFEF3E8")   # data light-orange
+
+    white_bold  = Font(color="FFFFFFFF", bold=True, size=10)
+    normal_font = Font(size=10)
+    bold_font   = Font(size=10, bold=True)   # best hit (Hit_rank == 1) per sample
+    hdr_align   = Alignment(horizontal="center", vertical="center")
+    dat_align   = Alignment(vertical="center", wrap_text=False)
+    thin        = Side(style="thin", color="FFCCCCCC")
+    medium      = Side(style="medium", color="FF9AA0A6")   # sample-block divider
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
+    # Same as `border` but with a heavier top edge — marks the first row of each
+    # new sample block so the hit groups are visually separated.
+    border_group_top = Border(left=thin, right=thin, top=medium, bottom=thin)
+
+    # Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
+    # numeric. Writing them as strings makes Excel flag every cell with
+    # "Number stored as text", whose background error-checker re-scans the
+    # sheet on every sort/filter/scroll → high CPU. Convert these to
+    # int/float so openpyxl writes native numeric cells; the rest stay text.
+    # Detect them by header name so it is robust to column shifts.
+    _NUMERIC_NAMES = frozenset({
+        "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
+        "Gap_opens", "Query_start", "Query_end", "Subject_start",
+        "Subject_end", "Evalue", "Bit_score",
+    })
+    _numeric_idx = frozenset(
+        i for i, h in enumerate(headers) if h in _NUMERIC_NAMES)
+
+    def _num(v):
+        if v == "":
+            return v
+        try:
+            return int(v)
+        except ValueError:
+            pass
+        try:
+            return float(v)   # handles decimals and e-notation (Evalue)
+        except ValueError:
+            return v          # leave genuinely non-numeric text as-is
+
+    def _hfill(ci):
+        return H1 if ci <= 1 else (H2 if ci <= 12 else H3)
+
+    def _dfill(ci, tinted):
+        if not tinted:
+            return None
+        return D1 if ci <= 1 else (D2 if ci <= 12 else D3)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "BLAST Results"
+
+    # Header row
+    ws.append(headers)
+    for ci in range(n_cols):
+        cell = ws.cell(row=1, column=ci + 1)
+        cell.fill      = _hfill(ci)
+        cell.font      = white_bold
+        cell.alignment = hdr_align
+        cell.border    = border
+    ws.row_dimensions[1].height = 22
+
+    # Data rows — shaded in BLOCKS by sample (Query_name), not per single row,
+    # so each sample's hits share one tint and the next sample flips tint. A
+    # heavier top border marks the first row of each new block. Rows already
+    # arrive grouped by Query_name (see _rank_rows), so a simple value-change
+    # check delimits the blocks. Column indices are looked up by name to stay
+    # robust to layout shifts (taxonomy columns present or not).
+    try:
+        _query_idx = headers.index("Query_name")
+    except ValueError:
+        _query_idx = 1
+    try:
+        _rank_idx = headers.index("Hit_rank")
+    except ValueError:
+        _rank_idx = 0
+
+    prev_query   = None
+    block_tinted = True   # first block tinted (matches former row-2 behaviour)
+    for rn, line in enumerate(lines[1:], start=2):
+        raw_vals = line.split("\t")
+        while len(raw_vals) < n_cols:
+            raw_vals.append("")
+        raw_vals = raw_vals[:n_cols]
+
+        query     = raw_vals[_query_idx] if _query_idx < n_cols else ""
+        new_block = (prev_query is not None and query != prev_query)
+        if new_block:
+            block_tinted = not block_tinted
+        prev_query = query
+
+        rank_raw = raw_vals[_rank_idx] if _rank_idx < n_cols else ""
+        is_best  = (str(rank_raw).strip() == "1")   # best hit of this sample
+
+        vals = [
+            _num(v) if ci in _numeric_idx else v
+            for ci, v in enumerate(raw_vals)
+        ]
+        ws.append(vals)
+        row_border = border_group_top if new_block else border
+        row_font   = bold_font if is_best else normal_font
+        for ci in range(n_cols):
+            cell = ws.cell(row=rn, column=ci + 1)
+            fill = _dfill(ci, block_tinted)
+            if fill:
+                cell.fill = fill
+            cell.font      = row_font
+            cell.alignment = dat_align
+            cell.border    = row_border
+
+    # Freeze header, enable auto-filter
+    ws.freeze_panes    = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    # Auto-fit column widths (capped at 55 chars)
+    for ci, col_cells in enumerate(ws.columns):
+        width = max((len(str(c.value or "")) for c in col_cells), default=8)
+        ws.column_dimensions[get_column_letter(ci + 1)].width = min(width + 2, 55)
+
+    xlsx_path = tsv_path.rsplit(".", 1)[0] + ".xlsx"
+    wb.save(xlsx_path)   # overwrites any existing file of that name
+    return xlsx_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -394,9 +590,51 @@ class _ReferenceFileGroup:
         )
         self.check.toggled.connect(self._on_toggled)
 
+        # Link to the stand-alone "apply to an existing table" tool (see
+        # _ApplyReferenceDialog). Shown regardless of the checkbox above: it
+        # opens its own dialog with its own reference-file picker, so it does
+        # not depend on this group's state. Styled as a link (flat, blue,
+        # underline on hover) rather than a boxed button, so it reads as a
+        # secondary action next to the checkbox instead of competing with it.
+        self.apply_link = QtWidgets.QPushButton("Apply reference taxonomy to a results file…")
+        self.apply_link.setToolTip(
+            "Add or update Query_Order / Query_Family / Query_Genus / Query_organism\n"
+            "(and Tax_level_match) on an existing BLAST results table — no new search\n"
+            "is submitted. Use this after fixing a reference file or its sample-ID\n"
+            "suffix, or when the reference file wasn't ready when the search ran."
+        )
+        self.apply_link.setCursor(QtCore.Qt.PointingHandCursor)
+        self.apply_link.setFlat(True)
+        self.apply_link.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                color: {BLUE};
+                font-size: 14px;
+                text-align: left;
+                padding: 0px;
+            }}
+            QPushButton:hover {{ color: {BLUE_MID}; text-decoration: underline; }}
+        """)
+
         self.zone = _RefDropZone()
         self.zone.fileChanged.connect(self._on_file_changed)
         self.zone.hide()
+
+        # Matches Best Sequence's own "Strip suffix from sample ID" field: the
+        # sample ID is the text before the first ';' in Query_name, and this
+        # suffix (if present) is removed from it before the reference lookup,
+        # e.g. DNS-1343_all.fa;758;807 -> DNS-1343.
+        self.suffix_label = QtWidgets.QLabel("Strip suffix from sample ID:")
+        self.suffix_edit = QtWidgets.QLineEdit("_all.fa")
+        self.suffix_edit.setFixedWidth(300)
+        self.suffix_edit.setPlaceholderText("suffix stripped from the sample ID (optional)")
+        self.suffix_edit.setToolTip(
+            "The sample ID is the text before the first ';' in the query name.\n"
+            "This suffix is removed from it, e.g. DNS-1343_all.fa;758;807 → DNS-1343."
+        )
+        self.suffix_label.hide()
+        self.suffix_edit.hide()
 
         self.info_label = QtWidgets.QLabel("")
         self.info_label.setWordWrap(True)
@@ -407,9 +645,11 @@ class _ReferenceFileGroup:
         self._describe()   # seed the hint text shown before any file is set
 
     def add_to(self, form: QtWidgets.QFormLayout):
-        """Add the three rows to a QFormLayout, in the order they're meant to appear."""
+        """Add the rows to a QFormLayout, in the order they're meant to appear."""
         form.addRow(self.check)
+        form.addRow(self.apply_link)
         form.addRow(self.zone)
+        form.addRow(self.suffix_label, self.suffix_edit)
         form.addRow(self.info_label)
 
     @property
@@ -421,8 +661,15 @@ class _ReferenceFileGroup:
         """The reference file path, or '' when the checkbox is off."""
         return self.zone.path if self.checked else ""
 
+    @property
+    def suffix(self) -> str:
+        """The suffix to strip from the sample ID, or '' when the checkbox is off."""
+        return self.suffix_edit.text().strip() if self.checked else ""
+
     def _on_toggled(self, checked: bool):
         self.zone.setVisible(checked)
+        self.suffix_label.setVisible(checked)
+        self.suffix_edit.setVisible(checked)
         self.info_label.setVisible(checked)
         self._describe()
 
@@ -470,8 +717,180 @@ class _ReferenceFileGroup:
 
     def retranslateUi(self, ctx: str):
         self.check.setText(_tr(ctx, "I have a reference file with the query taxonomy"))
+        self.apply_link.setText(_tr(ctx, "Apply reference taxonomy to a results file…"))
+        self.suffix_label.setText(_tr(ctx, "Strip suffix from sample ID:"))
         self.zone.retranslateUi()
         self._describe()
+
+
+class _ResultsDropZone(_RefDropZone):
+    """A BLAST results table (.tsv/.csv) drop zone — same drag-and-drop zone
+    and "Add"/"Clear" button styling as _RefDropZone (consistent with the rest
+    of the app), just pointed at a different file kind and dialog text."""
+
+    _HINT = "Drag the BLAST results table here  (.tsv, .csv)"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tip = (
+            "The BLAST results table to update, in place (.tsv or .csv) — the\n"
+            "one produced by a previous BLAST run. Must have a 'Query_name' column."
+        )
+        self._render()
+
+    def _browse(self):
+        f, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select a BLAST results table", "",
+            "BLAST results (*.tsv *.csv);;All files (*)"
+        )
+        if f:
+            self.set_path(f)
+
+    def _dropped_paths(self, mime) -> List[str]:
+        paths = [u.toLocalFile() for u in mime.urls()]
+        return [p for p in paths if p.lower().endswith((".tsv", ".csv"))]
+
+
+class _ApplyReferenceDialog(QtWidgets.QDialog):
+    """Stand-alone tool: (re-)apply a query-taxonomy reference file to an
+    already-generated BLAST results table, in place — no BLAST search is run.
+
+    Exists for the two situations that leave a finished results table without
+    query taxonomy even though a reference file exists: the reference wasn't
+    ready when the search ran, or the match needed a sample-ID suffix that
+    wasn't set at the time. Either way, re-submitting the whole search just to
+    fix the taxonomy columns is wasteful (and, for a large run, slow and
+    rate-limited) — this reruns only the local, offline matching step.
+    """
+
+    # A word-wrapped QLabel's sizeHint() is its *unwrapped* single-line width —
+    # wrapping only affects heightForWidth, which plain sizeHint() ignores. Left
+    # uncapped, a label whose text changes at runtime (the status line, the
+    # reference info line) balloons the layout's preferred width every time it
+    # gets a longer message, and adjustSize()/the layout pass then squeezes
+    # other rows to compensate instead of growing the window sanely. Every
+    # word-wrapped label in this dialog is capped at this width so their
+    # sizeHint reflects their real wrapped height instead.
+    _WRAP_WIDTH = 560
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Apply query taxonomy to a results file")
+        self.setMinimumWidth(600)
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setSpacing(12)
+
+        desc = make_label(
+            "Adds or updates Query_Order, Query_Family, Query_Genus and "
+            "Query_organism (and Tax_level_match, if the table already has "
+            "hit taxonomy) on an existing BLAST results table. The table is "
+            "edited in place; run this again after fixing the reference file "
+            "or the sample-ID suffix below.",
+            color=TEXT_SEC
+        )
+        desc.setWordWrap(True)
+        desc.setMaximumWidth(self._WRAP_WIDTH)
+        v.addWidget(desc)
+
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+        form.setSpacing(10)
+
+        self._tsv_zone = _ResultsDropZone()
+        self._tsv_zone.fileChanged.connect(self._on_changed)
+        form.addRow("Results table:", self._tsv_zone)
+        v.addLayout(form)
+
+        self._ref_group = _ReferenceFileGroup()
+        self._ref_group.check.setChecked(True)
+        self._ref_group.check.hide()        # always "on" in this dialog
+        self._ref_group.apply_link.hide()   # this dialog IS that link's destination
+        # The reference block's content (info_label text, in particular) changes
+        # height when a file is added/removed. A QDialog does not auto-resize to
+        # fit content that grows *after* it was first shown, which was clipping
+        # the Add/Clear button labels and the info text below them — resize
+        # after every such change instead of relying on the initial layout pass.
+        self._ref_group.zone.fileChanged.connect(self._on_changed)
+        self._ref_group.info_label.setMaximumWidth(self._WRAP_WIDTH)
+        ref_form = QtWidgets.QFormLayout()
+        ref_form.setLabelAlignment(QtCore.Qt.AlignRight)
+        ref_form.setSpacing(10)
+        self._ref_group.add_to(ref_form)
+        v.addLayout(ref_form)
+
+        self._status = QtWidgets.QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setMaximumWidth(self._WRAP_WIDTH)
+        v.addWidget(self._status)
+
+        v.addStretch(1)
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.setObjectName("secondary_btn")
+        close_btn.clicked.connect(self.reject)
+        btns.addWidget(close_btn)
+        self._apply_btn = QtWidgets.QPushButton("Apply  →")
+        self._apply_btn.setObjectName("primary_btn")
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self._apply)
+        btns.addWidget(self._apply_btn)
+        v.addLayout(btns)
+
+    def _on_changed(self, *_args):
+        self._apply_btn.setEnabled(bool(self._tsv_zone.path))
+        self._set_status("")
+
+    def _set_status(self, text: str, color: str = ""):
+        self._status.setText(text)
+        self._status.setStyleSheet(f"color:{color};" if color else "")
+        # The status text's own height (0, 1 or several wrapped lines) is part
+        # of what the dialog must fit. Without this, a longer message after
+        # Apply — or a shorter one after clearing it — left the window sized
+        # for whatever it last was, clipping content instead of growing, or
+        # leaving dead space instead of shrinking. Deferred so it runs after
+        # the layout has recomputed for the new text.
+        QtCore.QTimer.singleShot(0, self.adjustSize)
+
+    def _apply(self):
+        tsv_path = self._tsv_zone.path
+        if not tsv_path or not os.path.isfile(tsv_path):
+            self._set_status("⚠  Pick an existing results file first.", RED)
+            return
+        if not self._ref_group.validate_or_warn(self):
+            return
+        ref_path = self._ref_group.path
+        if not ref_path:
+            self._set_status("⚠  Add a query taxonomy reference file first.", RED)
+            return
+        try:
+            _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
+            ref_lower = {k.lower(): v for k, v in ref_table.items()}
+            n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
+                tsv_path, ref_table, ref_lower, self._ref_group.suffix
+            )
+        except Exception as exc:
+            self._set_status(f"⚠  {exc}", RED)
+            return
+        msg = f"✓  {n_filled}/{n_rows} row(s) matched to the reference and written to the file."
+        if unknown:
+            examples = ", ".join(sorted(unknown)[:5])
+            msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
+        if n_match >= 0:
+            msg += f"  Tax_level_match updated on {n_match} row(s)."
+
+        # Regenerate the matching .xlsx from the just-updated table, overwriting
+        # whichever one (if any) sits next to it — otherwise it would keep
+        # showing the pre-fix taxonomy even though the .tsv is now correct.
+        try:
+            xlsx_path = build_xlsx_from_tsv(tsv_path)
+            if xlsx_path:
+                msg += f"  {os.path.basename(xlsx_path)} updated."
+        except Exception as exc:
+            msg += f"  ⚠ .xlsx not updated: {exc}"
+
+        self._set_status(msg, GREEN)
 
 
 class _FullWidthTabBar(QtWidgets.QTabBar):
@@ -642,12 +1061,14 @@ class BlastPanel(QtWidgets.QWidget):
         bl2.addWidget(self._batch_mode)
 
         self._batch_spin = QtWidgets.QSpinBox()
-        # NCBI's limit is total query length (1,000,000 bases for blastn), not a
-        # sequence count, and its penalty counts *searches*, not sequences — so a
-        # low ceiling here works against the user. The worker splits a batch that
-        # exceeds the length limit on its own.
+        # NCBI's documented limit is total query length (1,000,000 bases for
+        # blastn), not a sequence count — but in practice its undocumented
+        # CPU-time budget for a MEGABLAST job against core_nt rejects a batch
+        # well before that: 500 and 250 sequences/batch both failed in testing,
+        # 100 was the first size that worked reliably, hence the default below.
+        # The worker also auto-splits a batch NCBI still rejects at run time.
         self._batch_spin.setRange(1, 1000)
-        self._batch_spin.setValue(500)
+        self._batch_spin.setValue(100)
         self._batch_spin.setFixedWidth(80)
         self._batch_spin.valueChanged.connect(self._update_batch_plan)
         bl2.addWidget(self._batch_spin)
@@ -687,6 +1108,7 @@ class BlastPanel(QtWidgets.QWidget):
         # Adds Query_Order/Query_Family/Query_Genus/Query_organism to every hit
         # row, exactly like the Best Sequence utility does for its own tables.
         self._ref_group = _ReferenceFileGroup()
+        self._ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._ref_group.add_to(sg)
 
         self._layout.addWidget(self._settings_box)
@@ -1079,6 +1501,10 @@ class BlastPanel(QtWidgets.QWidget):
             )
         self._update_batch_plan()
 
+    def _open_apply_reference_dialog(self):
+        dlg = _ApplyReferenceDialog(self)
+        dlg.exec_()
+
     def _emit_blast(self):
         if not self._ref_group.validate_or_warn(self):
             return
@@ -1090,6 +1516,7 @@ class BlastPanel(QtWidgets.QWidget):
             "nseq":           self._effective_nseq(),
             "fetch_taxonomy": self._tax_check.isChecked(),
             "tax_reference":  self._ref_group.path,
+            "strip_suffix":   self._ref_group.suffix,
         }
         self.blastRequested.emit(list(self._drop.files), cfg)
 
@@ -1290,6 +1717,7 @@ class BlastPanel(QtWidgets.QWidget):
 
         # ── Optional query-taxonomy reference file ──
         self._file_ref_group = _ReferenceFileGroup()
+        self._file_ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._file_ref_group.add_to(sg)
 
         lay.addWidget(self._file_settings_box)
@@ -1418,6 +1846,7 @@ class BlastPanel(QtWidgets.QWidget):
             "nhits":          self._file_hits_spin.value(),
             "fetch_taxonomy": self._file_tax_check.isChecked(),
             "tax_reference":  self._file_ref_group.path,
+            "strip_suffix":   self._file_ref_group.suffix,
         }
         self.blastFileRequested.emit(list(self._file_drop.files), cfg)
 
@@ -1574,6 +2003,14 @@ class _BlastWorker(QtCore.QThread):
     _SOCK_TIMEOUT = 15   # max seconds blocked in a single urlopen call
     _TAX_RETRIES  = 2    # extra retry rounds for "Not_found_in_Taxonomy" results
     _NCBI_RATE    = 9.0  # max HTTP requests/second (NCBI allows 10 with API key)
+    # If NCBI outright rejects a batch (no RID, or Status=FAILED — typically its
+    # undocumented CPU-time budget for a heavy MEGABLAST job), halve it and retry
+    # rather than losing the whole batch: nseq -> nseq/2 -> nseq/4 ..., down to
+    # _MIN_SPLIT_SEQS sequences or _MAX_SPLIT_DEPTH halvings, whichever comes first.
+    # Default batches are already MAX_QUERY_SEQS (100) or less, so this mostly
+    # matters for a manual batch size set higher than that.
+    _MIN_SPLIT_SEQS  = 20
+    _MAX_SPLIT_DEPTH = 3
     # NCBI rejects a blastn query longer than 1,000,000 bases. Cap a batch a
     # little below that so headers and encoding overhead cannot push it over.
     _MAX_QUERY_BASES = MAX_QUERY_BASES
@@ -1687,16 +2124,23 @@ class _BlastWorker(QtCore.QThread):
                 self._interruptible_sleep(2)
         return ""
 
-    def _http_post(self, url, data: str, timeout=120):
+    def _http_post(self, url, data: str, timeout=120, label=""):
+        """POST `data`; returns (body, reason). `body` is "" on failure and
+        `reason` says why (HTTP code, timeout, connection error, …) so a caller
+        that cares — currently only the BLAST submission — can tell the user
+        what NCBI actually did instead of a silent retry loop. `label`, when
+        given, also logs that reason itself once retries are exhausted.
+        """
         import urllib.request, urllib.error
         if "eutils.ncbi" in url and "tool=" not in data:
             data = f"{data}&tool={self._NCBI_TOOL}"
+        reason = ""
         for attempt in range(self._MAX_RETRY):
             if self._stop:
-                return ""
+                return "", "stopped"
             self._rate_acquire()
             if self._stop:
-                return ""
+                return "", "stopped"
             try:
                 req = urllib.request.Request(
                     url,
@@ -1711,8 +2155,12 @@ class _BlastWorker(QtCore.QThread):
                         if text:
                             with self._usage_lock:
                                 self._req_count += 1
-                            return text
+                            return text, ""
+                        reason = "HTTP 200 with an empty body"
+                    else:
+                        reason = f"HTTP {resp.status}"
             except urllib.error.HTTPError as e:
+                reason = f"HTTP {e.code} {e.reason}".strip()
                 if e.code == 429:
                     with self._usage_lock:
                         self._rate_limit_count += 1
@@ -1728,10 +2176,20 @@ class _BlastWorker(QtCore.QThread):
                         self._server_err_count += 1
                     self._interruptible_sleep(min(10 * (attempt + 1), 60))
                 else:
-                    return ""  # 4xx other than 429 — not retryable
-            except Exception:
+                    return "", reason  # 4xx other than 429 — not retryable
+            except urllib.error.URLError as e:
+                reason = f"connection error: {e.reason}"
                 self._interruptible_sleep(2)
-        return ""
+            except Exception as e:
+                reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self._interruptible_sleep(2)
+        if label:
+            self.statusUpdated.emit(
+                "blast",
+                f"BLAST       │ [{label}] no usable reply from NCBI after "
+                f"{self._MAX_RETRY} attempts — {reason or 'unknown error'}"
+            )
+        return "", reason
 
     def _interruptible_sleep(self, seconds: float):
         """Sleep in 0.5 s chunks so _stop is checked frequently."""
@@ -1824,29 +2282,43 @@ class _BlastWorker(QtCore.QThread):
         )
         return quote(text, safe=safe)
 
-    def _blast_submit(self, fasta_text):
+    def _extract_ncbi_message(self, resp: str) -> str:
+        """Best-effort extraction of NCBI's own wording from a Blast.cgi reply
+        (e.g. a CPU-time-limit rejection), so a failure can be reported in the
+        server's own words instead of a bare "no response"."""
+        import re
+        m = re.search(r"(?:Message|Error|ThereWasAnError)\s*[:=]\s*([^\n<]+)", resp, re.I)
+        return m.group(1).strip() if m else ""
+
+    def _blast_submit(self, fasta_text, label=""):
+        """Submit one BLAST batch. Returns (rid, rtoe, reason) — reason is ""
+        on success, otherwise why NCBI (or the network) did not hand back a
+        usable RID, worded from its own reply when possible."""
         cfg = self.cfg
         encoded = self._url_encode_fasta(fasta_text)
         data = (
             f"CMD=Put&PROGRAM={cfg['program']}&DATABASE={cfg['database']}"
             f"&api_key={cfg['api_key']}&HITLIST_SIZE={cfg['nhits']}&QUERY={encoded}"
         )
-        resp = self._http_post(self._BLAST_URL, data)
+        resp, reason = self._http_post(self._BLAST_URL, data, label=label)
         if not resp:
-            return None, 30
+            return None, 30, reason or "no response from NCBI"
         import re
         rid_m  = re.search(r"RID = ([^\s]+)\s+RTOE", resp)
         rtoe_m = re.search(r"RTOE = (\d+)", resp)
         rid  = rid_m.group(1) if rid_m else None
         rtoe = int(rtoe_m.group(1)) if rtoe_m else 30
-        return rid, rtoe
+        if not rid:
+            reason = self._extract_ncbi_message(resp) or "NCBI accepted the request but returned no RID"
+            return None, rtoe, reason
+        return rid, rtoe, ""
 
     def _blast_poll(self, rid, batch_label=""):
         """Wait for one RID, up to _POLL_BUDGET seconds.
 
         The interval grows from _POLL_MIN to _POLL_MAX: a short job is picked up
-        quickly, a long one is not polled needlessly. Returns True only when the
-        search is READY.
+        quickly, a long one is not polled needlessly. Returns (ready, reason) —
+        reason is "" on success, otherwise NCBI's own wording when available.
         """
         url = f"{self._BLAST_URL}?CMD=Get&RID={rid}"
         polls    = 0
@@ -1868,15 +2340,17 @@ class _BlastWorker(QtCore.QThread):
             resp = self._http_get(url)
             polls += 1
             if self._stop:
-                return False
+                return False, "stopped"
             if "Status=READY" in resp:
-                return True
+                return True, ""
             if "Status=FAILED" in resp:
-                self.statusUpdated.emit("blast", f"{prefix}Search failed for RID {rid}.")
-                return False
+                reason = (self._extract_ncbi_message(resp) or
+                          "search FAILED (often NCBI's CPU-time budget for a large batch)")
+                self.statusUpdated.emit("blast", f"{prefix}Search failed for RID {rid}: {reason}")
+                return False, reason
             if "Status=UNKNOWN" in resp:
                 self.statusUpdated.emit("blast", f"{prefix}Search expired for RID {rid}.")
-                return False
+                return False, "search expired (RID UNKNOWN)"
             # WAITING, or an empty/unrecognised reply: both mean "not yet".
             _progress("" if "Status=WAITING" in resp else " (no status in reply)")
             self._interruptible_sleep(interval)
@@ -1897,7 +2371,7 @@ class _BlastWorker(QtCore.QThread):
                 f"open blast.ncbi.nlm.nih.gov and enter RID {rid}, or retry this "
                 f"batch with fewer sequences per BLAST."
             )
-        return False
+        return False, "timed out waiting for RID"
 
     def _blast_get_tabular(self, rid):
         url = (
@@ -2090,7 +2564,7 @@ class _BlastWorker(QtCore.QThread):
                             "rettype": "gbc", "retmode": "xml"}
             if api_key:
                 params["api_key"] = api_key
-            xml_text = self._http_post(f"{base}efetch.fcgi",
+            xml_text, _reason = self._http_post(f"{base}efetch.fcgi",
                                        _ulp.urlencode(params), timeout=120)
             if not xml_text or self._stop:
                 continue
@@ -2156,7 +2630,7 @@ class _BlastWorker(QtCore.QThread):
             params: dict = {"db": "taxonomy", "id": ",".join(chunk), "retmode": "xml"}
             if api_key:
                 params["api_key"] = api_key
-            xml_text = self._http_post(f"{base}efetch.fcgi",
+            xml_text, _reason = self._http_post(f"{base}efetch.fcgi",
                                        _ulp.urlencode(params), timeout=120)
             if xml_text and not self._stop:
                 taxid_results.update(self._parse_taxonomy_xml_batch(xml_text))
@@ -2253,161 +2727,68 @@ class _BlastWorker(QtCore.QThread):
     def _tsv_to_xlsx(self, tsv_path: str) -> str:
         """Convert *tsv_path* to a formatted xlsx. Returns xlsx path or '' on failure."""
         try:
-            from openpyxl import Workbook
-            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-            from openpyxl.utils import get_column_letter
-        except ImportError as e:
-            self.statusUpdated.emit("result", f"XLSX skip  │ openpyxl not available: {e}")
+            return build_xlsx_from_tsv(tsv_path)
+        except _XlsxBuildError as e:
+            self.statusUpdated.emit("result", f"XLSX skip  │ {e}")
             return ""
-        try:
-            with open(tsv_path, "r", encoding="utf-8") as fh:
-                lines = [l for l in fh.read().splitlines() if l.strip()]
-        except Exception as e:
-            self.statusUpdated.emit("result", f"XLSX skip  │ could not read TSV: {e}")
-            return ""
-        if not lines:
-            return ""
-
-        # The TSV already carries Hit_rank (per-sample 1..N, best hit = 1) as its
-        # first column, so the layout is read as-is.
-        headers = lines[0].split("\t")
-        n_cols  = len(headers)
-
-        # openpyxl 3.x requires 8-char ARGB hex strings (alpha + RGB).
-        # Zone 1 → cols 0-1   : Hit_rank, Query_name
-        # Zone 2 → cols 2-12  : BLAST metric columns (accession … bit-score)
-        # Zone 3 → cols 13+   : Taxonomy columns (only when fetch_taxonomy=True)
-        H1 = PatternFill(patternType="solid", fgColor="FF1A365D")   # header navy
-        H2 = PatternFill(patternType="solid", fgColor="FF0D5E6E")   # header teal
-        H3 = PatternFill(patternType="solid", fgColor="FF7C3200")   # header burnt-orange
-        D1 = PatternFill(patternType="solid", fgColor="FFE8F1FB")   # data light-blue
-        D2 = PatternFill(patternType="solid", fgColor="FFE8F5F6")   # data light-teal
-        D3 = PatternFill(patternType="solid", fgColor="FFFEF3E8")   # data light-orange
-
-        white_bold  = Font(color="FFFFFFFF", bold=True, size=10)
-        normal_font = Font(size=10)
-        bold_font   = Font(size=10, bold=True)   # best hit (Hit_rank == 1) per sample
-        hdr_align   = Alignment(horizontal="center", vertical="center")
-        dat_align   = Alignment(vertical="center", wrap_text=False)
-        thin        = Side(style="thin", color="FFCCCCCC")
-        medium      = Side(style="medium", color="FF9AA0A6")   # sample-block divider
-        border      = Border(left=thin, right=thin, top=thin, bottom=thin)
-        # Same as `border` but with a heavier top edge — marks the first row of each
-        # new sample block so the hit groups are visually separated.
-        border_group_top = Border(left=thin, right=thin, top=medium, bottom=thin)
-
-        # Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
-        # numeric. Writing them as strings makes Excel flag every cell with
-        # "Number stored as text", whose background error-checker re-scans the
-        # sheet on every sort/filter/scroll → high CPU. Convert these to
-        # int/float so openpyxl writes native numeric cells; the rest stay text.
-        # Detect them by header name so it is robust to column shifts.
-        _NUMERIC_NAMES = frozenset({
-            "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
-            "Gap_opens", "Query_start", "Query_end", "Subject_start",
-            "Subject_end", "Evalue", "Bit_score",
-        })
-        _numeric_idx = frozenset(
-            i for i, h in enumerate(headers) if h in _NUMERIC_NAMES)
-
-        def _num(v):
-            if v == "":
-                return v
-            try:
-                return int(v)
-            except ValueError:
-                pass
-            try:
-                return float(v)   # handles decimals and e-notation (Evalue)
-            except ValueError:
-                return v          # leave genuinely non-numeric text as-is
-
-        def _hfill(ci):
-            return H1 if ci <= 1 else (H2 if ci <= 12 else H3)
-
-        def _dfill(ci, tinted):
-            if not tinted:
-                return None
-            return D1 if ci <= 1 else (D2 if ci <= 12 else D3)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "BLAST Results"
-
-        # Header row
-        ws.append(headers)
-        for ci in range(n_cols):
-            cell = ws.cell(row=1, column=ci + 1)
-            cell.fill      = _hfill(ci)
-            cell.font      = white_bold
-            cell.alignment = hdr_align
-            cell.border    = border
-        ws.row_dimensions[1].height = 22
-
-        # Data rows — shaded in BLOCKS by sample (Query_name), not per single row,
-        # so each sample's hits share one tint and the next sample flips tint. A
-        # heavier top border marks the first row of each new block. Rows already
-        # arrive grouped by Query_name (see _rank_rows), so a simple value-change
-        # check delimits the blocks. Column indices are looked up by name to stay
-        # robust to layout shifts (taxonomy columns present or not).
-        try:
-            _query_idx = headers.index("Query_name")
-        except ValueError:
-            _query_idx = 1
-        try:
-            _rank_idx = headers.index("Hit_rank")
-        except ValueError:
-            _rank_idx = 0
-
-        prev_query   = None
-        block_tinted = True   # first block tinted (matches former row-2 behaviour)
-        for rn, line in enumerate(lines[1:], start=2):
-            raw_vals = line.split("\t")
-            while len(raw_vals) < n_cols:
-                raw_vals.append("")
-            raw_vals = raw_vals[:n_cols]
-
-            query     = raw_vals[_query_idx] if _query_idx < n_cols else ""
-            new_block = (prev_query is not None and query != prev_query)
-            if new_block:
-                block_tinted = not block_tinted
-            prev_query = query
-
-            rank_raw = raw_vals[_rank_idx] if _rank_idx < n_cols else ""
-            is_best  = (str(rank_raw).strip() == "1")   # best hit of this sample
-
-            vals = [
-                _num(v) if ci in _numeric_idx else v
-                for ci, v in enumerate(raw_vals)
-            ]
-            ws.append(vals)
-            row_border = border_group_top if new_block else border
-            row_font   = bold_font if is_best else normal_font
-            for ci in range(n_cols):
-                cell = ws.cell(row=rn, column=ci + 1)
-                fill = _dfill(ci, block_tinted)
-                if fill:
-                    cell.fill = fill
-                cell.font      = row_font
-                cell.alignment = dat_align
-                cell.border    = row_border
-
-        # Freeze header, enable auto-filter
-        ws.freeze_panes    = "A2"
-        ws.auto_filter.ref = ws.dimensions
-
-        # Auto-fit column widths (capped at 55 chars)
-        for ci, col_cells in enumerate(ws.columns):
-            width = max((len(str(c.value or "")) for c in col_cells), default=8)
-            ws.column_dimensions[get_column_letter(ci + 1)].width = min(width + 2, 55)
-
-        xlsx_path = tsv_path.rsplit(".", 1)[0] + ".xlsx"
-        try:
-            wb.save(xlsx_path)
         except Exception as e:
             self.statusUpdated.emit("result", f"XLSX error │ {e}")
             return ""
-        return xlsx_path
+
+    def _submit_batch_with_retry(self, pairs, batch_label, depth=0):
+        """Submit one BLAST batch; if NCBI rejects it outright (no RID, or
+        Status=FAILED — typically its undocumented CPU-time budget for a large
+        MEGABLAST job) rather than losing the whole batch, halve it and retry
+        as two sub-batches. Halves down to _MIN_SPLIT_SEQS sequences or
+        _MAX_SPLIT_DEPTH levels, whichever comes first, before giving up.
+
+        Returns (blast_rows, used_pairs): used_pairs is the subset of `pairs`
+        that NCBI actually answered (blast_rows is their combined hit table) —
+        callers use it (rather than assuming the whole batch succeeded) to know
+        exactly which sequences were really queried.
+        """
+        batch_fasta = "\n".join(h + "\n" + s for h, s in pairs)
+        rid, rtoe, reason = self._blast_submit(batch_fasta, label=batch_label)
+        if rid:
+            self.statusUpdated.emit(
+                "blast",
+                f"BLAST       │ [{batch_label}] RID={rid}  waiting {rtoe}s…"
+            )
+            for _ in range(rtoe):
+                if self._stop:
+                    return [], []
+                time.sleep(1)
+            ok, poll_reason = self._blast_poll(rid, batch_label)
+            if ok:
+                return self._blast_get_tabular(rid), pairs
+            reason = poll_reason
+
+        if self._stop:
+            return [], []
+
+        n = len(pairs)
+        if n > self._MIN_SPLIT_SEQS and depth < self._MAX_SPLIT_DEPTH:
+            half = -(-n // 2)  # ceil
+            self.statusUpdated.emit(
+                "blast",
+                f"BLAST       │ [{batch_label}] rejected ({reason}) — "
+                f"retrying as 2 batches of ~{half} sequences…"
+            )
+            rows, used = [], []
+            for i, sub in enumerate((pairs[:half], pairs[half:])):
+                if not sub or self._stop:
+                    continue
+                r, u = self._submit_batch_with_retry(sub, f"{batch_label}.{i + 1}", depth + 1)
+                rows.extend(r)
+                used.extend(u)
+            return rows, used
+
+        self.statusUpdated.emit(
+            "blast",
+            f"BLAST       │ [{batch_label}] giving up ({reason}) — "
+            f"{n} sequence(s) marked missing."
+        )
+        return [], []
 
     # ── Main run ─────────────────────────────────────────────────────────
 
@@ -2463,9 +2844,13 @@ class _BlastWorker(QtCore.QThread):
         # ── Split into batches ──
         batches, batch_pairs_list = self._split_batches(fasta, nseq)
         n_batches = len(batches)
-        completed_batches: set = set()   # indices of batches fully written to TSV
+        # Query_name (header, no leading '>') of every sequence NCBI actually
+        # answered and whose hits reached the TSV. A batch that gets split on
+        # rejection (see _submit_batch_with_retry) can succeed only partially,
+        # so this is tracked per-sequence rather than per top-level batch index.
+        processed_headers: set = set()
         # Query_name values with at least one hit written to the TSV. Sequences
-        # of a completed batch that are absent here got no match from BLAST.
+        # in processed_headers but absent here got no match from BLAST.
         hit_queries: set = set()
 
         # ── Summary line (fixed slot "info") ──
@@ -2534,43 +2919,23 @@ class _BlastWorker(QtCore.QThread):
             if self._stop:
                 break
 
-            batch_seq   = batch_fasta.count(">")
+            batch_pairs = batch_pairs_list[batch_idx]
+            batch_seq   = len(batch_pairs)
             batch_label = f"Batch {batch_idx+1}/{n_batches}"
             batch_base  = batch_idx * self._BATCH_UNITS
 
-            # ── BLAST ──
+            # ── BLAST (auto-retries as smaller sub-batches if NCBI rejects it) ──
             self.statusUpdated.emit(
                 "blast",
                 f"BLAST       │ [{batch_label}] Submitting {batch_seq} sequences…"
             )
-            rid, rtoe = self._blast_submit(batch_fasta)
-            if not rid:
-                self.statusUpdated.emit(
-                    "blast",
-                    f"BLAST       │ [{batch_label}] Submission failed — skipping."
-                )
-                continue
-
-            self.statusUpdated.emit(
-                "blast",
-                f"BLAST       │ [{batch_label}] RID={rid}  waiting {rtoe}s…"
-            )
-            for tick in range(rtoe):
-                if self._stop:
-                    break
-                time.sleep(1)
-                self.progressUpdated.emit(
-                    batch_base + int(400 * (tick + 1) / max(rtoe, 1)),
-                    total_expected
-                )
+            blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
             if self._stop:
                 break
-
             self.progressUpdated.emit(batch_base + 400, total_expected)
-            if not self._blast_poll(rid, batch_label):
-                continue
+            if not used_pairs:
+                continue  # every split down to the floor was rejected; already logged
 
-            blast_rows = self._blast_get_tabular(rid)
             self.statusUpdated.emit(
                 "blast",
                 f"BLAST       │ [{batch_label}] {len(blast_rows)} hits retrieved  ✓"
@@ -2691,13 +3056,13 @@ class _BlastWorker(QtCore.QThread):
                     )
                     self._interruptible_sleep(0.5)
 
-            # Solo marcar el batch como completado si sus filas llegaron al disco;
-            # de lo contrario sus secuencias deben aparecer en el FASTA de "missing".
-            # Contar los hits una sola vez, tras la escritura exitosa, para que un
-            # reintento (que reescribe el lote completo) no infle el total.
+            # Solo marcar como procesadas las secuencias cuyas filas llegaron al disco;
+            # de lo contrario deben aparecer en el FASTA de "missing". used_pairs es
+            # el subconjunto de batch_pairs que NCBI realmente respondio (puede ser
+            # parcial si _submit_batch_with_retry tuvo que dividir el lote).
             if _batch_written:
-                completed_batches.add(batch_idx)
                 total_hits_done += len(batch_rows_out)
+                processed_headers.update(h[1:] for h, _s in used_pairs)
                 # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
                 # which is the FASTA header of the query without the leading '>'.
                 for _r in batch_rows_out:
@@ -2707,9 +3072,10 @@ class _BlastWorker(QtCore.QThread):
 
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
         missing_pairs = []
-        for bi, bp in enumerate(batch_pairs_list):
-            if bi not in completed_batches:
-                missing_pairs.extend(bp)
+        for bp in batch_pairs_list:
+            for h, s in bp:
+                if h[1:] not in processed_headers:
+                    missing_pairs.append((h, s))
 
         miss_msg = ""
         if missing_pairs:
@@ -2726,13 +3092,13 @@ class _BlastWorker(QtCore.QThread):
                 miss_msg = f"Could not write missing FASTA: {exc}"
 
         # ── Build no-hit FASTA (queried, but BLAST returned no match) ──
-        # Only batches whose rows reached the TSV are inspected: sequences of a
-        # failed or unprocessed batch were never really queried and are already
-        # reported in the missing FASTA above.
+        # Only actually-processed sequences are inspected: sequences of a
+        # failed or unprocessed (sub-)batch were never really queried and are
+        # already reported in the missing FASTA above.
         nohit_pairs = []
-        for bi in sorted(completed_batches):
-            for h, sq in batch_pairs_list[bi]:
-                if h[1:] not in hit_queries:
+        for bp in batch_pairs_list:
+            for h, sq in bp:
+                if h[1:] in processed_headers and h[1:] not in hit_queries:
                     nohit_pairs.append((h, sq))
 
         nohit_msg  = ""
@@ -2765,7 +3131,7 @@ class _BlastWorker(QtCore.QThread):
                 _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
                 ref_lower = {k.lower(): v for k, v in ref_table.items()}
                 n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
-                    tsv_path, ref_table, ref_lower)
+                    tsv_path, ref_table, ref_lower, cfg.get("strip_suffix", ""))
                 ref_msg = f"Reference query taxonomy: {n_filled}/{n_rows} rows filled"
                 if unknown:
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
@@ -2809,7 +3175,7 @@ class _BlastWorker(QtCore.QThread):
             api_masked = "(not set)"
 
         status_str = "Stopped" if self._stop else "Completed"
-        batches_ok = len(completed_batches)
+        seqs_queried = len(processed_headers)
 
         log_lines = [
             "BLAST Run Log",
@@ -2834,7 +3200,7 @@ class _BlastWorker(QtCore.QThread):
             "",
             "Results:",
             f"  Sequences found   : {seq_count}",
-            f"  Batches           : {batches_ok}/{n_batches} completed",
+            f"  Sequences queried : {seqs_queried}/{seq_count} ({n_batches} batch(es) planned)",
             f"  Hits written      : {total_hits_done}",
             f"  Seqs with hits    : {len(hit_queries)}",
             f"  Seqs with no hits : {len(nohit_pairs)}",
@@ -3117,7 +3483,7 @@ class _BlastFileWorker(_BlastWorker):
                 _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
                 ref_lower = {k.lower(): v for k, v in ref_table.items()}
                 n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
-                    tsv_path, ref_table, ref_lower)
+                    tsv_path, ref_table, ref_lower, cfg.get("strip_suffix", ""))
                 ref_msg = f"Reference query taxonomy: {n_filled}/{n_rows} rows filled"
                 if unknown:
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
