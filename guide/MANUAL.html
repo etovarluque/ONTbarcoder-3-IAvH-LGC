@@ -1785,6 +1785,45 @@ the deduplicated FASTA from whatever combinations completed:</p>
       of them leave the batch stuck waiting on one that was just killed.</li>
 </ul>
 
+<h4>17.6 Coverage report — which combinations were actually needed</h4>
+<p>After BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
+have turned the batch's merged FASTA into a taxonomically-identified best-sequence set, a
+natural question is whether the sweep was worth it: does any single combination already
+reproduce every identified sequence, or were several combinations each needed to contribute
+their own share? <code>_utilities/batch_coverage_report.py</code> answers this directly from
+the batch and Best Sequence output folders, with no GUI panel of its own — run it from a
+command line:</p>
+<pre>python _utilities/batch_coverage_report.py \
+    --batch-dir "output/ont-barcoder_&lt;timestamp&gt;_batch" \
+    --bestseq-dir "output/ont-barcoder_&lt;timestamp&gt;_bestseq"</pre>
+<p>It re-derives, by direct sequence comparison against every run folder's own
+<code>consensus_filtered.fa</code>, exactly which run combinations reproduce each
+taxonomically-identified sample's winning sequence — rather than trusting the
+<code>;run&lt;N&gt;</code> tag in <code>unique_consensus_filtered.fasta</code>, which only
+records the <i>first</i> run that produced a given variant, not every run that did. It then
+computes a greedy minimal set of combinations that together cover as many identified
+sequences as possible, and writes <code>parameter_batch_coverage_report.xlsx</code> (by
+default, into the <code>_bestseq</code> folder) with four sheets:</p>
+<ul>
+  <li><b>Summary</b> — combinations tested, sequences identified, size of the minimal set,
+      best/worst single combination, and any identified sample whose sequence could not be
+      reproduced by any run folder on disk (a sign that folder was re-run after the batch's
+      dedup/BLAST steps).</li>
+  <li><b>Minimal_run_set</b> — the combinations in the minimal set, one row each, with their
+      parameters broken into columns, how many new sequences each one added, and the running
+      total.</li>
+  <li><b>Per_sample_detail</b> — every identified sample, its taxonomy match, in how many of
+      the swept combinations its winning sequence recurs, and whether/which combination in
+      the minimal set covers it.</li>
+  <li><b>All_runs_coverage</b> — every combination in the sweep with its parameters and how
+      many identified sequences it reproduces on its own, for context.</li>
+</ul>
+<p>Useful flags: <code>--fasta-name</code> to compare a different per-run FASTA than
+<code>consensus_filtered.fa</code>; <code>--output-root</code> if the run folders were moved
+out from under <code>output/</code>; <code>--output</code> to pick the report's path. Both
+<code>--batch-dir</code> and <code>--bestseq-dir</code> auto-detect the most recent matching
+files inside the folders given, so exact filenames/timestamps don't need to be typed out.</p>
+
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="performance">18. Performance &amp; threads</h2>
 <p>The heavy work is many short alignment subprocesses (<code>disttbfast.exe</code>, each

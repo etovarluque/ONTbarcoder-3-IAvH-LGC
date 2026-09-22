@@ -853,6 +853,24 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         # the layout has recomputed for the new text.
         QtCore.QTimer.singleShot(0, self.adjustSize)
 
+    def _set_busy(self, busy: bool):
+        """Make the run visibly in progress while _apply() does its (blocking,
+        UI-thread) work on a large table. The default #primary_btn :pressed
+        tint is too close to its normal color to notice, and — since a click
+        is only ever momentarily "pressed" — it does not even stay visible for
+        work that takes a second or more; a disabled button with changed text
+        plus a wait cursor is unambiguous regardless of how long it takes.
+        """
+        self._apply_btn.setEnabled(not busy and bool(self._tsv_zone.path))
+        self._apply_btn.setText("Applying…" if busy else "Apply  →")
+        if busy:
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        else:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        # Force the repaint now: the work below runs on this same thread and
+        # would otherwise keep the old button/cursor on screen until it's done.
+        QtWidgets.QApplication.processEvents()
+
     def _apply(self):
         tsv_path = self._tsv_zone.path
         if not tsv_path or not os.path.isfile(tsv_path):
@@ -864,33 +882,38 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         if not ref_path:
             self._set_status("⚠  Add a query taxonomy reference file first.", RED)
             return
-        try:
-            _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
-            ref_lower = {k.lower(): v for k, v in ref_table.items()}
-            n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
-                tsv_path, ref_table, ref_lower, self._ref_group.suffix
-            )
-        except Exception as exc:
-            self._set_status(f"⚠  {exc}", RED)
-            return
-        msg = f"✓  {n_filled}/{n_rows} row(s) matched to the reference and written to the file."
-        if unknown:
-            examples = ", ".join(sorted(unknown)[:5])
-            msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
-        if n_match >= 0:
-            msg += f"  Tax_level_match updated on {n_match} row(s)."
 
-        # Regenerate the matching .xlsx from the just-updated table, overwriting
-        # whichever one (if any) sits next to it — otherwise it would keep
-        # showing the pre-fix taxonomy even though the .tsv is now correct.
+        self._set_busy(True)
         try:
-            xlsx_path = build_xlsx_from_tsv(tsv_path)
-            if xlsx_path:
-                msg += f"  {os.path.basename(xlsx_path)} updated."
-        except Exception as exc:
-            msg += f"  ⚠ .xlsx not updated: {exc}"
+            try:
+                _id_col, _tax_cols, ref_table = read_tax_reference(ref_path)
+                ref_lower = {k.lower(): v for k, v in ref_table.items()}
+                n_rows, n_filled, unknown, n_match = apply_reference_and_tax_match(
+                    tsv_path, ref_table, ref_lower, self._ref_group.suffix
+                )
+            except Exception as exc:
+                self._set_status(f"⚠  {exc}", RED)
+                return
+            msg = f"✓  {n_filled}/{n_rows} row(s) matched to the reference and written to the file."
+            if unknown:
+                examples = ", ".join(sorted(unknown)[:5])
+                msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
+            if n_match >= 0:
+                msg += f"  Tax_level_match updated on {n_match} row(s)."
 
-        self._set_status(msg, GREEN)
+            # Regenerate the matching .xlsx from the just-updated table, overwriting
+            # whichever one (if any) sits next to it — otherwise it would keep
+            # showing the pre-fix taxonomy even though the .tsv is now correct.
+            try:
+                xlsx_path = build_xlsx_from_tsv(tsv_path)
+                if xlsx_path:
+                    msg += f"  {os.path.basename(xlsx_path)} updated."
+            except Exception as exc:
+                msg += f"  ⚠ .xlsx not updated: {exc}"
+
+            self._set_status(msg, GREEN)
+        finally:
+            self._set_busy(False)
 
 
 class _FullWidthTabBar(QtWidgets.QTabBar):

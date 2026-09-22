@@ -1972,7 +1972,7 @@ class _BestSeqWorker(QtCore.QThread):
                 if (not identical and runner_up is not None
                         and abs(best["score"] - runner_up["score"]) < 1.0):
                     flags.append("near_tie")
-                if not in_all_files:
+                if not in_all_files and n_files > 1:
                     flags.append("missing_in_%d_run(s)" % (n_files - len(cands)))
                 if best["info"]["ambs"]:
                     flags.append("ambs=%d" % best["info"]["ambs"])
