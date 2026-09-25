@@ -15,6 +15,73 @@ repository):
 
 ---
 
+## [Unreleased]
+
+### Added
+- `_utilities/compare_runs_report.py`: standalone per-sample comparison of two
+  run folders (or two runs of a Parameter Batch): QC-compliant / filtered
+  barcodes gained, lost or changed, and secondary variants newly flagged;
+  writes a TSV.
+- `_utilities/batch_coverage_report.py`: standalone CLI that cross-checks a
+  completed Parameter Batch against a Best Sequence Selection run to work out
+  exactly which combinations were needed to recover the taxonomically-
+  identified sequences (per-combination coverage + greedy minimal run set +
+  Excel report). Documented in the manual (§17.6).
+- Parameter Batch `.cfg`: an explicit combination list, as an alternative to
+  the grid (Cartesian product) shape. A file whose first non-blank line is
+  `# combos` is parsed as one full combination per line
+  (`key=value, key=value, ...`, the same shape as the `Parameters` column of
+  `batch_run_summary.tsv`), instead of crossing every key's values with every
+  other key's — for re-running specific combinations a coverage analysis
+  already singled out, without regenerating the full grid they came from.
+  `_utilities/batch_sweep.py`'s `load_batch_config()` dispatches to either
+  shape; both feed the same downstream run/dedup/report machinery. Its own
+  template, `_profiles/ontbarcoder_batch_combos.cfg` — kept separate from the
+  grid template rather than a second section inside it, since the two shapes
+  are mutually exclusive per batch — is reachable from a new **"Create
+  example cfg (combo list)"** button next to the existing (now relabelled
+  **"Create example cfg (grid)"**) one. Documented in the manual (§17.1b).
+
+### Changed
+- Intra-sample variants: "several variants pass QC" now sets *needs review*
+  only when a QC-passing secondary diverges >= `multi_qc_review_div` (1 %)
+  from the dominant. Near-identical conspecific copies are still reported but
+  no longer flagged (on a 557-sample non-Coding run: 175 -> ~84 flagged
+  samples). New mix field `review_multi_qc`.
+- Intra-sample variants: "Minimum read coverage" now also sets the minimum
+  size of a real haplotype cluster (never below 3), so no barcode or variant
+  rests on fewer reads than that; smaller clusters count as noise.
+- Phase 2a, descending coverage levels: a sample with no more reads than the
+  current level is skipped there (it would realign exactly the reads of the
+  previous level and return the same consensus) and carried to the next one;
+  levels no pending sample needs are skipped entirely. Results are unchanged.
+- Phase 3 reference search bounds edlib by the current 20th-best distance
+  (same top-20 selection); `MSAcheck` uses a set for membership;
+  `calculatecoverage` counts headers without loading whole files; phase-2a
+  read counts come from the worker instead of re-reading every file.
+
+### Removed
+- `barcodesets/variant_reads/`: the reads of every secondary cluster were
+  written per sample and coverage level but never read by anything.
+
+### Fixed
+- non-Coding markers: a consensus is accepted by absence of Ns alone (the
+  rule the GUI already applied). The worker still required length == expected
+  length, which disabled the consensus-frequency sweep rescue (0.3–0.5) for
+  variable-length markers: a sample with a few Ns at the main frequency was
+  never rescued at a cleaner frequency.
+- Phase 2b re-runs the haplotype resolver, but its result was discarded: for
+  samples whose barcode comes from 2b, the 2b variant breakdown (chosen
+  cluster, review flag, secondaries) now replaces phase 2a's in the log, the
+  variants sheet, `secondary_variants.fa` and phase-3 variant recovery.
+- Fine variant resolver (`_dominant_haplotype`): the minor-allele frequency of
+  a column is now computed over all reads, not only the non-gap ones. Sparse
+  ONT insertion columns (a few bases among mostly gaps) were counted as
+  polymorphic, inflating the tolerance until it absorbed real low-divergence
+  haplotypes (a 30 % mix differing by 2 SNPs went undetected). On a
+  557-sample non-Coding run: 459 vs 446 QC-compliant barcodes, same agreement
+  with taxonomically identified reference sequences.
+
 ## [3.4b] — 2026-09
 
 Adds a way to explore several values of a few parameters without re-running

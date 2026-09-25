@@ -219,6 +219,103 @@ def combo_label(override: Dict[str, str]) -> str:
     return ", ".join(f"{k}={v}" for k, v in override.items())
 
 
+# ── Explicit combination list (as opposed to a grid) ────────────────────
+#
+# A grid .cfg (one "key = v1, v2, ..." line per parameter) is a Cartesian
+# product: every value of every key gets crossed with every value of every
+# other key. That is the wrong shape once specific combinations have already
+# been picked out of a previous sweep — e.g. the N run numbers a coverage
+# analysis (batch_coverage_report.py) found sufficient to reproduce a given
+# set of results. Re-listing each of those parameters' distinct values in a
+# grid .cfg would regenerate the full product again, not just the N
+# combinations wanted.
+#
+# A combo-list .cfg instead has one FULL combination per line, using the
+# same "key=value, key=value, ..." shape already used elsewhere in the app
+# (combo_label() above, and the "Parameters" column of batch_run_summary.tsv)
+# so a row can be copied there directly. Its first non-blank line must be
+# exactly "# combos" (case-insensitive) — this is what tells parse_sweep_config
+# apart from load_batch_config which one to use; a plain grid .cfg has no such
+# line and stays untouched.
+
+COMBO_LIST_MARKER = "combos"
+
+
+def is_combo_list_config(path: str) -> bool:
+    """True if `path`'s first non-blank line is the '# combos' marker."""
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            return line.lstrip("#").strip().lower() == COMBO_LIST_MARKER
+    return False
+
+
+def parse_combo_list_config(path: str) -> List[Dict[str, str]]:
+    """Parse a combo-list config: one full combination per line, as
+    'key=value, key=value, ...'. The '# combos' marker line and any other
+    '#'-comment or blank line are skipped. Order is preserved.
+
+    Every key/value is validated against PARAM_SPECS (same rules as a grid
+    .cfg) — raises ValueError naming the offending line on an unknown key,
+    an unparsable value, or a value outside its GUI-enforced range.
+    """
+    combos: List[Dict[str, str]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            combo: Dict[str, str] = {}
+            for part in line.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if "=" not in part:
+                    raise ValueError(
+                        f"{os.path.basename(path)}:{lineno}: expected "
+                        f"'key=value, key=value, ...', got: {raw.strip()!r}"
+                    )
+                key, value = part.split("=", 1)
+                key, value = key.strip(), value.strip()
+                _cast_and_validate(key, value)  # raises with key/value context
+                combo[key] = value
+            if not combo:
+                raise ValueError(f"{os.path.basename(path)}:{lineno}: empty combination")
+            combos.append(combo)
+    if not combos:
+        raise ValueError(f"{os.path.basename(path)}: no combinations found")
+    return combos
+
+
+def load_batch_config(
+    path: str,
+) -> Tuple[List[Dict[str, str]], str, Dict[str, List[str]] | None]:
+    """Load a batch .cfg of either shape and return (combos, mode, sweep).
+
+    mode is "grid" or "combos". For "grid", `sweep` is the parsed
+    {key: [values]} dict (expand_grid(sweep) == combos) — kept around so
+    callers can still show "N values" per key, exactly as before this
+    function existed. For "combos", `sweep` is None; use
+    `swept_keys(combos)` below to get the set of parameters actually varied.
+    """
+    if is_combo_list_config(path):
+        return parse_combo_list_config(path), "combos", None
+    sweep = parse_sweep_config(path)
+    validate_sweep(sweep)
+    return expand_grid(sweep), "grid", sweep
+
+
+def swept_keys(combos: List[Dict[str, str]]) -> set:
+    """Union of every key overridden by any combination — works for both a
+    grid's combos and an explicit combo list alike."""
+    keys: set = set()
+    for combo in combos:
+        keys.update(combo.keys())
+    return keys
+
+
 # ── Deduplication ────────────────────────────────────────────────────────
 
 def _read_fasta(path: str) -> List[Tuple[str, str]]:

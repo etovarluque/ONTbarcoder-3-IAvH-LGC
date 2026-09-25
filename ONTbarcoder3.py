@@ -228,9 +228,8 @@ from _utilities.fasta_tools import FastaToolsPanel
 from _utilities.bold_formatter import BoldFormatterPanel
 from _utilities.notes_panel import NotesPanel
 from _utilities.batch_sweep_panel import BatchSweepPanel
-from _utilities.batch_sweep import (parse_sweep_config, expand_grid, apply_overrides,
-                                     validate_sweep, combo_label, dedup_consensus_filtered,
-                                     phase1_key)
+from _utilities.batch_sweep import (load_batch_config, swept_keys, apply_overrides,
+                                     combo_label, dedup_consensus_filtered, phase1_key)
 # ── i18n ──────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import xml.etree.ElementTree as _ET
@@ -3345,6 +3344,10 @@ class ParamsPanel(BasePanel):
                 # above it (heterospecific level) it suggests cross-
                 # contamination or a sample mix-up.
                 "divergence_review": 0.03,
+                # Several QC-passing variants force 'needs review' only when
+                # they diverge >= this from the dominant (near-identical
+                # conspecific copies are reported but not flagged).
+                "multi_qc_review_div": 0.01,
             },
             "run_phase1": self._step_checks["phase1"].isChecked(),
             "run_phase2a": self._step_checks["phase2a"].isChecked(),
@@ -5896,12 +5899,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            sweep = parse_sweep_config(cfg_path)
-            validate_sweep(sweep)
-            combos = expand_grid(sweep)
+            combos, cfg_mode, sweep = load_batch_config(cfg_path)
         except Exception as e:
             self._panel_batch_sweep.on_error(str(e))
             return
+        cfg_swept_keys = swept_keys(combos)
 
         base_params = self._panel_params.get_params()
 
@@ -5923,9 +5925,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # would make every combination identical, so it is turned on for the
         # whole batch. An explicit resolve_mixed.enabled in the .cfg still
         # wins: apply_overrides() runs on top of this baseline.
-        _forced_resolve = (any(k.startswith("resolve_mixed.") for k in sweep)
+        _forced_resolve = (any(k.startswith("resolve_mixed.") for k in cfg_swept_keys)
                            and not base_params.get("resolve_mixed", {}).get("enabled"))
-        if any(k.startswith("resolve_mixed.") for k in sweep):
+        if any(k.startswith("resolve_mixed.") for k in cfg_swept_keys):
             base_params.setdefault("resolve_mixed", {})["enabled"] = True
 
         if len(combos) > 200:
@@ -5949,8 +5951,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 fh.write(f"Parameter sweep started {datetime.datetime.now()}\n")
                 fh.write(f"Config file: {cfg_path}\n")
                 fh.write(f"Combinations: {len(combos)}\n\n")
-                for key, values in sweep.items():
-                    fh.write(f"  {key} = {', '.join(values)}\n")
+                if cfg_mode == "grid":
+                    for key, values in sweep.items():
+                        fh.write(f"  {key} = {', '.join(values)}\n")
+                else:
+                    fh.write("  Explicit combination list:\n")
+                    for i, combo in enumerate(combos, start=1):
+                        fh.write(f"    {i}. {combo_label(combo)}\n")
         except OSError:
             pass
 
@@ -7275,10 +7282,26 @@ class MainWindow(QtWidgets.QMainWindow):
                           if self.sampleids.get(
                               f.split("_all.fa")[0], 0) >= mincov]
             self.inlistforconsensus = all_fa
+            self._cov_deferred = []
             self._consensus_first_call = False
 
         current_cov = self.selectlens[self.selectlenscounter]
         self._panel_progress.set_phase("2a", f"Consensus by length-coverage {current_cov}...")
+
+        # Descending coverages: a sample with <= current_cov reads already
+        # used ALL its reads at the previous (larger) level, so this level
+        # would align exactly the same reads and return the same consensus.
+        # It is deferred to the next level (where fewer reads may change the
+        # result) instead of being re-aligned.
+        _n_deferred = 0
+        if self.selectlenscounter > 0 and self._coverage_descending():
+            _run, _defer = [], []
+            for f in self.inlistforconsensus:
+                (_run if self.sampleids.get(f.split("_all.fa")[0], 0) > current_cov
+                 else _defer).append(f)
+            self.inlistforconsensus = _run
+            self._cov_deferred = _defer
+            _n_deferred = len(_defer)
 
         if not self.inlistforconsensus:
             self._panel_progress.append_log("No _all.fa files found.", "error")
@@ -7290,6 +7313,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.append_log(
             f"Processing {n_samples} samples (coverage {current_cov})"
             + (f" — {n_good_so_far} barcodes without errors so far" if n_good_so_far > 0 else "")
+            + (f"; {_n_deferred} skipped (≤{current_cov} reads: same reads as the "
+               f"previous level)" if _n_deferred else "")
             + "...", "info"
         )
         self._panel_progress.update_phase_progress("2a", 0, n_samples)
@@ -7340,7 +7365,9 @@ class MainWindow(QtWidgets.QMainWindow):
              params["consfreqmax"]],
             params["consfreqstep"],
             params["gencode"],
-            params.get("resolve_mixed", {}),
+            # "Minimum read coverage" also bounds the haplotype-cluster size.
+            dict(params.get("resolve_mixed", {}) or {},
+                 min_reads=params.get("mincoverage", 1)),
             self._gencode_by_sample(),
             params.get("qclentol", 0),
         ]
@@ -7349,6 +7376,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.myconsensus1.notifyProgress.connect(self._on_consensus_progress)
         self.myconsensus1.taskFinished.connect(self._on_consensus_done)
         self.myconsensus1.start()
+
+    def _coverage_descending(self) -> bool:
+        """True when phase-2a coverage levels go from high to low."""
+        return (len(self.selectlens) > 1
+                and self.selectlens[0] > self.selectlens[-1])
 
     def _on_consensus_progress(self, i):
         n = len(self.inlistforconsensus)
@@ -7415,7 +7447,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if not _mv.get("chosen_by_abundance", True):
                         _reasons.append(
                             "chosen barcode is not the most abundant variant")
-                    if _mv.get("n_pass_qc", 0) > 1:
+                    if _mv.get("review_multi_qc", _mv.get("n_pass_qc", 0) > 1):
                         _reasons.append(
                             f"{_mv.get('n_pass_qc')} variants pass QC")
                     _why = "; ".join(_reasons) or "review flagged"
@@ -7464,8 +7496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _n_this_seq  = 0  # non-Coding: have non-empty sequence
 
         # Downward coverage (non-Coding): selectlens = [1000, 500, 200, ...]
-        _is_descending = (len(self.selectlens) > 1 and
-                          self.selectlens[0] > self.selectlens[-1])
+        _is_descending = self._coverage_descending()
         _next_idx = self.selectlenscounter + 1
         _next_cov = (self.selectlens[_next_idx]
                      if _next_idx < len(self.selectlens) else None)
@@ -7550,6 +7581,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.selectlenscounter += 1
 
+        # Samples deferred at this level (same reads as the previous one) still
+        # need the lower levels; skip any level none of the pending samples
+        # would process with different reads.
+        if _is_descending:
+            self.inlistforconsensus = sorted(
+                self.inlistforconsensus + getattr(self, "_cov_deferred", []))
+            self._cov_deferred = []
+            while (self.inlistforconsensus
+                   and self.selectlenscounter < len(self.selectlens)
+                   and not any(self.sampleids.get(f.split("_all.fa")[0], 0)
+                               > self.selectlens[self.selectlenscounter]
+                               for f in self.inlistforconsensus)):
+                self.selectlenscounter += 1
+
         # Same count as Coding: con200flags is now True for resolved ones
         # in both modes. _n_this_good counts those in this cycle.
         n_good_this = _n_this_good
@@ -7616,67 +7661,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         outfile3.write(f">{k}_all.fa;{slen};{cov}\n{seq}\n")
 
-            # ── Intra-sample variant resolution summary ───────────────────
-            _resolve_enabled = bool(params.get("resolve_mixed", {}).get("enabled", False))
-            _mixed = {k: v for k, v in getattr(self, 'mixinfo_all', {}).items()
-                      if k in self.con200barcodes and v.get("secondary")}
-            if _resolve_enabled:
-                variants_fa = os.path.join(outpath, "barcodesets",
-                                           "consensus_by_length",
-                                           "secondary_variants.fa")
-                # ALL secondary variants per sample are reported (not just one). No
-                # cross-sample "source" is inferred: an analysis routinely contains
-                # several samples of the same species, so a secondary matching
-                # another sample's barcode does NOT imply it is the source.
-                # Skip low-quality secondaries (≥5 Ns) to keep the file informative.
-                _MAX_VARIANT_N = 5
-                _n_written = 0
-                with open(variants_fa, 'w') as cf:
-                    for k in sorted(_mixed.keys()):
-                        v = _mixed[k]
-                        # Prefer the full per-cluster breakdown; fall back to the
-                        # back-compat single 'secondary' field if absent.
-                        _secs = v.get("secondaries")
-                        if not _secs:
-                            _secs = [{"frac": 1.0 - float(v.get("frac", 0)),
-                                      "seq": v.get("secondary", ""),
-                                      "translates": None}]
-                        for _i, s in enumerate(_secs, start=1):
-                            seq = s.get("seq", "")
-                            if not seq or seq.count("N") >= _MAX_VARIANT_N:
-                                continue
-                            _tr = s.get("translates")
-                            _tr_tag = ("yes" if _tr is True
-                                       else "no" if _tr is False else "NA")
-                            _dv = s.get("divergence")
-                            _dv_tag = (f"{float(_dv)*100:.1f}%"
-                                       if _dv is not None else "NA")
-                            cf.write(
-                                f">{k}_var{_i};frac={float(s.get('frac',0))*100:.0f}%;"
-                                f"len={len(seq)};div={_dv_tag};"
-                                f"translates={_tr_tag}\n{seq}\n")
-                            _n_written += 1
-                # "Recovered" = mixed samples that became QC-compliant barcodes
-                # thanks to resolution (they would otherwise fail on Ns / frame).
-                _n_recovered = sum(1 for k in _mixed
-                                   if self.con200flags.get(k, False))
-                _n_review = sum(1 for v in _mixed.values() if v.get("needs_review"))
-                self._resolve_stats = {"enabled": True, "mixed": len(_mixed),
-                                       "recovered": _n_recovered,
-                                       "needs_review": _n_review,
-                                       "contaminants": _n_written}
-                if _mixed:
-                    _rev_txt = (f"; ⚠ {_n_review} need manual review"
-                                if _n_review else "")
-                    self._panel_progress.append_log(
-                        f"  Intra-sample variant resolution: {len(_mixed)} sample(s) "
-                        f"resolved ({_n_recovered} now QC-compliant){_rev_txt}; "
-                        f"{_n_written} secondary variant(s) written to "
-                        f"secondary_variants.fa.", "warn")
-            else:
-                self._resolve_stats = {"enabled": False, "mixed": 0,
-                                       "recovered": 0, "needs_review": 0,
-                                       "contaminants": 0}
+            self._write_variant_summary()
 
             # EXECUTE ALL PHASES in each cycle (not just up to 2a)
             if params.get("run_phase2b", True):
@@ -7690,6 +7675,76 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._build_final_for_non_coi()
             else:
                 self._finish_analysis()
+
+    def _write_variant_summary(self, stage: str = "2a"):
+        """Writes secondary_variants.fa and the intra-sample variant stats from
+        mixinfo_all. Called when phase 2a ends and again after phase 2b when
+        2b resolved samples through the haplotype resolver (their barcode —
+        and hence their variant breakdown — then comes from 2b)."""
+        params = self._params
+        outpath = self._outpath
+        _resolve_enabled = bool(params.get("resolve_mixed", {}).get("enabled", False))
+        if not _resolve_enabled:
+            self._resolve_stats = {"enabled": False, "mixed": 0,
+                                   "recovered": 0, "needs_review": 0,
+                                   "contaminants": 0}
+            return
+        _mixed = {k: v for k, v in getattr(self, 'mixinfo_all', {}).items()
+                  if k in self.con200barcodes and v.get("secondary")}
+        variants_fa = os.path.join(outpath, "barcodesets",
+                                   "consensus_by_length",
+                                   "secondary_variants.fa")
+        # ALL secondary variants per sample are reported (not just one). No
+        # cross-sample "source" is inferred: an analysis routinely contains
+        # several samples of the same species, so a secondary matching
+        # another sample's barcode does NOT imply it is the source.
+        # Skip low-quality secondaries (≥5 Ns) to keep the file informative.
+        _MAX_VARIANT_N = 5
+        _n_written = 0
+        with open(variants_fa, 'w') as cf:
+            for k in sorted(_mixed.keys()):
+                v = _mixed[k]
+                # Prefer the full per-cluster breakdown; fall back to the
+                # back-compat single 'secondary' field if absent.
+                _secs = v.get("secondaries")
+                if not _secs:
+                    _secs = [{"frac": 1.0 - float(v.get("frac", 0)),
+                              "seq": v.get("secondary", ""),
+                              "translates": None}]
+                for _i, s in enumerate(_secs, start=1):
+                    seq = s.get("seq", "")
+                    if not seq or seq.count("N") >= _MAX_VARIANT_N:
+                        continue
+                    _tr = s.get("translates")
+                    _tr_tag = ("yes" if _tr is True
+                               else "no" if _tr is False else "NA")
+                    _dv = s.get("divergence")
+                    _dv_tag = (f"{float(_dv)*100:.1f}%"
+                               if _dv is not None else "NA")
+                    cf.write(
+                        f">{k}_var{_i};frac={float(s.get('frac',0))*100:.0f}%;"
+                        f"len={len(seq)};div={_dv_tag};"
+                        f"translates={_tr_tag}\n{seq}\n")
+                    _n_written += 1
+        # "Recovered" = mixed samples that became QC-compliant barcodes
+        # thanks to resolution (they would otherwise fail on Ns / frame).
+        _n90 = getattr(self, "n90flags", {}) or {}
+        _n_recovered = sum(1 for k in _mixed
+                           if self.con200flags.get(k, False) or _n90.get(k, False))
+        _n_review = sum(1 for v in _mixed.values() if v.get("needs_review"))
+        self._resolve_stats = {"enabled": True, "mixed": len(_mixed),
+                               "recovered": _n_recovered,
+                               "needs_review": _n_review,
+                               "contaminants": _n_written}
+        if _mixed:
+            _rev_txt = (f"; ⚠ {_n_review} need manual review"
+                        if _n_review else "")
+            _upd = " (updated after phase 2b)" if stage == "2b" else ""
+            self._panel_progress.append_log(
+                f"  Intra-sample variant resolution{_upd}: {len(_mixed)} sample(s) "
+                f"resolved ({_n_recovered} now QC-compliant){_rev_txt}; "
+                f"{_n_written} secondary variant(s) written to "
+                f"secondary_variants.fa.", "warn")
 
     # ──────────────────────────────────────────────────────────────────────────
     # NON-CODING MODE: Build final files from phase 2a (without 2b or 3)
@@ -7930,7 +7985,9 @@ class MainWindow(QtWidgets.QMainWindow):
             [params["consfreqmin"], params["consfreqmax"]],
             params["consfreqstep"],
             params["gencode"],
-            params.get("resolve_mixed", {}),
+            # "Minimum read coverage" also bounds the haplotype-cluster size.
+            dict(params.get("resolve_mixed", {}) or {},
+                 min_reads=params.get("mincoverage", 1)),
             self._gencode_by_sample(),
             params.get("qclentol", 0),
         ]
@@ -8008,6 +8065,24 @@ class MainWindow(QtWidgets.QMainWindow):
                         if slen != 0:
                             outfile.write(f">{k}_all.fa;{slen};{cov}\n{seq}\n")
                             outfile3.write(f">{k}_all.fa;{slen};{cov}\n{seq}\n")
+
+        # Phase 2b also runs the haplotype resolver. For samples whose final
+        # barcode comes from 2b, its variant breakdown (chosen cluster, review
+        # flag, secondaries) replaces phase 2a's, so reports and phase-3
+        # variant recovery describe the barcode actually delivered.
+        _mix2 = getattr(self.myconsensus2, "mixinfo", {}) or {}
+        _merged2 = [k for k in sorted(_mix2) if self.n90flags.get(k)]
+        if _merged2:
+            if not hasattr(self, "mixinfo_all"):
+                self.mixinfo_all = {}
+            for k in _merged2:
+                self.mixinfo_all[k] = _mix2[k]
+                _mv = _mix2[k]
+                _rev = " — NEEDS REVIEW" if _mv.get("needs_review") else ""
+                self._panel_progress.append_log(
+                    f"  🟣 2b {k} — {_mv.get('n_clusters', 2)} variants, kept "
+                    f"variant at {float(_mv.get('frac', 0)) * 100:.0f}%{_rev}", "warn")
+            self._write_variant_summary(stage="2b")
 
         # ── Excel Sheet 2b Consensus by similarity ───────────────────────────
         if not self._is_live() or getattr(self, "_live_finalizing", False):

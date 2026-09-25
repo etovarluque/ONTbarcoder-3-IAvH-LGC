@@ -33,6 +33,7 @@ import multiprocessing
 import xlsxwriter
 import fileinput
 import itertools
+import heapq
 import subprocess
 from collections import Counter, defaultdict
 from itertools import zip_longest, combinations
@@ -709,13 +710,10 @@ class calculatecoverage(QtCore.QThread):
                     self.dirdict[fname] = fname
                 else:
                     self.dirdict[fname.split(".")[0] + "_all.fa"] = fname
-                l = infile.readlines()
-                for i, j in enumerate(l):
-                    if ">" in j:
-                        try:
-                            self.counter[fname.split("_all.fa")[0]] += 1
-                        except KeyError:
-                            self.counter[fname.split("_all.fa")[0]] = 1
+                n_hdr = sum(1 for j in infile if ">" in j)
+                if n_hdr:
+                    key = fname.split("_all.fa")[0]
+                    self.counter[key] = self.counter.get(key, 0) + n_hdr
             self.notifyProgress.emit(c+1)
         
         self.taskFinished.emit(0)
@@ -768,7 +766,7 @@ def _consensus_columns(seqs, perc_thresh):
 
 
 def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
-                        tolerance=0.10):
+                        tolerance=0.10, min_reads=3):
     """
     Intra-sample variant resolver (marker-agnostic) for the MSA-aligned
     reads of ONE sample. From the polymorphic columns, it groups the
@@ -794,6 +792,9 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
                     disagree with its cluster's centroid and still belong to it.
                     Absorbs sequencing error / intrinsic variation so as not to
                     fragment a single haplotype into many spurious clusters.
+      min_reads:    minimum reads for a cluster to be a real haplotype (never
+                    below 3). Callers pass the user's "Minimum read coverage",
+                    so no barcode or variant rests on fewer reads than that.
 
     Returns dict:
       mixed:               bool   (>=2 real clusters)
@@ -826,8 +827,13 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
         if len(cnt) < 2:
             continue
         common = cnt.most_common(2)
-        total = sum(cnt.values())
-        mf = common[1][1] / total if total else 0.0
+        # Minor-allele frequency over ALL reads, not only the non-gap ones:
+        # ONT insertion columns hold a base in a handful of reads (e.g. 3 T +
+        # 1 C among 100 reads, the rest '-'), and normalising by the non-gap
+        # total made them look polymorphic (1/4 = 25%). Dozens of such columns
+        # inflated n_poly and hence tol_pos, which then absorbed a real
+        # low-divergence haplotype (a 2-SNP mix went undetected).
+        mf = common[1][1] / n
         if mf >= minor_thresh:
             poly_cols.append(j)
     n_poly = len(poly_cols)
@@ -892,12 +898,15 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
     # 4) Sort clusters by size (deterministic tie-break by consensus).
     cluster_members.sort(key=lambda m: (-len(m), ''.join(_consensus_columns(m, 0.5))))
 
-    # Real clusters = fraction >= min_secondary_frac AND absolute size >= 3
-    # reads (at low coverage, 2 reads sharing a correlated error are not
-    # sufficient evidence of a real haplotype); the rest is noise.
+    # Real clusters = fraction >= min_secondary_frac AND absolute size >=
+    # max(3, min_reads) reads (at low coverage, 2 reads sharing a correlated
+    # error are not sufficient evidence of a real haplotype, and the user's
+    # "Minimum read coverage" must hold for every barcode/variant reported);
+    # the rest is noise.
+    _min_size = max(3, int(min_reads))
     real, noise_reads = [], []
     for m in cluster_members:
-        if len(m) / n >= min_secondary_frac and len(m) >= 3:
+        if len(m) / n >= min_secondary_frac and len(m) >= _min_size:
             real.append(m)
         else:
             noise_reads.extend(m)
@@ -914,11 +923,6 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
             "consensus": ''.join(_consensus_columns(m, 0.5)),
             "translates": None,        # filled in by callconsensus in Coding mode
             "role": "dominant" if rank == 0 else "secondary",
-            # Aligned reads of the cluster (with gaps). Used locally in
-            # callconsensus to dump the per-cluster reads to disk so that
-            # secondary variants can be recovered (re-consensus 2a + Phase 3). NOT
-            # propagated in the 'mix' dict returned to the main thread (would be heavy).
-            "members": m,
         })
 
     dominant_frac = len(real[0]) / n
@@ -992,10 +996,11 @@ def _runconsensusparts_fn(inlist):
     _resolve_minor = float(resolve_cfg.get("minor_thresh", 0.2))
     _resolve_secfrac = float(resolve_cfg.get("min_secondary_frac", 0.2))
     _resolve_tol = float(resolve_cfg.get("tolerance", 0.10))
-    # Secondary-variant recovery (2a-consensus + Phase 3): always active
-    # when detection is turned on. The reads of each eligible secondary
-    # cluster (< _resolve_maxn Ns in its consensus) are saved for reprocessing,
-    # capped at _resolve_maxvar per sample (the most abundant ones).
+    # User's "Minimum read coverage", injected by the GUI when building the job.
+    _resolve_minreads = int(resolve_cfg.get("min_reads", 3))
+    # Secondary-variant recovery (Phase 3 at finalization): eligible secondaries
+    # have < _resolve_maxn Ns, capped at _resolve_maxvar per sample (the most
+    # abundant ones); here only the number left beyond the cap is counted.
     _resolve_recover = bool(resolve_cfg.get("recover_secondaries", True))
     _resolve_maxvar = int(resolve_cfg.get("max_variants", 3))
     _resolve_maxn = int(resolve_cfg.get("max_variant_Ns", 5))
@@ -1004,6 +1009,9 @@ def _runconsensusparts_fn(inlist):
     # species, heteroplasmia, alleles) the mixture is informative; above it
     # (heterospecific level) it suggests cross-contamination or sample mixing.
     _resolve_divrev = float(resolve_cfg.get("divergence_review", 0.03))
+    # Minimum dominant<->secondary divergence for 'several variants pass QC'
+    # to force 'needs review' (below it the variants are near-identical).
+    _resolve_passdiv = float(resolve_cfg.get("multi_qc_review_div", 0.01))
 
     def consensus(indict, perc_thresh, abs_thresh):
         seqs = list(indict.values())
@@ -1160,7 +1168,7 @@ def _runconsensusparts_fn(inlist):
             if _resolve_on:
                 _r = _dominant_haplotype(list(seqdict.values()),
                                          _resolve_minor, _resolve_secfrac,
-                                         _resolve_tol)
+                                         _resolve_tol, _resolve_minreads)
                 if _r["mixed"] and _r["clusters"]:
                     cl = _r["clusters"]
                     # Length (gap-free) and number of ambiguities (Ns) per cluster.
@@ -1216,7 +1224,7 @@ def _runconsensusparts_fn(inlist):
                         return (c.get("translates")
                                 and abs(c["len"] - plen) <= postdemlen)
                     _n_pass = sum(1 for c in cl if _passes_qc(c))
-                    needs_review = (chosen_idx != 0) or (_n_pass > 1)
+                    needs_review = (chosen_idx != 0)
                     # Reassign roles: the chosen one is 'dominant', the rest 'secondary'.
                     for i, c in enumerate(cl):
                         c["role"] = "dominant" if i == chosen_idx else "secondary"
@@ -1234,7 +1242,15 @@ def _runconsensusparts_fn(inlist):
                                                            c["consensus"]))
                     _max_div = max((c["divergence"] for c in cl), default=0.0)
                     _div_review = _max_div >= _resolve_divrev
-                    needs_review = needs_review or _div_review
+                    # Several QC-passing variants only warrant review when they
+                    # differ by >= _resolve_passdiv: below that (a few bases —
+                    # intragenomic copies, heteroplasmy) any of them gives the
+                    # same identification, so it is reported but not flagged.
+                    _multi_qc_review = any(
+                        i != chosen_idx and _passes_qc(c)
+                        and c["divergence"] >= _resolve_passdiv
+                        for i, c in enumerate(cl))
+                    needs_review = needs_review or _div_review or _multi_qc_review
                     # Secundarios (todos los no elegidos) en orden de abundancia.
                     _secs = [{"rank": c["rank"],
                               "frac": c["frac"],
@@ -1254,6 +1270,7 @@ def _runconsensusparts_fn(inlist):
                         "n_pass_qc": _n_pass,
                         "max_divergence": _max_div,
                         "review_divergence": _div_review,
+                        "review_multi_qc": _multi_qc_review,
                         # back-compat: 'secondary' = top secondary (string).
                         "secondary": (_secs[0]["seq"] if _secs else ""),
                         "secondaries": _secs,
@@ -1264,35 +1281,12 @@ def _runconsensusparts_fn(inlist):
                                       "role": c["role"]} for c in cl],
                     }
 
-                    # ── Save reads of the eligible secondary clusters ──
-                    # for later recovery (2a-consensus + Phase 3).
-                    # Eligible = secondaries with < _resolve_maxn Ns in their consensus;
-                    # the _resolve_maxvar most abundant ones are saved, and the number
-                    # left out is recorded (to notify the user).
+                    # Eligible secondaries beyond the per-sample cap are counted
+                    # (reported to the user as 'not recovered').
                     if _resolve_recover:
-                        _skey = name.split("_all.fa")[0]
-                        _secs_cl = [c for i, c in enumerate(cl) if i != chosen_idx]
-                        _eligible = [c for c in _secs_cl if c["nN"] < _resolve_maxn]
-                        _to_save = _eligible[:_resolve_maxvar]
-                        _vdir = os.path.join(outpath, "barcodesets", "variant_reads")
-                        try:
-                            os.makedirs(_vdir, exist_ok=True)
-                            saved = []
-                            for c in _to_save:
-                                vname = f"{_skey}__var{c['rank']}"
-                                with open(os.path.join(_vdir, vname + "_all.fa"),
-                                          "w") as vf:
-                                    for ri, aread in enumerate(c.get("members", [])):
-                                        rseq = aread.replace("-", "")
-                                        if rseq:
-                                            vf.write(f">{vname}_read{ri}\n{rseq}\n")
-                                saved.append({"name": vname, "rank": c["rank"],
-                                              "size": c["size"], "frac": c["frac"]})
-                            mix["recover_saved"] = saved
-                            mix["n_variants_extra"] = len(_eligible) - len(_to_save)
-                        except OSError:
-                            mix["recover_saved"] = []
-                            mix["n_variants_extra"] = 0
+                        _n_elig = sum(1 for i, c in enumerate(cl)
+                                      if i != chosen_idx and c["nN"] < _resolve_maxn)
+                        mix["n_variants_extra"] = max(0, _n_elig - _resolve_maxvar)
 
             if _gc == 0:
                 # non-Coding marker mode: acceptance is by ABSENCE OF Ns; the
@@ -1300,8 +1294,11 @@ def _runconsensusparts_fn(inlist):
                 # so len==plen is NOT required here (the GUI accepts by 0 Ns).
                 transcheck = "non-Coding"
                 if conseq.count("N") == 0:
-                    if len(conseq) == plen:
-                        flag = True
+                    # Accepted by absence of Ns alone, the same rule the GUI
+                    # applies: non-Coding lengths vary between taxa, so the
+                    # former len == plen requirement left flag False for most
+                    # samples and disabled the threshold-sweep rescue below.
+                    flag = True
                     if mix is not None:
                         # Mixture explicitly resolved to the dominant haplotype.
                         transcheck = "non-Coding-mixed"
@@ -1465,7 +1462,7 @@ def _runconsensusparts_fn(inlist):
                             conseq2 = ''.join(sequence).replace("-", "")
                             if conseq2:
                                 if gencode_for(name) == 0:
-                                    flag2 = len(conseq2) == plen and conseq2.count("N") == 0
+                                    flag2 = conseq2.count("N") == 0
                                 else:
                                     flag2 = False
                                     if abs(len(conseq2) - plen) <= qclentol and conseq2.count("N") == 0:
@@ -1505,7 +1502,7 @@ def _runconsensusparts_fn(inlist):
             if cov != 'NA':
                 coverages[_key] = "NA"
 
-    result = [transcheck, conseqs, flags, coverages, mixinfo, lenwarns]
+    result = [transcheck, conseqs, flags, coverages, mixinfo, lenwarns, sampleids]
     return result
 
 
@@ -1522,12 +1519,28 @@ def _runtoptwenty_worker(args):
     # saves an O(R log R) sort per query sequence).
     ambiguity_codes = AMBIGUITY_CODES
     dists = {}
+    # Only the 20 closest references are used. Once 20 are known, any other
+    # reference farther than the current 20th-best distance can never enter
+    # the top 20, so edlib is bounded by that distance (k) and abandons it
+    # early. References at exactly that distance are still computed, so the
+    # name-based tie-break below sees the same candidates as an unbounded run.
+    top = []        # max-heap (negated) of the 20 smallest distances so far
+    kbound = -1     # -1 = unbounded
 
     for other in refseqdict:
         if each != other:
             k = edlib.align(each, other, mode='NW', task='distance',
-                           additionalEqualities=ambiguity_codes)
-            dists[other] = k['editDistance']
+                           additionalEqualities=ambiguity_codes, k=kbound)
+            d = k['editDistance']
+            if d < 0:
+                continue
+            dists[other] = d
+            if len(top) < 20:
+                heapq.heappush(top, -d)
+            elif d < -top[0]:
+                heapq.heapreplace(top, -d)
+            if len(top) == 20:
+                kbound = -top[0]
     
     sorted_d = sorted(dists.items(), key=lambda x: x[1])
     
@@ -1819,6 +1832,21 @@ class runconsensusparts(QtCore.QThread):
         self.mixinfo = {}
         self.lenwarns = {}
 
+    def _store_read_count(self, res, fname, outpath, indir):
+        """Demultiplexed read count of one sample: taken from the worker (which
+        already counted it while subsampling) or, when it did not subsample
+        (phase 2b), by counting the headers of its input file."""
+        key = fname.split('_all.fa')[0]
+        counted = res[6] if len(res) > 6 else {}
+        if key in counted:
+            self.sampleids[key] = counted[key]
+            return
+        try:
+            with open(os.path.join(outpath, indir, fname), 'rb') as f:
+                self.sampleids[key] = f.read().count(b'>')
+        except OSError:
+            self.sampleids[key] = 0
+
     def run(self):
         inlist = self.inlist
         inlist1 = inlist[0]
@@ -1857,14 +1885,8 @@ class runconsensusparts(QtCore.QThread):
                             self.mixinfo.update(res[4])
                         if len(res) > 5:
                             self.lenwarns.update(res[5])
-                        fname = inlist1_sorted[orig_i]
-                        key = fname.split('_all.fa')[0]
-                        fa = os.path.join(outpath, indir, fname)
-                        try:
-                            with open(fa) as f:
-                                self.sampleids[key] = sum(1 for l in f if l.startswith('>'))
-                        except (FileNotFoundError, OSError):
-                            self.sampleids[key] = 0
+                        self._store_read_count(res, inlist1_sorted[orig_i],
+                                               outpath, indir)
                         completed += 1
                         self.notifyProgress.emit(completed)
             except Exception:
@@ -1892,14 +1914,7 @@ class runconsensusparts(QtCore.QThread):
                     self.mixinfo.update(res[4])
                 if len(res) > 5:
                     self.lenwarns.update(res[5])
-                fname = inlist1_sorted[i]
-                key = fname.split('_all.fa')[0]
-                fa = os.path.join(outpath, indir, fname)
-                try:
-                    with open(fa) as f:
-                        self.sampleids[key] = sum(1 for l in f if l.startswith('>'))
-                except (FileNotFoundError, OSError):
-                    self.sampleids[key] = 0
+                self._store_read_count(res, inlist1_sorted[i], outpath, indir)
                 self.notifyProgress.emit(i + 1)
 
         self.taskFinished.emit(0)
@@ -2071,6 +2086,7 @@ class MSAcheck(QtCore.QThread):
         
         # --- DETERMINISTIC PATCH: sort lists for iteration ---
         tocorlist_sorted = deterministic_sort(self.tocorlist) if self.tocorlist else []
+        tocor_set = set(tocorlist_sorted)
 
         with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.prefix + "_predgood_barcodes.fa"), 'w') as gfile:
             with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile), 'a') as bfile:
@@ -2079,7 +2095,7 @@ class MSAcheck(QtCore.QThread):
                     seqdict_keys = deterministic_sort(list(seqdict.keys()))
                     
                     for n, each in enumerate(seqdict_keys):
-                        if each.split(";")[0] in tocorlist_sorted:
+                        if each.split(";")[0] in tocor_set:
                             flag = True
                             errcount = 0
                             for i, j in enumerate(seqdict[each]):
@@ -2103,7 +2119,7 @@ class MSAcheck(QtCore.QThread):
                     seqdict_keys = deterministic_sort(list(seqdict.keys()))
                     
                     for n, each in enumerate(seqdict_keys):
-                        if each.split(";")[0] in tocorlist_sorted:
+                        if each.split(";")[0] in tocor_set:
                             bfile.write(">" + each + '\n' + seqdict[each].replace("-", "").upper() + '\n')
                             badbarcodes[each] = seqdict[each]
                             self.notifyProgress2.emit([n+1, len(tocorlist_sorted)])

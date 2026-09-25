@@ -4,7 +4,7 @@ import time
 from PyQt5 import QtCore, QtGui, QtWidgets
 from .shared import *
 from .shared import _tr, _get_base_dir
-from .batch_sweep import parse_sweep_config, expand_grid, validate_sweep
+from .batch_sweep import load_batch_config, swept_keys
 
 # Combinations above this count get a visible (non-blocking) warning in the
 # panel, since each one is a full analysis. MainWindow additionally asks for
@@ -26,9 +26,28 @@ resolve_mixed.min_secondary_frac = 20, 15, 10
 resolve_mixed.tolerance          = 10, 9, 8, 7, 6, 5
 """
 
+# Same idea, but for the explicit-combination-list shape (see
+# _utilities/batch_sweep.py's is_combo_list_config / parse_combo_list_config).
+# Kept as its own file/fallback rather than folded into the grid template
+# above: the two shapes are mutually exclusive per batch, so a single file
+# mixing both examples invites copying the wrong block by accident.
+_EXAMPLE_COMBOS_CFG_FALLBACK = """# combos
+# One FULL combination per line: key=value, key=value, ... — e.g. a row
+# copied from a previous batch_run_summary.tsv's Parameters column.
+# See _profiles/ontbarcoder_batch_combos.cfg for the full explanation.
+
+consfreqfixed=0.30, resolve_mixed.min_secondary_frac=20, resolve_mixed.tolerance=10
+consfreqfixed=0.40, resolve_mixed.min_secondary_frac=15, resolve_mixed.tolerance=7
+consfreqfixed=0.50, resolve_mixed.min_secondary_frac=10, resolve_mixed.tolerance=5
+"""
+
 
 def _example_cfg_path() -> str:
     return os.path.join(_get_base_dir(), "_profiles", "ontbarcoder_batch.cfg")
+
+
+def _example_combos_cfg_path() -> str:
+    return os.path.join(_get_base_dir(), "_profiles", "ontbarcoder_batch_combos.cfg")
 
 
 class BatchSweepPanel(QtWidgets.QWidget):
@@ -114,10 +133,13 @@ class BatchSweepPanel(QtWidgets.QWidget):
         cl.addWidget(self._lbl_warn)
 
         help_lbl = QtWidgets.QLabel(
-            "<b>Format:</b> one line per parameter, <code>key = v1, v2, v3</code>, "
-            "<code>#</code> for comments. “Create example cfg” below writes "
-            "every available parameter with its default, valid range and an "
-            "example — uncomment and edit the ones you want to sweep."
+            "<b>Grid:</b> one line per parameter, <code>key = v1, v2, v3</code> — every "
+            "combination of every listed value is run. <b>Combo list:</b> first line "
+            "<code># combos</code>, then one full combination per line, "
+            "<code>key=value, key=value, ...</code> — for re-running specific "
+            "combinations rather than every combination of a grid. "
+            "<code>#</code> for comments in both. The two buttons below each write out "
+            "a self-documented starting point for their own shape."
         )
         help_lbl.setWordWrap(True)
         help_lbl.setTextFormat(QtCore.Qt.RichText)
@@ -125,11 +147,16 @@ class BatchSweepPanel(QtWidgets.QWidget):
         cl.addWidget(help_lbl)
 
         example_row = QtWidgets.QHBoxLayout()
-        example_btn = QtWidgets.QPushButton("Create example cfg")
+        example_btn = QtWidgets.QPushButton("Create example cfg (grid)")
         example_btn.setObjectName("secondary_btn")
         example_btn.setFixedHeight(self._BTN_H)
         example_btn.clicked.connect(self._save_example)
         example_row.addWidget(example_btn)
+        example_combos_btn = QtWidgets.QPushButton("Create example cfg (combo list)")
+        example_combos_btn.setObjectName("secondary_btn")
+        example_combos_btn.setFixedHeight(self._BTN_H)
+        example_combos_btn.clicked.connect(self._save_example_combos)
+        example_row.addWidget(example_combos_btn)
         example_row.addStretch()
         cl.addLayout(example_row)
 
@@ -226,18 +253,23 @@ class BatchSweepPanel(QtWidgets.QWidget):
         if not path:
             return
         try:
-            sweep = parse_sweep_config(path)
-            validate_sweep(sweep)
-            combos = expand_grid(sweep)
+            combos, mode, sweep = load_batch_config(path)
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Invalid batch config", str(e))
             return
         self._cfg_path = path
         self._lbl_path.setText(os.path.basename(path))
-        lines = ", ".join(f"{k} ({len(v)} values)" for k, v in sweep.items())
-        self._lbl_summary.setText(
-            f"<b>{len(combos)} combination(s)</b> from {len(sweep)} parameter(s): {lines}"
-        )
+        if mode == "grid":
+            lines = ", ".join(f"{k} ({len(v)} values)" for k, v in sweep.items())
+            self._lbl_summary.setText(
+                f"<b>{len(combos)} combination(s)</b> from {len(sweep)} parameter(s): {lines}"
+            )
+        else:
+            keys = ", ".join(sorted(swept_keys(combos)))
+            self._lbl_summary.setText(
+                f"<b>{len(combos)} combination(s)</b> loaded as an explicit list "
+                f"(varies: {keys})"
+            )
         if len(combos) > WARN_COMBO_THRESHOLD:
             self._lbl_warn.setText(
                 f"⚠ {len(combos)} combinations — each one is a full analysis run "
@@ -248,22 +280,32 @@ class BatchSweepPanel(QtWidgets.QWidget):
             self._lbl_warn.hide()
         self._start_btn.setEnabled(True)
 
-    def _save_example(self):
+    def _save_template(self, dialog_title: str, default_name: str,
+                       template_path: str, fallback: str):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Create example batch cfg", "ontbarcoder_batch.cfg",
+            self, dialog_title, default_name,
             filter="Config files (*.cfg);;All files (*)")
         if not path:
             return
         try:
-            with open(_example_cfg_path(), "r", encoding="utf-8") as fh:
+            with open(template_path, "r", encoding="utf-8") as fh:
                 content = fh.read()
         except OSError:
-            content = _EXAMPLE_CFG_FALLBACK
+            content = fallback
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
         except OSError as e:
             QtWidgets.QMessageBox.warning(self, "Could not save file", str(e))
+
+    def _save_example(self):
+        self._save_template("Create example batch cfg (grid)", "ontbarcoder_batch.cfg",
+                             _example_cfg_path(), _EXAMPLE_CFG_FALLBACK)
+
+    def _save_example_combos(self):
+        self._save_template("Create example batch cfg (combo list)",
+                             "ontbarcoder_batch_combos.cfg",
+                             _example_combos_cfg_path(), _EXAMPLE_COMBOS_CFG_FALLBACK)
 
     def _emit_sweep(self):
         if self._cfg_path:

@@ -1699,12 +1699,44 @@ parameters only needs 3 lines, not a copy of every setting:</p>
 <pre>consfreqfixed                    = 0.30, 0.35, 0.40, 0.45, 0.50
 resolve_mixed.min_secondary_frac = 20, 15, 10
 resolve_mixed.tolerance          = 10, 9, 8, 7, 6, 5</pre>
-<p>Click <b>Create example cfg</b> in the panel to write out
+<p>Click <b>Create example cfg (grid)</b> in the panel to write out
 <code>_profiles/ontbarcoder_batch.cfg</code> — a fully commented template listing
 <i>every</i> sweepable parameter with its default, valid range and an example value
 list, ready to uncomment and edit. Percent fields (<i>Min. secondary variant
 fraction</i>, <i>Variant tolerance</i>) are written on the same 0–100 scale as their
 GUI spinboxes, not as a 0–1 fraction.</p>
+
+<h4>17.1b Explicit combination list (instead of a grid)</h4>
+<p>A grid file is a Cartesian product: every value of every key gets crossed with
+every value of every other key. That's the wrong shape once specific combinations
+have already been picked out of a previous sweep — e.g. the run numbers a
+coverage analysis (<code>_utilities/batch_coverage_report.py</code>, §17.6)
+found sufficient to reproduce a given result. Re-listing each of those parameters'
+distinct values in a grid file would regenerate the full product again, not just the
+combinations wanted.</p>
+<p>For this case, a <code>.cfg</code> can instead list combinations <i>explicitly</i>:
+one full combination per line, as <code>key=value, key=value, ...</code> — the same
+shape already used for the <code>Parameters</code> column of
+<code>batch_run_summary.tsv</code> (§17.4) and by <code>combo_label()</code>
+internally, so a row from a previous run's summary can be pasted in directly. The
+file's first non-blank line must be exactly <code># combos</code> (case-insensitive)
+— this is what tells it apart from a grid file:</p>
+<pre># combos
+consfreqfixed=0.50, resolve_mixed.min_secondary_frac=20, resolve_mixed.tolerance=6
+consfreqfixed=0.35, resolve_mixed.min_secondary_frac=10, resolve_mixed.tolerance=6
+consfreqfixed=0.30, resolve_mixed.min_secondary_frac=15, resolve_mixed.tolerance=5</pre>
+<p>Each key/value is validated exactly as in a grid file (unknown keys and
+out-of-range values are rejected before anything runs), and everything downstream —
+run numbering, <code>batch_run_summary.tsv</code>, the deduplicated FASTA — works
+the same regardless of which shape produced the combinations. <code>sweep_config.log</code>
+records the combination list directly instead of a per-key value list in this case.</p>
+<p>Click <b>Create example cfg (combo list)</b> in the panel to write out
+<code>_profiles/ontbarcoder_batch_combos.cfg</code> — kept as a separate file from the
+grid template above rather than a second section inside it, since the two shapes are
+mutually exclusive per batch and mixing both examples in one file invites copying the
+wrong block by accident. Its example combinations are illustrative only, ready to
+replace with whichever ones you actually want to re-run — e.g. the run numbers a
+coverage analysis (§17.6) singled out from a previous grid sweep.</p>
 
 <h4>17.2 Validation</h4>
 <p>The file is checked as soon as it is loaded — before anything runs:</p>
@@ -1735,8 +1767,41 @@ GUI spinboxes, not as a 0–1 fraction.</p>
       self-documenting log recording the exact parameters used — indistinguishable from
       a manual run except for how it was launched.</li>
   <li>Two progress bars track it: combinations completed (<code>i/N</code>) and the
-      combination currently running (its own phase-by-phase progress, 0–100&nbsp;%).</li>
+      combination currently running (its own phase-by-phase progress, 0–100&nbsp;%). The
+      latter reflects steady progress within whichever phase is active — including phase
+      2a's own coverage levels — independently of the overall <code>i/N</code> bar, so a
+      run with several coverage levels no longer advances unevenly (fast through small
+      levels, slow through the first, most expensive one) or looks stuck at 100&nbsp;% a
+      level early.</li>
 </ol>
+
+<h4>17.3b Phase 1 reuse across combinations</h4>
+<p>Only 7 parameters affect what Phase 1 (demultiplexing) actually does:
+<code>minlen</code>, <code>explen</code>, <code>demlen</code>, <code>minq</code>,
+<code>tagmm</code>, <code>primersearchlen</code>, <code>primermismatch</code>. Every other
+sweepable parameter (consensus calling frequency, intra-sample variant detection, …) only
+affects phase 2a/2b/3. Since a sweep typically varies only consensus-calling parameters —
+exactly the case in the worked example above — most combinations would otherwise
+re-demultiplex the same reads from scratch for no reason.</p>
+<p>When a combination agrees with the <i>previous</i> one on all 7 of those parameters,
+Parameter Batch skips demultiplexing entirely and reuses its output instead: the prior
+combination's <code>demultiplexed/</code> folder is hard-linked in (falling back to a copy
+when hard-linking isn't possible), or unpacked from
+<code>intermediate_files/demultiplexed.zip</code> if the prior run had already archived it.
+Any failure in this reuse path logs a warning and falls back to a normal Phase 1 run for
+that combination rather than stalling the batch. A sweep that never lists any of the 7
+demultiplex parameters reuses Phase 1 for every combination after the first, since they
+then never change from the value fixed in the Parameters panel — the common case, and
+exactly what the worked example above does. A sweep that mixes demultiplex parameters
+with consensus-calling ones benefits from listing the demultiplex parameters
+<i>first</i> in the grid <code>.cfg</code>: <code>expand_grid()</code> varies the
+<i>last</i>-listed key fastest (standard Cartesian-product order), so putting
+consensus-calling parameters last keeps the demultiplex parameters unchanged across the
+longest possible run of consecutive combinations.</p>
+<p>Each combination's log line shows its own wall-clock start time and the batch's running
+elapsed time, and its "done" line reports how long that specific combination took —
+useful for spotting which combinations were demultiplexed fresh (slower) versus reused
+(faster) at a glance.</p>
 
 <h4>17.4 Output — per-run summary and deduplicated FASTA</h4>
 <p>Once every combination finishes (or the batch is stopped), three files are written to

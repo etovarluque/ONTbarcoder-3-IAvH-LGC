@@ -111,7 +111,8 @@ shutil.copy(os.path.join(SPECPATH, 'icon.ico'), os.path.join(_dist_root, 'icon.i
 # API key (_profiles/blast_config.json), which must not end up in a build.
 _profiles_dst = os.path.join(_dist_root, '_profiles')
 os.makedirs(_profiles_dst, exist_ok=True)
-for _fname in ('ontbarcoder_batch.cfg', 'blast_config.example.json'):
+for _fname in ('ontbarcoder_batch.cfg', 'ontbarcoder_batch_combos.cfg',
+               'blast_config.example.json'):
     _fsrc = os.path.join(SPECPATH, '_profiles', _fname)
     if os.path.exists(_fsrc):
         shutil.copy(_fsrc, os.path.join(_profiles_dst, _fname))
