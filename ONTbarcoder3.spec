@@ -39,6 +39,11 @@ except Exception:
 # safe even if Pillow is installed in the build environment.
 excluded = ['PIL', 'PIL.Image', 'Pillow']
 
+# pandas is likewise never imported by this project; openpyxl.utils.dataframe
+# (reached by the same collect_submodules call) pulls it in, plus tzdata and
+# dateutil, whenever pandas is installed in the build environment (~700 files).
+excluded += ['pandas']
+
 a = Analysis(
     ['ONTbarcoder3.py'],
     pathex=['.'],
