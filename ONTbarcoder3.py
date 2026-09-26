@@ -7365,9 +7365,7 @@ class MainWindow(QtWidgets.QMainWindow):
              params["consfreqmax"]],
             params["consfreqstep"],
             params["gencode"],
-            # "Minimum read coverage" also bounds the haplotype-cluster size.
-            dict(params.get("resolve_mixed", {}) or {},
-                 min_reads=params.get("mincoverage", 1)),
+            params.get("resolve_mixed", {}),
             self._gencode_by_sample(),
             params.get("qclentol", 0),
         ]
@@ -7985,9 +7983,7 @@ class MainWindow(QtWidgets.QMainWindow):
             [params["consfreqmin"], params["consfreqmax"]],
             params["consfreqstep"],
             params["gencode"],
-            # "Minimum read coverage" also bounds the haplotype-cluster size.
-            dict(params.get("resolve_mixed", {}) or {},
-                 min_reads=params.get("mincoverage", 1)),
+            params.get("resolve_mixed", {}),
             self._gencode_by_sample(),
             params.get("qclentol", 0),
         ]

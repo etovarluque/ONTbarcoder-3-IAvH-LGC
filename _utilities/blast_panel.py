@@ -2356,7 +2356,7 @@ class _BlastWorker(QtCore.QThread):
                 "blast",
                 f"{prefix}Waiting for RID {rid}{state}… "
                 f"({elapsed // 60}m {elapsed % 60:02d}s of "
-                f"{self._POLL_BUDGET // 60}m max · poll {polls})"
+                f"{self._POLL_BUDGET // 60}m max · try {polls})"
             )
 
         while not self._stop and time.monotonic() < deadline:

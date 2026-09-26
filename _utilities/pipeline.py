@@ -793,8 +793,9 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
                     Absorbs sequencing error / intrinsic variation so as not to
                     fragment a single haplotype into many spurious clusters.
       min_reads:    minimum reads for a cluster to be a real haplotype (never
-                    below 3). Callers pass the user's "Minimum read coverage",
-                    so no barcode or variant rests on fewer reads than that.
+                    below 3). Deliberately NOT tied to "Minimum read coverage":
+                    in low-coverage mixed samples the clean haplotype often has
+                    only 3-4 reads, and requiring more merges both templates.
 
     Returns dict:
       mixed:               bool   (>=2 real clusters)
@@ -900,9 +901,7 @@ def _dominant_haplotype(aligned_seqs, minor_thresh=0.2, min_secondary_frac=0.2,
 
     # Real clusters = fraction >= min_secondary_frac AND absolute size >=
     # max(3, min_reads) reads (at low coverage, 2 reads sharing a correlated
-    # error are not sufficient evidence of a real haplotype, and the user's
-    # "Minimum read coverage" must hold for every barcode/variant reported);
-    # the rest is noise.
+    # error are not sufficient evidence of a real haplotype); the rest is noise.
     _min_size = max(3, int(min_reads))
     real, noise_reads = [], []
     for m in cluster_members:
@@ -996,7 +995,6 @@ def _runconsensusparts_fn(inlist):
     _resolve_minor = float(resolve_cfg.get("minor_thresh", 0.2))
     _resolve_secfrac = float(resolve_cfg.get("min_secondary_frac", 0.2))
     _resolve_tol = float(resolve_cfg.get("tolerance", 0.10))
-    # User's "Minimum read coverage", injected by the GUI when building the job.
     _resolve_minreads = int(resolve_cfg.get("min_reads", 3))
     # Secondary-variant recovery (Phase 3 at finalization): eligible secondaries
     # have < _resolve_maxn Ns, capped at _resolve_maxvar per sample (the most
