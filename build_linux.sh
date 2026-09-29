@@ -77,7 +77,7 @@ rm -f "$DIST/_mafftfiles/disttbfast.exe"
 # because it can hold a real, locally-configured NCBI API key
 # (_profiles/blast_config.json), which must not end up in a build.
 mkdir -p "$DIST/_profiles"
-for f in ontbarcoder_batch.cfg blast_config.example.json; do
+for f in ontbarcoder_batch.cfg ontbarcoder_batch_combos.cfg blast_config.example.json; do
     [ -f "_profiles/$f" ] && cp "_profiles/$f" "$DIST/_profiles/"
 done
 [ -d _notes ]    && cp -r _notes    "$DIST/"
