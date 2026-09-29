@@ -345,6 +345,12 @@ def _sample_of(header: str) -> str:
     return header.split(";", 1)[0].strip()
 
 
+def variant_host_sample(header: str) -> str:
+    """Host sample of a secondary_variants.fa record ('{sample}_var{i};...'),
+    so every variant of a sample is grouped together across runs."""
+    return _sample_of(header).rsplit("_var", 1)[0]
+
+
 def _compress_ranges(nums: List[int]) -> str:
     """[1,2,3,5,7,8,9] -> '1..3,5,7..9'. Keeps the Runs column readable when a
     sample is present across dozens of run folders. Uses '..' rather than '-'
@@ -367,20 +373,28 @@ def _compress_ranges(nums: List[int]) -> str:
 
 def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
                               out_fasta: str, out_report: str,
-                              fasta_name: str = "consensus_filtered.fa") -> dict:
-    """Merge consensus_filtered.fa from every run folder into one FASTA.
+                              fasta_name: str = "consensus_filtered.fa",
+                              sample_key=_sample_of,
+                              run_number: Dict[str, int] = None) -> dict:
+    """Merge `fasta_name` (consensus_filtered.fa by default) from every run
+    folder into one FASTA.
 
     run_folders: [(folder_path, tag), ...] in run order. Runs are referenced
     in the report by their 1-based run number (matching batch_run_summary.tsv)
     rather than by their (timestamped) folder tag, so the Runs column stays
-    short even with dozens of run folders.
+    short even with dozens of run folders. Pass run_number ({tag: N}) when
+    run_folders is a subset of the batch, so the numbers still match.
+
+    sample_key(header) groups records; e.g. variant_host_sample groups every
+    secondary variant of a sample together.
 
     A sample whose sequence is identical in every folder it appears in is
     written once, with its original header untouched. A sample with distinct
     sequences across folders gets one record per distinct sequence, header
     suffixed with ";run<N>" of the run that first produced it.
     """
-    run_number = {tag: i + 1 for i, (_folder, tag) in enumerate(run_folders)}
+    if run_number is None:
+        run_number = {tag: i + 1 for i, (_folder, tag) in enumerate(run_folders)}
     n_runs = len(run_folders)
 
     # sample -> list of (folder_tag, header, seq), in run order
@@ -390,7 +404,7 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
         if not os.path.isfile(fa_path):
             continue
         for header, seq in _read_fasta(fa_path):
-            sample = _sample_of(header)
+            sample = sample_key(header)
             by_sample.setdefault(sample, []).append((tag, header, seq))
 
     n_samples = len(by_sample)
@@ -435,3 +449,39 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
         "n_with_variants": n_with_variants,
         "n_sequences_written": n_sequences_written,
     }
+
+
+def merge_runs(run_folders: List[Tuple[str, str]], outdir: str,
+               variant_folders: List[Tuple[str, str]] = None) -> dict:
+    """Merge the results of several run folders into `outdir` — shared by the
+    Parameter Batch (at the end of a sweep) and "Merge existing runs" (run
+    folders picked by hand):
+      unique_consensus_filtered.fasta + batch_dedup_report.tsv
+      unique_secondary_variants.fasta + batch_variants_dedup_report.tsv
+        (only from variant_folders: the runs with intra-sample variant
+        detection on; run numbers still refer to the full run_folders list).
+    Returns the consensus dedup stats, plus "variants" when merged.
+    """
+    run_number = {t: i for i, (_f, t) in enumerate(run_folders, start=1)}
+    summary = dedup_consensus_filtered(
+        run_folders,
+        os.path.join(outdir, "unique_consensus_filtered.fasta"),
+        os.path.join(outdir, "batch_dedup_report.tsv"))
+    if variant_folders:
+        summary["variants"] = dedup_consensus_filtered(
+            variant_folders,
+            os.path.join(outdir, "unique_secondary_variants.fasta"),
+            os.path.join(outdir, "batch_variants_dedup_report.tsv"),
+            fasta_name="secondary_variants.fa",
+            sample_key=variant_host_sample,
+            run_number=run_number)
+    return summary
+
+
+def count_fasta_records(path: str) -> int:
+    """Number of '>' records in a FASTA, 0 if the file is missing/unreadable."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return sum(1 for line in fh if line.startswith(">"))
+    except OSError:
+        return 0

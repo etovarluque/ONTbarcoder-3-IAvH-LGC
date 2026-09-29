@@ -50,6 +50,66 @@ _PHRED_ERR = [10.0 ** (-(q - 33) / 10.0) for q in range(256)]
 # ~8x faster than a Python loop with ord() per character.
 _PHRED_ERR_GET = _PHRED_ERR.__getitem__
 
+
+def read_demfile_rows(path):
+    """Rows of the demultiplexing CSV, parsed like the Setup panel does:
+    UTF-8 with or without BOM (falls back to cp1252 for ANSI CSVs saved by
+    Excel), cells stripped, blank rows / rows without sample name skipped.
+    Tags (columns 2-3) are upper-cased to match the reads."""
+    import csv
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            with open(path, newline="", encoding=enc) as fh:
+                raw = list(csv.reader(fh))
+            break
+        except UnicodeDecodeError:
+            continue
+    rows = []
+    for lineno, row in enumerate(raw, 1):
+        cells = [c.strip() for c in row]
+        if not any(cells) or not cells[0]:
+            continue
+        if len(cells) < 3 or not cells[1] or not cells[2]:
+            raise ValueError(
+                f"Demultiplexing file, line {lineno}: sample '{cells[0]}' "
+                f"needs at least 3 columns (sample, tag_f, tag_r).")
+        cells[1] = cells[1].upper()
+        cells[2] = cells[2].upper()
+        rows.append(cells)
+    if not rows:
+        raise ValueError("Demultiplexing file has no sample rows.")
+    return rows
+
+
+class _GuardedThread(QtCore.QThread):
+    """QThread whose run() reports any exception through taskFailed.
+    Without it, an error kills the thread silently: taskFinished is never
+    emitted and the UI waits forever. Subclasses decorate run() with
+    @_guarded_run."""
+    taskFailed = QtCore.pyqtSignal(str)
+
+
+def _guarded_run(run):
+    import functools
+    import traceback
+
+    @functools.wraps(run)
+    def wrapper(self):
+        try:
+            run(self)
+        except Exception as e:
+            tb = traceback.format_exc()
+            try:
+                log_path = os.path.join(os.path.expanduser("~"),
+                                        "ONTbarcoder_crash.log")
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n{'=' * 60}\n{time.ctime()} "
+                             f"[{type(self).__name__}]\n{tb}")
+            except OSError:
+                pass
+            self.taskFailed.emit(f"{type(self).__name__}: {type(e).__name__}: {e}")
+    return wrapper
+
 # ============================================================
 # HELPER FUNCTIONS FOR DETERMINISM
 # ============================================================
@@ -318,7 +378,7 @@ def resource_path(relative_path):
 # CLASS: prepdemultiplex
 # ============================================================
 
-class prepdemultiplex(QtCore.QThread):
+class prepdemultiplex(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress = QtCore.pyqtSignal(int)
     notifyMessage = QtCore.pyqtSignal(str)
@@ -340,25 +400,23 @@ class prepdemultiplex(QtCore.QThread):
         # generates tag mutants up to this depth (0 = exact match only).
         self.tagmm = tagmm
 
+    @_guarded_run
     def run(self):
         def crmutant_m2(tfile, nbp):
             tagdict = {}
             sampledict = {}
-            with open(tfile) as tagfile:
-                t = tagfile.readlines()
-                for each in t:
-                    tagdict[each.split(',')[1]] = ''
-                    tagdict[each.split(',')[2]] = ''
+            t = read_demfile_rows(tfile)
+            for each in t:
+                tagdict[each[1]] = ''
+                tagdict[each[2]] = ''
             counter = 1
             typedict = {}
             for each in tagdict.keys():
                 tagdict[each] = "t" + str(counter)
                 typedict[each] = 0
                 counter += 1
-            with open(tfile) as tagfile:
-                t = tagfile.readlines()
-                for each in t:
-                    sampledict[(tagdict[each.split(',')[1]], tagdict[each.split(',')[2]])] = each.split(',')[0]
+            for each in t:
+                sampledict[(tagdict[each[1]], tagdict[each[2]])] = each[0]
             n = 1
             muttags_fr = {}
             # Frontier BFS: each round expands only the NEWLY added tags from the
@@ -367,7 +425,7 @@ class prepdemultiplex(QtCore.QThread):
             frontier = dict(tagdict)
             while n <= nbp:
                 muttags_fr, newtags_fr = create_all_mutants(frontier, tagdict)
-                with open(os.path.join(self.outdir, "conflicts"), 'w') as conflictfile:
+                with open(os.path.join(self.outdir, "conflicts"), 'w', encoding="utf-8") as conflictfile:
                     for k in list(newtags_fr.keys()):
                         if len(newtags_fr[k]) > 1:
                             conflictfile.write(k + '\t' + ",".join(newtags_fr[k]) + '\n')
@@ -380,7 +438,7 @@ class prepdemultiplex(QtCore.QThread):
                     new_frontier[k] = v
                 frontier = new_frontier
                 n += 1
-            with open(self.outdir + "/temp1.fas", 'w') as outfile:
+            with open(self.outdir + "/temp1.fas", 'w', encoding="utf-8") as outfile:
                 for k in tagdict.keys():
                     outfile.write(k + '\t' + tagdict[k] + '\n')
             return tagdict, muttags_fr, sampledict, typedict
@@ -442,25 +500,24 @@ class prepdemultiplex(QtCore.QThread):
         basename = os.path.basename(self.infastq)
         self.sampleids = {}
         primerlensum = 0
-        with open(self.demfile) as demulfile:
-            demullines = demulfile.readlines()
-            for each in demullines:
-                self.sampleids[each.split(',')[0]] = ''
-            first_cols = [c.strip() for c in demullines[0].rstrip('\n').split(',')]
-            self.taglen = len(first_cols[1])
-            # Primer pairs from column 3: (primer_f, primer_r), (primer_f2, primer_r2)...
-            self.primerfset = []
-            self.primerrset = []
-            i = 3
-            while i + 1 < len(first_cols):
-                if first_cols[i]:
-                    self.primerfset.append(first_cols[i])
-                if first_cols[i + 1]:
-                    self.primerrset.append(first_cols[i + 1])
-                i += 2
-            avg_flen = sum(len(p) for p in self.primerfset) / len(self.primerfset) if self.primerfset else 0
-            avg_rlen = sum(len(p) for p in self.primerrset) / len(self.primerrset) if self.primerrset else 0
-            primerlensum += int(round(avg_flen + avg_rlen))
+        demulrows = read_demfile_rows(self.demfile)
+        for each in demulrows:
+            self.sampleids[each[0]] = ''
+        first_cols = demulrows[0]
+        self.taglen = len(first_cols[1])
+        # Primer pairs from column 3: (primer_f, primer_r), (primer_f2, primer_r2)...
+        self.primerfset = []
+        self.primerrset = []
+        i = 3
+        while i + 1 < len(first_cols):
+            if first_cols[i]:
+                self.primerfset.append(first_cols[i])
+            if first_cols[i + 1]:
+                self.primerrset.append(first_cols[i + 1])
+            i += 2
+        avg_flen = sum(len(p) for p in self.primerfset) / len(self.primerfset) if self.primerfset else 0
+        avg_rlen = sum(len(p) for p in self.primerrset) / len(self.primerrset) if self.primerrset else 0
+        primerlensum += int(round(avg_flen + avg_rlen))
 
         self.nseqspasslen = 0
         self.totalseqs = 0
@@ -509,7 +566,7 @@ class prepdemultiplex(QtCore.QThread):
         def _get_chunk(prefix, idx):
             key = (prefix, idx)
             if key not in _open_chunks:
-                _open_chunks[key] = open(_chunk_path(prefix, idx), 'w', buffering=65536)
+                _open_chunks[key] = open(_chunk_path(prefix, idx), 'w', buffering=65536, encoding="utf-8")
             return _open_chunks[key]
 
         def _flush_chunk(prefix, lines_buf, idx_ref, lines_ref):
@@ -536,7 +593,7 @@ class prepdemultiplex(QtCore.QThread):
 
         # Read the FASTQ with a large I/O buffer (8 MB) to minimize
         # system calls on multi-GB files.
-        with open(self.infastq, buffering=8 * 1024 * 1024) as infile:
+        with open(self.infastq, buffering=8 * 1024 * 1024, encoding="utf-8", errors="replace") as infile:
             for line1, line2, line3, line4 in zip_longest(*[infile] * 4):
                 if not line1 or not line1.strip():
                     continue
@@ -645,7 +702,7 @@ class prepdemultiplex(QtCore.QThread):
 # CLASS: mergedemfiles
 # ============================================================
 
-class mergedemfiles(QtCore.QThread):
+class mergedemfiles(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress = QtCore.pyqtSignal(int)
 
@@ -656,6 +713,7 @@ class mergedemfiles(QtCore.QThread):
         self.outdir = outdir
         self.n_chunks = n_chunks
 
+    @_guarded_run
     def run(self):
         def mergefiles(inlist, outfilename):
             nseqs = 0
@@ -691,7 +749,7 @@ class mergedemfiles(QtCore.QThread):
 # CLASS: calculatecoverage
 # ============================================================
 
-class calculatecoverage(QtCore.QThread):
+class calculatecoverage(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress = QtCore.pyqtSignal(int)
 
@@ -699,13 +757,14 @@ class calculatecoverage(QtCore.QThread):
         super(calculatecoverage, self).__init__(parent)
         self.indir = indir
 
+    @_guarded_run
     def run(self):
         dirlist = deterministic_sort(os.listdir(self.indir))
         self.dirdict = {}
         self.counter = {}
         
         for c, fname in enumerate(dirlist):
-            with open(os.path.join(self.indir, fname)) as infile:
+            with open(os.path.join(self.indir, fname), encoding="utf-8", errors="replace") as infile:
                 if fname.endswith("_all.fa"):
                     self.dirdict[fname] = fname
                 else:
@@ -1128,7 +1187,7 @@ def _runconsensusparts_fn(inlist):
         seqdict = {}
         header = None
         parts = []
-        with open(path) as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.rstrip()
                 if line.startswith('>'):
@@ -1336,7 +1395,7 @@ def _runconsensusparts_fn(inlist):
         entries = []
         len_hist = {}
         current_header = None
-        with open(infile) as fulldata:
+        with open(infile, encoding="utf-8", errors="replace") as fulldata:
             for line in fulldata:
                 line = line.rstrip()
                 if line.startswith('>'):
@@ -1353,7 +1412,7 @@ def _runconsensusparts_fn(inlist):
                     current_header = None
         entries.sort(key=lambda x: (x[0], x[1], x[2]))
         ntosubset = min(len(entries), n)
-        with open(outfile, 'w') as subsetdata:
+        with open(outfile, 'w', encoding="utf-8") as subsetdata:
             for k in range(ntosubset):
                 subsetdata.write(entries[k][1] + '\n' + entries[k][3] + '\n')
         lenwarn = None
@@ -1377,7 +1436,7 @@ def _runconsensusparts_fn(inlist):
     parstring = ''
 
     try:
-        with open(parfilepath) as parfile:
+        with open(parfilepath, encoding="utf-8", errors="replace") as parfile:
             l = parfile.readlines()
             parstring = l[0].strip() if l else ''
     except (FileNotFoundError, OSError):
@@ -1547,7 +1606,7 @@ def _runtoptwenty_worker(args):
     
     outfile_path = os.path.join(outpath, seq_info[0].split(";")[0])
     
-    with open(outfile_path, 'w') as outfile:
+    with open(outfile_path, 'w', encoding="utf-8") as outfile:
         outfile.write(">" + seq_info[0] + '\n' + each + '\n')
         for other in sorted_d[:20]:
             outfile.write(">" + refseqdict[other[0]][0] +
@@ -1629,14 +1688,14 @@ def rundemultiplex(inlist):
         out_dir = os.path.join(outpath, str(num_row))
         # Write samples in alphabetical order for stronger determinism
         for sample in sorted(buffer.keys()):
-            with open(os.path.join(out_dir, sample + "_all.fa"), 'a') as fh:
+            with open(os.path.join(out_dir, sample + "_all.fa"), 'a', encoding="utf-8") as fh:
                 fh.writelines(buffer[sample])
 
     # --- 3. Internal helper functions (unchanged) ---
     def readprimertagfasta(filef, filer):
         indict2, indict1, indict = {}, {}, {}
-        with open(filef) as infile1:
-            with open(filer) as infile2:
+        with open(filef, encoding="utf-8", errors="replace") as infile1:
+            with open(filer, encoding="utf-8", errors="replace") as infile2:
                 l1 = infile1.readlines()
                 l2 = infile2.readlines()
                 for i, j in enumerate(l1):
@@ -1651,7 +1710,7 @@ def rundemultiplex(inlist):
 
     def builddict_sequences(infile):
         seqdict = {}
-        with open(infile) as inseqs:
+        with open(infile, encoding="utf-8", errors="replace") as inseqs:
             header = None
             for line in inseqs:
                 line = line.strip()
@@ -1694,9 +1753,9 @@ def rundemultiplex(inlist):
         # --- 5a. Sort the sequence dictionary's keys (deterministic) ---
         sorted_seq_keys = sorted(inputseqs.keys())
 
-        with open(os.path.join(outpath, infile + "_all_glsearch1.parsed.lencutoff5parsed_f"), 'w') as tagfoutfile:
-            with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5parsed_r", 'w') as tagroutfile:
-                with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5endr", 'w') as fprimercleanfile:
+        with open(os.path.join(outpath, infile + "_all_glsearch1.parsed.lencutoff5parsed_f"), 'w', encoding="utf-8") as tagfoutfile:
+            with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5parsed_r", 'w', encoding="utf-8") as tagroutfile:
+                with open(outpath + "/" + infile + "_all_glsearchR.parsed.lencutoff5endr", 'w', encoding="utf-8") as fprimercleanfile:
                     # Pre-compute reverse complements of all reverse primers (once)
                     primerrset_rc = [revcomp(pr) for pr in primerrset]
 
@@ -1815,7 +1874,7 @@ def rundemultiplex(inlist):
 # CLASS: runconsensusparts (QThread)
 # ============================================================
 
-class runconsensusparts(QtCore.QThread):
+class runconsensusparts(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress = QtCore.pyqtSignal(int)
 
@@ -1845,6 +1904,7 @@ class runconsensusparts(QtCore.QThread):
         except OSError:
             self.sampleids[key] = 0
 
+    @_guarded_run
     def run(self):
         inlist = self.inlist
         inlist1 = inlist[0]
@@ -1922,7 +1982,7 @@ class runconsensusparts(QtCore.QThread):
 # CLASE: runtoptwenty (QThread)
 # ============================================================
 
-class runtoptwenty(QtCore.QThread):
+class runtoptwenty(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress = QtCore.pyqtSignal(int)
 
@@ -1930,6 +1990,7 @@ class runtoptwenty(QtCore.QThread):
         super(runtoptwenty, self).__init__(parent)
         self.inlist = inlist
 
+    @_guarded_run
     def run(self):
         inlist = self.inlist
         seqlist = inlist[0]
@@ -1979,7 +2040,7 @@ class runtoptwenty(QtCore.QThread):
 # CLASE: MSAcheck
 # ============================================================
 
-class MSAcheck(QtCore.QThread):
+class MSAcheck(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
     notifyProgress1 = QtCore.pyqtSignal(list)
     notifyProgress2 = QtCore.pyqtSignal(list)
@@ -2006,7 +2067,7 @@ class MSAcheck(QtCore.QThread):
 
     def builddict_sequences(self, infile):
         seqdict = {}
-        with open(infile) as inseqs:
+        with open(infile, encoding="utf-8", errors="replace") as inseqs:
             header = None
             for line in inseqs:
                 line = line.strip()
@@ -2040,7 +2101,7 @@ class MSAcheck(QtCore.QThread):
         seqdict = {}
         header = None
         parts = []
-        with open(i) as fh:
+        with open(i, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.rstrip()
                 if line.startswith('>'):
@@ -2054,6 +2115,7 @@ class MSAcheck(QtCore.QThread):
             seqdict[header] = ''.join(parts)
         return self.consensus(seqdict, perc_thresh), seqdict
 
+    @_guarded_run
     def run(self):
         filename = self.filename
         ambiguity_codes = AMBIGUITY_CODES
@@ -2074,7 +2136,7 @@ class MSAcheck(QtCore.QThread):
 
         badbarcodes = {}
 
-        with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile)) as bfile:
+        with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile), encoding="utf-8", errors="replace") as bfile:
             l = bfile.readlines()
             for i, j in enumerate(l):
                 if ">" in j and i + 1 < len(l):
@@ -2086,8 +2148,8 @@ class MSAcheck(QtCore.QThread):
         tocorlist_sorted = deterministic_sort(self.tocorlist) if self.tocorlist else []
         tocor_set = set(tocorlist_sorted)
 
-        with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.prefix + "_predgood_barcodes.fa"), 'w') as gfile:
-            with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile), 'a') as bfile:
+        with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.prefix + "_predgood_barcodes.fa"), 'w', encoding="utf-8") as gfile:
+            with open(os.path.join(self.outpath, "barcodesets", self.outdir, self.errfile), 'a', encoding="utf-8") as bfile:
                 if self.ngood >= 3:
                     # Sort the seqdict dictionary's keys
                     seqdict_keys = deterministic_sort(list(seqdict.keys()))
@@ -2139,11 +2201,11 @@ class MSAcheck(QtCore.QThread):
             for each in badbarcodes.keys():
                 refdict[each.split(';')[0]] = badbarcodes[each].upper().replace("-", "")
 
-            with open(os.path.join(self.outpath, "2b_ConsensusBySimilarity", "summary"), 'w') as outfile2:
+            with open(os.path.join(self.outpath, "2b_ConsensusBySimilarity", "summary"), 'w', encoding="utf-8") as outfile2:
                 refdict_keys = deterministic_sort(list(refdict.keys()))
                 
                 for i, f in enumerate(refdict_keys):
-                    with open(os.path.join(self.outpath, "2b_ConsensusBySimilarity", self.dirname, f), 'w') as outfile:
+                    with open(os.path.join(self.outpath, "2b_ConsensusBySimilarity", self.dirname, f), 'w', encoding="utf-8") as outfile:
                         ddict = {}
                         if self.mode == 0:
                             seqdict = self.builddict_sequences(os.path.join(self.outpath, "demultiplexed", f))
@@ -2180,7 +2242,7 @@ class MSAcheck(QtCore.QThread):
 # CLASE: copyfiles
 # ============================================================
 
-class copyfiles(QtCore.QThread):
+class copyfiles(_GuardedThread):
     taskFinished = QtCore.pyqtSignal(int)
 
     def __init__(self, indir, outdir, inlist, indir2, dirdict, inputmode, parent=None):
@@ -2192,6 +2254,7 @@ class copyfiles(QtCore.QThread):
         self.indir2 = indir2
         self.inputmode = inputmode
 
+    @_guarded_run
     def run(self):
         indir2 = self.indir2
         for i, inlist in enumerate(self.inlists):

@@ -4,6 +4,8 @@ import datetime
 import math
 import random
 from typing import Dict, List, Optional, Tuple
+from array import array
+from collections import Counter
 from PyQt5 import QtCore, QtGui, QtWidgets
 from .shared import *
 from .shared import _get_base_dir, _tr, _fmt_num
@@ -326,29 +328,161 @@ def _fq_sync_record(fh_bin) -> bool:
     return False
 
 
+# Phred+33 byte -> error probability. A read's mean Q is -10*log10 of the mean
+# error probability (ONT / NanoPlot convention), exactly as the analysis
+# quality filter computes it (pipeline._PHRED_ERR), so the numbers shown here
+# predict what that filter keeps. The arithmetic mean of the Phred values
+# overestimates quality because a few bad bases barely move it.
+_PHRED_ERR = [10.0 ** (-(q - 33) / 10.0) for q in range(256)]
+_PHRED_ERR_GET = _PHRED_ERR.__getitem__
+
+FASTQ_EXTS = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+
+
+def is_fastq_path(path: str) -> bool:
+    return path.lower().endswith(FASTQ_EXTS)
+
+
+def collect_fastq_paths(paths) -> List[str]:
+    """Expand dropped/selected paths into FASTQ files: folders are walked
+    recursively (e.g. fastq_pass/ with barcode sub-folders)."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _dirs, files in os.walk(p):
+                out.extend(os.path.join(root, f) for f in files if is_fastq_path(f))
+        elif os.path.isfile(p) and is_fastq_path(p):
+            out.append(p)
+    seen = set()
+    uniq = []
+    for p in sorted(out, key=lambda x: x.lower()):
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq
+
+
+def _natural_key(text: str):
+    """barcode2 < barcode10."""
+    import re
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def group_fastq_paths(paths) -> Tuple[List[str], Dict[str, str], str]:
+    """Expand the input like collect_fastq_paths() and assign every file to a
+    group for the per-group breakdown. Returns (files, {file: group}, kind):
+      • one folder dropped  → its first-level sub-folders (barcode01/, …);
+        files directly inside it form a '(folder root)' group;
+      • several items       → one group per dropped folder / per dropped file;
+      • a single file       → a single group (no breakdown shown).
+    kind is "sub-folder", "folder / file" or "" and titles the table."""
+    group_of: Dict[str, str] = {}
+    if len(paths) == 1 and os.path.isdir(paths[0]):
+        root = paths[0]
+        files = collect_fastq_paths([root])
+        for f in files:
+            parts = os.path.relpath(f, root).split(os.sep)
+            group_of[f] = parts[0] if len(parts) > 1 else "(folder root)"
+        return files, group_of, "sub-folder"
+    files: List[str] = []
+    for p in paths:
+        sub = collect_fastq_paths([p])
+        if os.path.isdir(p):
+            name = os.path.basename(os.path.normpath(p)) + "/"
+        else:
+            name = os.path.basename(p)
+        for f in sub:
+            if f not in group_of:
+                group_of[f] = name
+                files.append(f)
+    files.sort(key=lambda x: x.lower())
+    return files, group_of, ("folder / file" if len(paths) > 1 else "")
+
+
+def _read_q(qual: bytes) -> float:
+    """Per-read mean Q from the mean error probability."""
+    mean_err = sum(map(_PHRED_ERR_GET, qual)) / len(qual)
+    return -10.0 * math.log10(mean_err) if mean_err > 0 else 60.0
+
+
+class _FqAcc:
+    """Per-read values in compact arrays (4 bytes each instead of ~30 for a
+    Python number in a list) plus running counters. Arrays also pickle as raw
+    bytes, which keeps the parallel path cheap."""
+
+    def __init__(self):
+        self.lengths = array("I")
+        self.q_scores = array("f")
+        self.gc_pcts = array("f")
+        self.total_bases = 0
+        self.q_sum = self.gc_sum = 0.0
+        self.len_lt500 = self.len_500_1k = self.len_gt1k = 0
+        self.q_cnt_10 = self.q_cnt_15 = self.q_cnt_20 = 0
+        # Bases carried by reads at or above each Q: the usable yield after a
+        # quality filter (long bad reads weigh more than their read count says)
+        self.bases_q10 = self.bases_q15 = self.bases_q20 = 0
+
+    def add(self, seq: bytes, qual: bytes):
+        L = len(seq)
+        gc = (seq.count(b"G") + seq.count(b"C") +
+              seq.count(b"g") + seq.count(b"c")) / L * 100.0
+        q = _read_q(qual) if qual else 0.0
+        self.lengths.append(L)
+        self.q_scores.append(q)
+        self.gc_pcts.append(gc)
+        self.total_bases += L
+        self.q_sum += q
+        self.gc_sum += gc
+        if L < 500:
+            self.len_lt500 += 1
+        elif L <= 1000:
+            self.len_500_1k += 1
+        else:
+            self.len_gt1k += 1
+        if q >= 10:
+            self.q_cnt_10 += 1
+            self.bases_q10 += L
+        if q >= 15:
+            self.q_cnt_15 += 1
+            self.bases_q15 += L
+        if q >= 20:
+            self.q_cnt_20 += 1
+            self.bases_q20 += L
+
+    _COUNTERS = ("total_bases", "q_sum", "gc_sum", "len_lt500", "len_500_1k",
+                 "len_gt1k", "q_cnt_10", "q_cnt_15", "q_cnt_20",
+                 "bases_q10", "bases_q15", "bases_q20")
+
+    def snapshot(self) -> tuple:
+        """Counters used for the per-group breakdown (diffed around each file)."""
+        return (len(self.lengths), self.total_bases, self.q_sum,
+                self.q_cnt_10, self.bases_q10)
+
+    def to_dict(self) -> dict:
+        d = {k: getattr(self, k) for k in self._COUNTERS}
+        d.update(lengths=self.lengths, q_scores=self.q_scores, gc_pcts=self.gc_pcts)
+        return d
+
+    def merge(self, d: dict):
+        self.lengths.extend(d["lengths"])
+        self.q_scores.extend(d["q_scores"])
+        self.gc_pcts.extend(d["gc_pcts"])
+        for k in self._COUNTERS:
+            setattr(self, k, getattr(self, k) + d[k])
+
+
 def _fq_chunk_task(path: str, start: int, end: int) -> dict:
     """Process reads in byte range [start, end) of an UNCOMPRESSED FASTQ file.
-    Returns a partial-stats dict that _FastqInspectorWorker aggregates afterward.
+    Returns a partial _FqAcc as a dict that the worker merges afterwards.
     Defined at module level so ProcessPoolExecutor can pickle it on Windows."""
-    lengths:  List[int]   = []
-    q_scores: List[float] = []
-    gc_pcts:  List[float] = []
-    total_bases = 0
-    q_sum = gc_sum = 0.0
-    len_lt500 = len_500_2k = len_gt2k = 0
-    q_cnt_10 = q_cnt_15 = q_cnt_20 = 0
-
-    _EMPTY = {"n_reads": 0, "lengths": [], "q_scores": [], "gc_pcts": [],
-              "total_bases": 0, "q_sum": 0.0, "gc_sum": 0.0,
-              "len_lt500": 0, "len_500_2k": 0, "len_gt2k": 0,
-              "q_cnt_10": 0, "q_cnt_15": 0, "q_cnt_20": 0}
-
+    acc = _FqAcc()
     try:
         with open(path, "rb", buffering=1 << 20) as fh_bin:
             if start > 0:
                 fh_bin.seek(start)
                 if not _fq_sync_record(fh_bin):
-                    return _EMPTY
+                    return acc.to_dict()
 
             # Partition records by their START offset: this worker owns every
             # record beginning in [start, end). Using readline() + an explicit
@@ -363,51 +497,16 @@ def _fq_chunk_task(path: str, start: int, end: int) -> dict:
                 raw_header = fh_bin.readline()
                 if not raw_header:
                     break
-                if not raw_header.startswith(b'@'):
+                if not raw_header.startswith(b"@"):
                     continue                          # skip malformed / mid-record
-                raw_seq  = fh_bin.readline()
-                fh_bin.readline()                    # '+'
-                raw_qual = fh_bin.readline()
-
-                seq  = raw_seq.rstrip(b'\r\n')
-                qual = raw_qual.rstrip(b'\r\n')
-                L    = len(seq)
-                ql   = len(qual) or 1
-                if L == 0:
-                    continue
-
-                # Fast GC — str.count() is C-speed; avoids per-char Python loop
-                gc_cnt = (seq.count(b'G') + seq.count(b'C') +
-                          seq.count(b'g') + seq.count(b'c'))
-                gc     = gc_cnt / L * 100.0
-
-                # Fast Q-mean — bytes iterate as ints; no ord() call needed
-                q_mean = (sum(qual) - 33 * ql) / ql
-
-                lengths.append(L)
-                q_scores.append(q_mean)
-                gc_pcts.append(gc)
-
-                total_bases += L
-                q_sum       += q_mean
-                gc_sum      += gc
-
-                if L < 500:      len_lt500  += 1
-                elif L <= 2000:  len_500_2k += 1
-                else:            len_gt2k   += 1
-
-                if q_mean >= 10: q_cnt_10 += 1
-                if q_mean >= 15: q_cnt_15 += 1
-                if q_mean >= 20: q_cnt_20 += 1
-
+                seq = fh_bin.readline().rstrip(b"\r\n")
+                fh_bin.readline()                     # '+'
+                qual = fh_bin.readline().rstrip(b"\r\n")
+                if seq:
+                    acc.add(seq, qual)
     except Exception:
         pass   # partial result still aggregated
-
-    return {"n_reads": len(lengths), "lengths": lengths, "q_scores": q_scores,
-            "gc_pcts": gc_pcts, "total_bases": total_bases,
-            "q_sum": q_sum, "gc_sum": gc_sum,
-            "len_lt500": len_lt500, "len_500_2k": len_500_2k, "len_gt2k": len_gt2k,
-            "q_cnt_10": q_cnt_10, "q_cnt_15": q_cnt_15, "q_cnt_20": q_cnt_20}
+    return acc.to_dict()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -415,61 +514,71 @@ def _fq_chunk_task(path: str, start: int, end: int) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _FastqInspectorWorker(QtCore.QThread):
-    progress = QtCore.pyqtSignal(int)   # reads processed so far
+    progress = QtCore.pyqtSignal(int, int)   # reads processed, % of input bytes read
     finished = QtCore.pyqtSignal(dict)
     error    = QtCore.pyqtSignal(str)
 
     _SCATTER_MAX = 10_000
 
-    def __init__(self, path: str, parent=None):
+    # ── minimum file size to justify spawning worker processes ──────────────
+    _PARALLEL_THRESHOLD = 50 * 1024 * 1024   # 50 MB uncompressed
+
+    def __init__(self, paths, groups: Optional[Dict[str, str]] = None, parent=None):
         super().__init__(parent)
-        self._path = path
+        self._paths = [paths] if isinstance(paths, str) else list(paths)
+        self._groups = groups or {}   # file -> group name (per-group breakdown)
         self._stop = False
 
     def stop(self):
         self._stop = True
 
-    # ── minimum file size to justify spawning worker processes ──────────────
-    _PARALLEL_THRESHOLD = 50 * 1024 * 1024   # 50 MB uncompressed
-
     def run(self):
         try:
-            path  = self._path
-            is_gz = path.lower().endswith(".gz")
-            size  = os.path.getsize(path)
-            # Gzip streams cannot be split; only parallelize plain FASTQ files
-            # large enough to amortize process-spawn overhead (~200 ms on Windows).
-            if not is_gz and size >= self._PARALLEL_THRESHOLD:
-                self._run_parallel(path, size)
-            else:
-                self._run_sequential(path, is_gz)
+            acc = _FqAcc()
+            sizes = [os.path.getsize(p) for p in self._paths]
+            self._total_bytes = max(sum(sizes), 1)
+            done = 0
+            # group -> [files, reads, bases, q_sum, reads_q10, bases_q10]
+            self._group_stats: Dict[str, list] = {}
+            for path, size in zip(self._paths, sizes):
+                if self._stop:
+                    return
+                before = acc.snapshot()
+                # Gzip streams cannot be split; only parallelize plain FASTQ files
+                # large enough to amortize process-spawn overhead (~200 ms on Windows).
+                if not path.lower().endswith(".gz") and size >= self._PARALLEL_THRESHOLD:
+                    self._run_parallel(path, size, acc, done)
+                else:
+                    self._run_sequential(path, acc, done)
+                done += size
+                g = self._group_stats.setdefault(
+                    self._groups.get(path, os.path.basename(path)), [0, 0, 0, 0.0, 0, 0])
+                g[0] += 1
+                for i, (b, a) in enumerate(zip(before, acc.snapshot()), start=1):
+                    g[i] += a - b
+            if self._stop:
+                return
+            self._compute_and_emit(acc)
         except Exception as exc:
             self.error.emit(str(exc))
 
-    def _run_sequential(self, path: str, is_gz: bool):
-        """Read all records in one thread.  Used for gzip files and small plain FASTQ."""
-        import gzip, io
+    def _emit_progress(self, acc: _FqAcc, bytes_done: int):
+        pct = min(100, int(bytes_done * 100 / self._total_bytes))
+        self.progress.emit(len(acc.lengths), pct)
 
-        lengths:  List[int]   = []
-        q_scores: List[float] = []
-        gc_pcts:  List[float] = []
-        total_bases = 0
-        q_sum = gc_sum = 0.0
-        len_lt500 = len_500_2k = len_gt2k = 0
-        q_cnt_10 = q_cnt_15 = q_cnt_20 = 0
-
-        # Open in binary mode so quality bytes can be summed directly (no ord() call).
-        # For gzip, wrap the raw file in a 4 MB BufferedReader so compressed data
-        # is read in large chunks before decompression — reduces I/O syscall overhead.
-        if is_gz:
-            raw = open(path, "rb", buffering=4 * 1024 * 1024)
-            fh  = gzip.GzipFile(fileobj=raw)
-        else:
-            fh  = open(path, "rb", buffering=4 * 1024 * 1024)
-            raw = fh
-
+    def _run_sequential(self, path: str, acc: _FqAcc, done_before: int):
+        """Read all records of one file in this thread (gzip and small plain FASTQ).
+        Progress is measured on the bytes read from disk — for gzip that is the
+        compressed position, so the percentage is meaningful for .gz too."""
+        import gzip
+        is_gz = path.lower().endswith(".gz")
+        # Binary mode so quality bytes map straight onto the error table.
+        # For gzip, a 4 MB BufferedReader feeds decompression in large chunks.
+        raw = open(path, "rb", buffering=4 * 1024 * 1024)
+        fh = gzip.GzipFile(fileobj=raw) if is_gz else raw
         try:
             it = iter(fh)
+            n_local = 0
             for header in it:
                 if self._stop:
                     return
@@ -478,150 +587,86 @@ class _FastqInspectorWorker(QtCore.QThread):
                 if not header.startswith(b"@"):
                     continue
                 try:
-                    seq  = next(it).rstrip(b"\r\n")
+                    seq = next(it).rstrip(b"\r\n")
                     next(it)                           # '+' line
                     qual = next(it).rstrip(b"\r\n")
                 except StopIteration:
                     break
-
-                L  = len(seq)
-                ql = len(qual) or 1
-                if L == 0:
+                if not seq:
                     continue
-
-                # C-speed GC count — str.count() / bytes.count() implemented in C
-                gc_cnt = (seq.count(b"G") + seq.count(b"C") +
-                          seq.count(b"g") + seq.count(b"c"))
-                gc     = gc_cnt / L * 100.0
-
-                # Fast Q-mean — bytes iterate as integers; no ord() needed
-                q_mean = (sum(qual) - 33 * ql) / ql
-
-                lengths.append(L)
-                q_scores.append(q_mean)
-                gc_pcts.append(gc)
-
-                total_bases += L
-                q_sum       += q_mean
-                gc_sum      += gc
-
-                if L < 500:      len_lt500  += 1
-                elif L <= 2000:  len_500_2k += 1
-                else:            len_gt2k   += 1
-
-                if q_mean >= 10: q_cnt_10 += 1
-                if q_mean >= 15: q_cnt_15 += 1
-                if q_mean >= 20: q_cnt_20 += 1
-
-                if len(lengths) % 5000 == 0:
-                    self.progress.emit(len(lengths))
+                acc.add(seq, qual)
+                n_local += 1
+                if n_local % 5000 == 0:
+                    self._emit_progress(acc, done_before + raw.tell())
         finally:
             fh.close()
             if is_gz:
                 raw.close()
+        self._emit_progress(acc, done_before + os.path.getsize(path))
 
-        if self._stop:
-            return
-
-        self._compute_and_emit(
-            lengths, q_scores, gc_pcts,
-            total_bases, q_sum, gc_sum,
-            len_lt500, len_500_2k, len_gt2k,
-            q_cnt_10, q_cnt_15, q_cnt_20,
-        )
-
-    def _run_parallel(self, path: str, file_size: int):
-        """Split an uncompressed FASTQ file into chunks and process them in parallel
-        using ProcessPoolExecutor.  Each worker runs _fq_chunk_task() in its own
-        Python process, bypassing the GIL for true CPU-level parallelism."""
-        import random
+    def _run_parallel(self, path: str, file_size: int, acc: _FqAcc, done_before: int):
+        """Split an uncompressed FASTQ file into chunks processed in parallel with
+        ProcessPoolExecutor (one Python process per chunk, bypassing the GIL)."""
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         n_workers = min(os.cpu_count() or 1, 8)
-        chunk     = file_size // n_workers
-
-        # Build (start, end) byte ranges — end=0 means "read until EOF"
+        chunk = file_size // n_workers
+        # Byte ranges — end=0 means "read until EOF"
         boundaries = [(i * chunk, (i + 1) * chunk if i < n_workers - 1 else 0)
                       for i in range(n_workers)]
 
-        all_lengths:  List[int]   = []
-        all_q_scores: List[float] = []
-        all_gc_pcts:  List[float] = []
-        total_bases = 0
-        q_sum = gc_sum = 0.0
-        len_lt500 = len_500_2k = len_gt2k = 0
-        q_cnt_10 = q_cnt_15 = q_cnt_20 = 0
-
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_fq_chunk_task, path, s, e): i
-                       for i, (s, e) in enumerate(boundaries)}
-            for future in as_completed(futures):
+            futures = [pool.submit(_fq_chunk_task, path, s, e) for s, e in boundaries]
+            for k, future in enumerate(as_completed(futures), start=1):
                 if self._stop:
                     pool.shutdown(wait=False, cancel_futures=True)
                     return
-                p = future.result()
-                all_lengths.extend(p["lengths"])
-                all_q_scores.extend(p["q_scores"])
-                all_gc_pcts.extend(p["gc_pcts"])
-                total_bases  += p["total_bases"]
-                q_sum        += p["q_sum"]
-                gc_sum       += p["gc_sum"]
-                len_lt500    += p["len_lt500"]
-                len_500_2k   += p["len_500_2k"]
-                len_gt2k     += p["len_gt2k"]
-                q_cnt_10     += p["q_cnt_10"]
-                q_cnt_15     += p["q_cnt_15"]
-                q_cnt_20     += p["q_cnt_20"]
-                self.progress.emit(len(all_lengths))
+                acc.merge(future.result())
+                self._emit_progress(acc, done_before + file_size * k // n_workers)
 
-        if self._stop:
-            return
-
-        self._compute_and_emit(
-            all_lengths, all_q_scores, all_gc_pcts,
-            total_bases, q_sum, gc_sum,
-            len_lt500, len_500_2k, len_gt2k,
-            q_cnt_10, q_cnt_15, q_cnt_20,
-        )
-
-    def _compute_and_emit(
-        self,
-        lengths, q_scores, gc_pcts,
-        total_bases, q_sum, gc_sum,
-        len_lt500, len_500_2k, len_gt2k,
-        q_cnt_10, q_cnt_15, q_cnt_20,
-    ):
-        """Compute final statistics and histogram bins, then emit finished signal.
-        Shared by both sequential and parallel paths."""
-        import math, random
-
+    def _compute_and_emit(self, acc: _FqAcc):
+        """Compute final statistics and histogram bins, then emit finished.
+        Length statistics come from a length->count table instead of sorting
+        every length, which keeps millions of reads cheap."""
         N_BINS = 60
+        lengths, q_scores, gc_pcts = acc.lengths, acc.q_scores, acc.gc_pcts
         n = len(lengths)
         if n == 0:
-            self.error.emit("No reads found in file.")
+            self.error.emit("No reads found in the input.")
             return
 
-        mean_len    = total_bases / n
-        sorted_lens = sorted(lengths)
-        median_len  = (sorted_lens[n // 2 - 1] + sorted_lens[n // 2]) / 2 \
-                      if n % 2 == 0 else sorted_lens[n // 2]
-        min_len = sorted_lens[0]
-        max_len = sorted_lens[-1]
+        len_counts = Counter(lengths)
+        keys = sorted(len_counts)
+
+        def _nth(rank):
+            """Length at 0-based rank in the sorted order."""
+            cum = 0
+            for k in keys:
+                cum += len_counts[k]
+                if cum > rank:
+                    return k
+            return keys[-1]
+
+        total_bases = acc.total_bases
+        mean_len = total_bases / n
+        median_len = ((_nth(n // 2 - 1) + _nth(n // 2)) / 2 if n % 2 == 0
+                      else _nth(n // 2))
+        min_len, max_len = keys[0], keys[-1]
 
         # N50
-        half, cumsum, n50 = total_bases / 2, 0, sorted_lens[-1]
-        for l in reversed(sorted_lens):
-            cumsum += l
+        half, cumsum, n50 = total_bases / 2, 0, max_len
+        for k in reversed(keys):
+            cumsum += k * len_counts[k]
             if cumsum >= half:
-                n50 = l
+                n50 = k
                 break
 
-        mean_q  = q_sum  / n
-        mean_gc = gc_sum / n
-        std_gc  = math.sqrt(sum((x - mean_gc) ** 2 for x in gc_pcts) / max(n - 1, 1))
+        mean_q = acc.q_sum / n
+        mean_gc = acc.gc_sum / n
+        std_gc = math.sqrt(sum((x - mean_gc) ** 2 for x in gc_pcts) / max(n - 1, 1))
 
-        len_p01 = sorted_lens[max(0,     int(n * 0.01))]
-        len_p99 = sorted_lens[min(n - 1, int(n * 0.99))]
+        len_p01 = _nth(max(0, int(n * 0.01)))
+        len_p99 = _nth(min(n - 1, int(n * 0.99)))
 
         def _make_bins(values, v_min, v_max):
             span = v_max - v_min if v_max > v_min else 1.0
@@ -633,21 +678,35 @@ class _FastqInspectorWorker(QtCore.QThread):
 
         q_bin_min = min(q_scores)
         q_bin_max = max(q_scores)
-        len_bins = _make_bins(lengths,  len_p01, len_p99)
-        q_bins   = _make_bins(q_scores, q_bin_min, q_bin_max)
-        gc_bins  = _make_bins(gc_pcts,  0.0, 100.0)
+        len_bins = _make_bins(lengths, len_p01, len_p99)
+        q_bins = _make_bins(q_scores, q_bin_min, q_bin_max)
+        gc_bins = _make_bins(gc_pcts, 0.0, 100.0)
 
         if n > self._SCATTER_MAX:
-            idx    = random.sample(range(n), self._SCATTER_MAX)
-            sc_len = [lengths[i]  for i in idx]
-            sc_q   = [q_scores[i] for i in idx]
+            idx = random.sample(range(n), self._SCATTER_MAX)
+            sc_len = [lengths[i] for i in idx]
+            sc_q = [q_scores[i] for i in idx]
         else:
-            sc_len = lengths[:]
-            sc_q   = q_scores[:]
+            sc_len = list(lengths)
+            sc_q = list(q_scores)
 
-        del lengths, q_scores, gc_pcts, sorted_lens
+        groups = []
+        for name in sorted(getattr(self, "_group_stats", {}), key=_natural_key):
+            nf, gr, gb, gq, gr10, gb10 = self._group_stats[name]
+            groups.append({
+                "name": name, "files": nf, "reads": gr, "bases": gb,
+                "reads_pct": gr / n * 100,
+                "mean_len": gb / gr if gr else 0.0,
+                "mean_q": gq / gr if gr else 0.0,
+                "q10_pct": gr10 / gr * 100 if gr else 0.0,
+                "bases_q10_pct": gb10 / gb * 100 if gb else 0.0,
+            })
 
         self.finished.emit({
+            "groups":     groups,
+            "bases_q10_pct": acc.bases_q10 / total_bases * 100 if total_bases else 0.0,
+            "bases_q15_pct": acc.bases_q15 / total_bases * 100 if total_bases else 0.0,
+            "bases_q20_pct": acc.bases_q20 / total_bases * 100 if total_bases else 0.0,
             "n_reads":    n,
             "total_bases": total_bases,
             "mean_len":   mean_len,
@@ -655,13 +714,13 @@ class _FastqInspectorWorker(QtCore.QThread):
             "min_len":    min_len,
             "max_len":    max_len,
             "n50":        n50,
-            "len_lt500":  len_lt500,
-            "len_500_2k": len_500_2k,
-            "len_gt2k":   len_gt2k,
+            "len_lt500":  acc.len_lt500,
+            "len_500_1k": acc.len_500_1k,
+            "len_gt1k":   acc.len_gt1k,
             "mean_q":     mean_q,
-            "q10_pct":    q_cnt_10 / n * 100,
-            "q15_pct":    q_cnt_15 / n * 100,
-            "q20_pct":    q_cnt_20 / n * 100,
+            "q10_pct":    acc.q_cnt_10 / n * 100,
+            "q15_pct":    acc.q_cnt_15 / n * 100,
+            "q20_pct":    acc.q_cnt_20 / n * 100,
             "mean_gc":    mean_gc,
             "std_gc":     std_gc,
             "len_bins":   len_bins,
@@ -679,6 +738,87 @@ class _FastqInspectorWorker(QtCore.QThread):
 # ═══════════════════════════════════════════════════════════════════════════
 # FASTQ INSPECTOR – panel
 # ═══════════════════════════════════════════════════════════════════════════
+
+class _FastqDropZone(QtWidgets.QFrame):
+    """Drop zone for one or several FASTQ files and/or folders (walked
+    recursively, e.g. ONT fastq_pass/). Emits the expanded FASTQ list."""
+    filesChosen = QtCore.pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("drop_zone")
+        self.setAcceptDrops(True)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(4)
+        lay.setAlignment(QtCore.Qt.AlignCenter)
+        lbl = make_label("Drag FASTQ files or a folder here", color=TEXT_SEC)
+        lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self.setMinimumHeight(180)
+        hint = make_label(
+            "Accepted: .fastq · .fq · .fastq.gz · .fq.gz  —  a folder is searched "
+            "recursively (e.g. fastq_pass/)", size=15, color=TEXT_HINT)
+        hint.setAlignment(QtCore.Qt.AlignCenter)
+        row = QtWidgets.QHBoxLayout()
+        row.setAlignment(QtCore.Qt.AlignCenter)
+        row.setSpacing(8)
+        for text, slot in (("Browse files…", self._browse_files),
+                           ("Browse folder…", self._browse_folder)):
+            b = QtWidgets.QPushButton(text)
+            b.setObjectName("secondary_btn")
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        lay.addWidget(lbl)
+        lay.addWidget(hint)
+        lay.addSpacing(8)
+        lay.addLayout(row)
+
+    def _browse_files(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "Select FASTQ files", "",
+            "FASTQ (*.fastq *.fq *.fastq.gz *.fq.gz);;All files (*)")
+        if paths:
+            self.filesChosen.emit(paths)
+
+    def _browse_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select a folder with FASTQ files")
+        if path:
+            self.filesChosen.emit([path])
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self.setProperty("dragging", "true")
+            refresh_style(self)
+
+    def dragLeaveEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+
+    def dropEvent(self, e):
+        self.setProperty("dragging", "false")
+        refresh_style(self)
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.toLocalFile()]
+        if paths:
+            self.filesChosen.emit(paths)
+
+
+class _NumItem(QtWidgets.QTableWidgetItem):
+    """Table cell that shows formatted text but sorts by its numeric UserRole."""
+
+    def __lt__(self, other):
+        a = self.data(QtCore.Qt.UserRole)
+        b = other.data(QtCore.Qt.UserRole)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
+
+
+def _fmt_size(b):
+    if b >= 1_073_741_824: return f"{b/1_073_741_824:.2f} GB"
+    if b >= 1_048_576:     return f"{b/1_048_576:.1f} MB"
+    return f"{b/1_024:.1f} KB"
+
 
 class FastqInspectorPanel(QtWidgets.QWidget):
 
@@ -703,21 +843,34 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         # ── Title ──
         self._layout.addWidget(make_label("FASTQ Inspector", size=19, bold=True))
         desc = make_label(
-            "Drag a FASTQ file (.fastq or .fastq.gz) to get a full descriptive report. "
+            "Descriptive report of one or several FASTQ files (or a whole folder). "
             "All reads are analyzed; only the scatter plot uses a random sample of 10 000 points.",
             color=TEXT_SEC,
         )
         desc.setWordWrap(True)
         self._layout.addWidget(desc)
 
-        # ── Drop zone ──
-        self._drop = DropZone(
-            "Drag FASTQ file here",
-            "Accepted: .fastq  |  .fastq.gz",
-            extensions=[".fastq", ".gz"],
-        )
-        self._drop.fileDropped.connect(self._on_file)
+        # ── Drop zone (collapses to a compact row once input is chosen) ──
+        self._drop = _FastqDropZone()
+        self._drop.filesChosen.connect(self._on_files)
         self._layout.addWidget(self._drop)
+
+        self._file_row = QtWidgets.QFrame()
+        self._file_row.setObjectName("fq_file_row")
+        self._file_row.setStyleSheet(
+            f"QFrame#fq_file_row {{ background:{WHITE}; border:1px solid {GRAY_LINE};"
+            f" border-radius:8px; }}")
+        fr = QtWidgets.QHBoxLayout(self._file_row)
+        fr.setContentsMargins(14, 8, 10, 8)
+        self._file_row_lbl = make_label("", size=16, bold=True, color=GREEN)
+        self._file_row_lbl.setWordWrap(True)
+        fr.addWidget(self._file_row_lbl, 1)
+        change_btn = QtWidgets.QPushButton("Change…")
+        change_btn.setObjectName("secondary_btn")
+        change_btn.clicked.connect(self._show_drop)
+        fr.addWidget(change_btn)
+        self._file_row.hide()
+        self._layout.addWidget(self._file_row)
 
         # ── Status + progress bar ──
         self._status_lbl = make_label("", color=TEXT_SEC)
@@ -725,7 +878,15 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
         self._progress_bar = QtWidgets.QProgressBar()
         self._progress_bar.setRange(0, 0)
-        self._progress_bar.setFixedHeight(6)
+        # Taller than the global 6 px bar: this one carries a real percentage
+        self._progress_bar.setFixedHeight(22)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFormat("%p%")
+        self._progress_bar.setStyleSheet(
+            f"QProgressBar {{ background-color:{GRAY_LINE}; border:none;"
+            f" border-radius:6px; color:{TEXT_PRI}; font-size:13px; font-weight:600;"
+            f" text-align:center; }}"
+            f"QProgressBar::chunk {{ background-color:{BLUE_MID}; border-radius:6px; }}")
         self._progress_bar.hide()
         self._layout.addWidget(self._progress_bar)
 
@@ -744,60 +905,85 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(10)
 
+        # Every card row sits on the same 5-column grid so columns line up
+        # across sections instead of some rows stretching and others not.
+        def _grid(cards):
+            g = QtWidgets.QGridLayout()
+            g.setHorizontalSpacing(8)
+            for col in range(5):
+                g.setColumnStretch(col, 1)
+            for col, c in enumerate(cards):
+                g.addWidget(c, 0, col)
+            sl.addLayout(g)
+
         sl.addWidget(_sec("General"))
-        r = QtWidgets.QHBoxLayout()
-        r.setSpacing(8)
         self._sc_reads    = self._card("Total reads")
         self._sc_bases    = self._card("Total bases")
-        self._sc_filesize = self._card("File size")
-        for c in (self._sc_reads, self._sc_bases, self._sc_filesize):
-            r.addWidget(c)
-        r.addStretch()
-        sl.addLayout(r)
+        self._sc_filesize = self._card("Input size")
+        self._sc_nfiles   = self._card("Files")
+        _grid([self._sc_reads, self._sc_bases, self._sc_filesize, self._sc_nfiles])
 
         sl.addWidget(_sec("Read length"))
-        r2 = QtWidgets.QHBoxLayout()
-        r2.setSpacing(8)
         self._sc_min    = self._card("Min")
         self._sc_max    = self._card("Max")
         self._sc_mean   = self._card("Mean")
         self._sc_median = self._card("Median")
         self._sc_n50    = self._card("N50", color=BLUE)
-        for c in (self._sc_min, self._sc_max, self._sc_mean, self._sc_median, self._sc_n50):
-            r2.addWidget(c)
-        sl.addLayout(r2)
+        _grid([self._sc_min, self._sc_max, self._sc_mean, self._sc_median, self._sc_n50])
 
-        r3 = QtWidgets.QHBoxLayout()
-        r3.setSpacing(8)
         self._sc_lt500  = self._card("< 500 bp")
-        self._sc_500_2k = self._card("500–2000 bp")
-        self._sc_gt2k   = self._card("> 2000 bp")
-        for c in (self._sc_lt500, self._sc_500_2k, self._sc_gt2k):
-            r3.addWidget(c)
-        r3.addStretch(2)
-        sl.addLayout(r3)
+        self._sc_500_1k = self._card("500–1000 bp")
+        self._sc_gt1k   = self._card("> 1000 bp")
+        _grid([self._sc_lt500, self._sc_500_1k, self._sc_gt1k])
 
         sl.addWidget(_sec("Base quality (Phred)"))
-        r4 = QtWidgets.QHBoxLayout()
-        r4.setSpacing(8)
+        q_note = make_label(
+            "Per-read Q = −10·log10(mean error probability): the same measure the "
+            "analysis quality filter uses (ONT convention).", size=14, color=TEXT_SEC)
+        q_note.setWordWrap(True)
+        sl.addWidget(q_note)
         self._sc_meanq = self._card("Mean Q-score", color=GREEN)
         self._sc_q10   = self._card("Reads Q≥10")
         self._sc_q15   = self._card("Reads Q≥15")
         self._sc_q20   = self._card("Reads Q≥20")
-        for c in (self._sc_meanq, self._sc_q10, self._sc_q15, self._sc_q20):
-            r4.addWidget(c)
-        r4.addStretch()
-        sl.addLayout(r4)
+        _grid([self._sc_meanq, self._sc_q10, self._sc_q15, self._sc_q20])
+        # Same thresholds weighted by bases: usable yield after a quality filter
+        self._sc_bq10 = self._card("Bases in reads Q≥10")
+        self._sc_bq15 = self._card("Bases in reads Q≥15")
+        self._sc_bq20 = self._card("Bases in reads Q≥20")
+        for c in (self._sc_bq10, self._sc_bq15, self._sc_bq20):
+            c.setToolTip("Share of all bases carried by reads at or above this Q:\n"
+                         "the sequence that survives an equivalent quality filter.")
+        _grid([QtWidgets.QWidget(), self._sc_bq10, self._sc_bq15, self._sc_bq20])
 
         sl.addWidget(_sec("GC content"))
-        r5 = QtWidgets.QHBoxLayout()
-        r5.setSpacing(8)
         self._sc_meangc = self._card("Mean %GC")
         self._sc_stdgc  = self._card("Std dev %GC")
-        for c in (self._sc_meangc, self._sc_stdgc):
-            r5.addWidget(c)
-        r5.addStretch(3)
-        sl.addLayout(r5)
+        _grid([self._sc_meangc, self._sc_stdgc])
+
+        # ── Per-group breakdown (sub-folders such as barcode01/, or the
+        #    dropped files/folders); hidden when there is a single group ──
+        self._groups_title = _sec("By sub-folder")
+        sl.addWidget(self._groups_title)
+        self._groups_table = QtWidgets.QTableWidget(0, 8)
+        self._groups_table.setHorizontalHeaderLabels(
+            ["Group", "Files", "Reads", "% of reads", "Bases",
+             "Mean length", "Mean Q", "Reads Q≥10"])
+        self._groups_table.verticalHeader().setVisible(False)
+        self._groups_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self._groups_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._groups_table.setAlternatingRowColors(True)
+        self._groups_table.setStyleSheet(
+            "QTableWidget::item { padding: 0 12px; }"
+            "QHeaderView::section { padding: 4px 12px; font-weight: 600; }")
+        hh = self._groups_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        for col in range(1, 8):
+            hh.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
+        self._groups_table.setSortingEnabled(True)
+        sl.addWidget(self._groups_table)
+        self._groups_title.hide()
+        self._groups_table.hide()
 
         self._layout.addWidget(self._stats_w)
 
@@ -849,6 +1035,15 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._clear)
         fl.addWidget(self._clear_btn)
 
+        # Cancels the running analysis but keeps the loaded input
+        self._stop_btn = QtWidgets.QPushButton("Stop")
+        self._stop_btn.setObjectName("danger_btn")
+        self._stop_btn.setFixedHeight(44)
+        self._stop_btn.setFixedWidth(120)
+        self._stop_btn.clicked.connect(self._stop_analysis)
+        self._stop_btn.hide()
+        fl.addWidget(self._stop_btn)
+
         self._pdf_btn = QtWidgets.QPushButton("Export PDF  ↓")
         self._pdf_btn.setObjectName("secondary_btn")
         self._pdf_btn.setFixedHeight(44)
@@ -876,8 +1071,10 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         # Detached-but-maybe-running workers, kept referenced so they aren't GC'd
         # mid-run (which crashes Qt). Purged in _retire_worker.
         self._retired_workers: set = set()
-        self._file_path   = ""
+        self._files: List[str] = []
         self._file_size   = 0
+        self._input_label = ""   # shown in the file row and the PDF
+        self._input_stem  = ""   # base of the PDF file name
         self._last_result: Optional[dict] = None
         self._last_pdf    = ""
         self._pdf_ready   = False   # True after first successful export
@@ -950,61 +1147,122 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
     # ── slots ─────────────────────────────────────────────────────────────
 
-    def _on_file(self, path: str):
-        # Cancel any running analysis — new file supersedes the old one
+    def _on_files(self, paths: list):
+        """Files and/or folders chosen: expand to FASTQ files and show them as a
+        compact row (the large drop zone would push the results below the fold)."""
+        files, self._group_of, self._group_kind = group_fastq_paths(paths)
+        # Cancel any running analysis — new input supersedes the old one
         self._retire_worker()
-        self._file_path = path
-        self._set_analyze_enabled(bool(path))
-        self._status_lbl.setStyleSheet("")
-        self._status_lbl.setText("")
         self._stats_w.hide()
         self._charts_w.hide()
         self._pdf_btn.hide()
         self._pdf_btn.setText("Export PDF  ↓")
         self._pdf_ready = False
+        self._status_lbl.setStyleSheet("")
+        if not files:
+            self._status_lbl.setStyleSheet(f"color:{RED};")
+            self._status_lbl.setText(
+                "No FASTQ files found (.fastq, .fq, .fastq.gz, .fq.gz).")
+            return
+        self._files = files
+        self._file_size = sum(os.path.getsize(f) for f in files)
+        if len(paths) == 1 and os.path.isdir(paths[0]):
+            base = os.path.basename(os.path.normpath(paths[0]))
+            self._input_label = f"{base}/ ({len(files)} files)"
+            self._input_stem = base
+        elif len(files) == 1:
+            self._input_label = os.path.basename(files[0])
+            self._input_stem = self._stem_of(files[0])
+        else:
+            self._input_label = f"{len(files)} FASTQ files"
+            self._input_stem = f"{self._stem_of(files[0])}_and_{len(files) - 1}_more"
+        icon = "📁" if len(files) > 1 else "📄"
+        self._file_row_lbl.setText(
+            f"{icon}  {self._input_label}  ·  {_fmt_size(self._file_size)}")
+        self._file_row_lbl.setToolTip("\n".join(files[:30]) +
+                                      ("\n…" if len(files) > 30 else ""))
+        self._drop.hide()
+        self._file_row.show()
+        self._status_lbl.setText("")
+        self._set_analyze_enabled(True)
+
+    @staticmethod
+    def _stem_of(path: str) -> str:
+        name = os.path.basename(path)
+        for ext in (".fastq.gz", ".fq.gz", ".fastq", ".fq"):
+            if name.lower().endswith(ext):
+                return name[:-len(ext)]
+        return os.path.splitext(name)[0]
+
+    def _show_drop(self):
+        """'Change…': show the drop zone again; results stay until new input."""
+        self._file_row.hide()
+        self._drop.show()
 
     def _clear(self):
         self._retire_worker()
-        self._drop.clear()
-        self._file_path   = ""
+        self._files       = []
         self._file_size   = 0
+        self._input_label = ""
+        self._input_stem  = ""
         self._last_result = None
         self._last_pdf    = ""
         self._pdf_ready   = False
+        self._file_row.hide()
+        self._drop.show()
         self._status_lbl.setStyleSheet("")
         self._status_lbl.setText("")
         self._progress_bar.hide()
+        self._stop_btn.hide()
         self._stats_w.hide()
         self._charts_w.hide()
+        self._groups_title.hide()
+        self._groups_table.hide()
+        self._group_of = {}
+        self._group_kind = ""
         self._pdf_btn.setText("Export PDF  ↓")
         self._pdf_btn.hide()
         self._set_analyze_enabled(False)
 
     def _start(self):
-        if not self._file_path or not os.path.isfile(self._file_path):
+        files = [f for f in self._files if os.path.isfile(f)]
+        if not files:
             return
         # Stop any previous worker before starting a new one
         self._retire_worker()
-        self._file_size = os.path.getsize(self._file_path)
         self._set_analyze_enabled(False)
         self._status_lbl.setStyleSheet("")
         self._status_lbl.setText("Analyzing…  reading all reads")
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
         self._progress_bar.show()
+        self._stop_btn.show()
         self._stats_w.hide()
         self._charts_w.hide()
         self._pdf_btn.hide()
 
-        self._worker = _FastqInspectorWorker(self._file_path)
+        self._worker = _FastqInspectorWorker(files, getattr(self, "_group_of", {}))
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _on_progress(self, n: int):
-        self._status_lbl.setText(f"Analyzing…  {n:,} reads processed")
+    def _stop_analysis(self):
+        """Cancel the running analysis; the loaded input stays ready to re-run."""
+        self._retire_worker()
+        self._progress_bar.hide()
+        self._stop_btn.hide()
+        self._status_lbl.setStyleSheet(f"color:{AMBER};")
+        self._status_lbl.setText("Stopped — press Analyze to run again.")
+        self._set_analyze_enabled(bool(self._files))
+
+    def _on_progress(self, n: int, pct: int):
+        self._progress_bar.setValue(pct)
+        self._status_lbl.setText(f"Analyzing…  {pct}%  ·  {n:,} reads processed")
 
     def _on_finished(self, r: dict):
         self._progress_bar.hide()
+        self._stop_btn.hide()
         self._last_result = r
         n = r["n_reads"]
         self._status_lbl.setText(f"Done — {n:,} reads analyzed")
@@ -1015,14 +1273,10 @@ class FastqInspectorPanel(QtWidgets.QWidget):
             if v >= 1_000:         return f"{v/1_000:.1f} Kbp"
             return f"{v} bp"
 
-        def _fmt_size(b):
-            if b >= 1_073_741_824: return f"{b/1_073_741_824:.2f} GB"
-            if b >= 1_048_576:     return f"{b/1_048_576:.1f} MB"
-            return f"{b/1_024:.1f} KB"
-
         self._sc_reads._val.setText(f"{n:,}")
         self._sc_bases._val.setText(_fmt_bp(r["total_bases"]))
         self._sc_filesize._val.setText(_fmt_size(self._file_size))
+        self._sc_nfiles._val.setText(f"{len(self._files):,}")
 
         self._sc_min._val.setText(f"{r['min_len']:,} bp")
         self._sc_max._val.setText(f"{r['max_len']:,} bp")
@@ -1031,13 +1285,17 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._sc_n50._val.setText(f"{r['n50']:,} bp")
 
         self._sc_lt500._val.setText(f"{r['len_lt500']:,}  ({r['len_lt500']/n*100:.1f}%)")
-        self._sc_500_2k._val.setText(f"{r['len_500_2k']:,}  ({r['len_500_2k']/n*100:.1f}%)")
-        self._sc_gt2k._val.setText(f"{r['len_gt2k']:,}  ({r['len_gt2k']/n*100:.1f}%)")
+        self._sc_500_1k._val.setText(f"{r['len_500_1k']:,}  ({r['len_500_1k']/n*100:.1f}%)")
+        self._sc_gt1k._val.setText(f"{r['len_gt1k']:,}  ({r['len_gt1k']/n*100:.1f}%)")
 
         self._sc_meanq._val.setText(f"Q{r['mean_q']:.1f}")
         self._sc_q10._val.setText(f"{r['q10_pct']:.1f}%")
         self._sc_q15._val.setText(f"{r['q15_pct']:.1f}%")
         self._sc_q20._val.setText(f"{r['q20_pct']:.1f}%")
+        self._sc_bq10._val.setText(f"{r['bases_q10_pct']:.1f}%")
+        self._sc_bq15._val.setText(f"{r['bases_q15_pct']:.1f}%")
+        self._sc_bq20._val.setText(f"{r['bases_q20_pct']:.1f}%")
+        self._fill_groups_table(r.get("groups", []))
 
         self._sc_meangc._val.setText(f"{r['mean_gc']:.1f}%")
         self._sc_stdgc._val.setText(f"± {r['std_gc']:.1f}%")
@@ -1057,9 +1315,47 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._pdf_ready = False
         self._pdf_btn.show()
 
+    def _fill_groups_table(self, groups: list):
+        """Per-group table; shown only when the input has 2+ groups."""
+        show = len(groups) > 1
+        self._groups_title.setVisible(show)
+        self._groups_table.setVisible(show)
+        if not show:
+            return
+        kind = getattr(self, "_group_kind", "") or "file"
+        self._groups_title.setText(f"BY {kind.upper()}")
+
+        def _num_item(value, text):
+            # Sort numerically while displaying formatted text
+            it = _NumItem(text)
+            it.setData(QtCore.Qt.UserRole, value)
+            it.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return it
+
+        t = self._groups_table
+        t.setSortingEnabled(False)
+        t.setRowCount(len(groups))
+        for row, g in enumerate(groups):
+            t.setItem(row, 0, QtWidgets.QTableWidgetItem(g["name"]))
+            cells = [
+                (g["files"], f"{g['files']:,}"),
+                (g["reads"], f"{g['reads']:,}"),
+                (g["reads_pct"], f"{g['reads_pct']:.1f}%"),
+                (g["bases"], f"{g['bases']:,}"),
+                (g["mean_len"], f"{g['mean_len']:,.0f} bp"),
+                (g["mean_q"], f"Q{g['mean_q']:.1f}"),
+                (g["q10_pct"], f"{g['q10_pct']:.1f}%"),
+            ]
+            for col, (val, text) in enumerate(cells, start=1):
+                t.setItem(row, col, _num_item(val, text))
+        # Height fits up to ~14 rows, then the table scrolls
+        rows_h = sum(t.rowHeight(i) for i in range(min(len(groups), 14)))
+        t.setFixedHeight(t.horizontalHeader().height() + rows_h + 4)
+
     def _on_error(self, msg: str):
         self._progress_bar.hide()
-        self._set_analyze_enabled(True)
+        self._stop_btn.hide()
+        self._set_analyze_enabled(bool(self._files))
         self._status_lbl.setStyleSheet(f"color:{RED};")
         self._status_lbl.setText(f"Error: {msg}")
 
@@ -1077,11 +1373,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
         ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"ont-barcoder_{ts}_fastq_ins"
-        fastq_stem  = os.path.splitext(os.path.basename(self._file_path))[0]
-        # strip .fastq.gz double extension if present
-        if fastq_stem.endswith(".fastq"):
-            fastq_stem = fastq_stem[:-6]
-        pdf_name    = f"{fastq_stem}_stats.pdf"
+        pdf_name    = f"{self._input_stem or 'fastq'}_stats.pdf"
         prog_dir    = _get_base_dir()
         auto_path   = os.path.join(prog_dir, "output", folder_name, pdf_name)
 
@@ -1186,7 +1478,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
     def _build_pdf_html(self) -> str:
         r = self._last_result
         n = r["n_reads"]
-        fname = os.path.basename(self._file_path)
+        fname = self._input_label
         ts = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M")
 
         def _fmt_bp(v):
@@ -1424,8 +1716,8 @@ class FastqInspectorPanel(QtWidgets.QWidget):
                 <tr><td>Median</td><td class="value">{r['median_len']:,.0f} bp</td><td></td></tr>
                 <tr><td>N50</td><td class="value">{r['n50']:,} bp</td><td><span class="badge-info">Assembly standard</span></td></tr>
                 <tr><td>&lt; 500 bp</td><td class="value">{r['len_lt500']:,}</td><td>({r['len_lt500']/n*100:.1f}%)</td></tr>
-                <tr><td>500–2000 bp</td><td class="value">{r['len_500_2k']:,}</td><td>({r['len_500_2k']/n*100:.1f}%)</td></tr>
-                <tr><td>&gt; 2000 bp</td><td class="value">{r['len_gt2k']:,}</td><td>({r['len_gt2k']/n*100:.1f}%)</td></tr>
+                <tr><td>500–1000 bp</td><td class="value">{r['len_500_1k']:,}</td><td>({r['len_500_1k']/n*100:.1f}%)</td></tr>
+                <tr><td>&gt; 1000 bp</td><td class="value">{r['len_gt1k']:,}</td><td>({r['len_gt1k']/n*100:.1f}%)</td></tr>
             </tbody>
         </table>
         """
@@ -1442,7 +1734,30 @@ class FastqInspectorPanel(QtWidgets.QWidget):
                 <tr><td>Reads ≥ Q10</td><td class="value">{r['q10_pct']:.1f}%</td><td></td></tr>
                 <tr><td>Reads ≥ Q15</td><td class="value">{r['q15_pct']:.1f}%</td><td></td></tr>
                 <tr><td>Reads ≥ Q20</td><td class="value">{r['q20_pct']:.1f}%</td><td><span class="badge-good">High confidence</span></td></tr>
+                <tr><td>Bases in reads ≥ Q10</td><td class="value">{r.get('bases_q10_pct', 0):.1f}%</td><td>Yield kept by a Q10 filter</td></tr>
+                <tr><td>Bases in reads ≥ Q15</td><td class="value">{r.get('bases_q15_pct', 0):.1f}%</td><td></td></tr>
+                <tr><td>Bases in reads ≥ Q20</td><td class="value">{r.get('bases_q20_pct', 0):.1f}%</td><td></td></tr>
             </tbody>
+        </table>
+        """
+
+        # Per-group table (only with 2+ sub-folders / dropped items)
+        groups_table = ""
+        groups = r.get("groups", [])
+        if len(groups) > 1:
+            kind = getattr(self, "_group_kind", "") or "file"
+            rows = "".join(
+                f"<tr><td>{g['name']}</td><td class='value'>{g['reads']:,}</td>"
+                f"<td>{g['reads_pct']:.1f}%</td><td>{g['mean_len']:,.0f} bp</td>"
+                f"<td>Q{g['mean_q']:.1f}</td><td>{g['q10_pct']:.1f}%</td></tr>"
+                for g in groups)
+            groups_table = f"""
+        <table class="data-table">
+            <thead>
+                <tr><th colspan="6" class="section-title-row">🗂 By {kind} <i>— reads per group</i></th></tr>
+                <tr><th>Group</th><th>Reads</th><th>% of reads</th><th>Mean length</th><th>Mean Q</th><th>Reads ≥ Q10</th></tr>
+            </thead>
+            <tbody>{rows}</tbody>
         </table>
         """
 
@@ -1528,13 +1843,14 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
     <div class="file-info">
         📁 <strong>Input file:</strong> {fname}<br>
-        💾 <strong>File size:</strong> {_fmt_size(self._file_size)}
+        💾 <strong>Input size:</strong> {_fmt_size(self._file_size)} · {len(self._files)} file(s)
     </div>
 
     {metrics}
     {length_table}
     {quality_table}
     {gc_table}
+    {groups_table}
     {charts}
 
     </body></html>"""

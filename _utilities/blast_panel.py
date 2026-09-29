@@ -949,6 +949,7 @@ class BlastPanel(QtWidgets.QWidget):
     stopRequested      = QtCore.pyqtSignal()             # user clicked Stop (tab 1)
     blastFileRequested = QtCore.pyqtSignal(list, dict)   # result files, config dict (tab 2)
     stopFileRequested  = QtCore.pyqtSignal()             # user clicked Stop (tab 2)
+    sendToBestSeq      = QtCore.pyqtSignal(list)         # [fasta, results] pair of the last run
 
     _DATABASES        = ["core_nt", "nt", "refseq_rna", "16S_ribosomal_RNA"]
     _PROGRAMS         = ["blastn&MEGABLAST=on", "blastn", "megablast"]
@@ -1014,7 +1015,25 @@ class BlastPanel(QtWidgets.QWidget):
         self._api_key_edit.setText(self._load_api_key())
         self._api_key_edit.editingFinished.connect(self._save_api_key)
         self._api_key_edit.textChanged.connect(self._on_api_key_changed)
+        # Masked by default so the key does not leak into screenshots/recordings
+        self._api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
         al.addWidget(self._api_key_edit)
+        self._api_key_show_btn = QtWidgets.QPushButton("Show")
+        self._api_key_show_btn.setCheckable(True)
+        self._api_key_show_btn.setFixedSize(64, 28)
+        self._api_key_show_btn.setToolTip("Show / hide API key")
+        self._api_key_show_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: 1px solid #CCC;"
+            " border-radius: 4px; color: #555; font-size:13px; }"
+            "QPushButton:checked { background: #E6F1FB; border-color: #378ADD; }"
+        )
+
+        def _toggle_key_visibility(on):
+            self._api_key_edit.setEchoMode(
+                QtWidgets.QLineEdit.Normal if on else QtWidgets.QLineEdit.Password)
+            self._api_key_show_btn.setText("Hide" if on else "Show")
+        self._api_key_show_btn.toggled.connect(_toggle_key_visibility)
+        al.addWidget(self._api_key_show_btn)
         self._api_key_clear_btn = QtWidgets.QPushButton("✕")
         self._api_key_clear_btn.setFixedSize(28, 28)
         self._api_key_clear_btn.setToolTip("Clear API key")
@@ -1198,6 +1217,19 @@ class BlastPanel(QtWidgets.QWidget):
         self._open_results_btn.hide()
         self._open_results_btn.clicked.connect(self._open_results_file)
         fl.addWidget(self._open_results_btn)
+
+        # Hands the queried FASTA + its results table to Best Sequence as a
+        # ready-made pair (same base name), so nothing has to be re-selected.
+        self._send_best_btn = QtWidgets.QPushButton("Open in Best Sequence  →")
+        self._send_best_btn.setObjectName("secondary_btn")
+        self._send_best_btn.setFixedHeight(44)
+        self._send_best_btn.setToolTip(
+            "Load the queried FASTA and this BLAST table as a pair in Best Sequence.")
+        self._send_best_btn.hide()
+        self._send_best_btn.clicked.connect(
+            lambda: self.sendToBestSeq.emit(list(self._best_seq_pair)))
+        fl.addWidget(self._send_best_btn)
+        self._best_seq_pair = []
 
         self._stop_btn = QtWidgets.QPushButton("Stop")
         self._stop_btn.setObjectName("danger_btn")
@@ -1561,6 +1593,8 @@ class BlastPanel(QtWidgets.QWidget):
         self._log.hide()
         self._open_folder_btn.hide()
         self._open_results_btn.hide()
+        self._send_best_btn.hide()
+        self._best_seq_pair = []
         self._stop_btn.hide()
         self._blast_btn.show()
         self._blast_btn.setEnabled(False)
@@ -1612,6 +1646,9 @@ class BlastPanel(QtWidgets.QWidget):
         self._stop_btn.setVisible(running)
         self._clear_btn.setEnabled(not running)
         if running:
+            # A new search invalidates the previous run's pair
+            self._send_best_btn.hide()
+            self._best_seq_pair = []
             self._start_time = time.monotonic()
             self._elapsed_timer.start()
             self._log.show()
@@ -1646,6 +1683,12 @@ class BlastPanel(QtWidgets.QWidget):
                     self._last_tsv = matches[0]
                     self._open_results_btn.show()
                     break
+            # FASTA saved by the worker with the same base name as the table
+            if self._last_tsv:
+                fa = os.path.splitext(self._last_tsv)[0] + ".fa"
+                if os.path.isfile(fa):
+                    self._best_seq_pair = [fa, self._last_tsv]
+                    self._send_best_btn.show()
         # Do NOT overwrite the result slot — the worker already set the final message
         self._blast_btn.setEnabled(bool(self._drop.files))
         if self._drop.files:
@@ -2402,6 +2445,10 @@ class _BlastWorker(QtCore.QThread):
             f"?CMD=Get&FORMAT_TYPE=Text&ALIGNMENT_VIEW=Tabular&RID={rid}"
         )
         resp = self._http_get(url, timeout=120)
+        # A real reply (even with 0 hits) always carries '#' comment lines;
+        # an empty one means the download failed, not "no hits".
+        if not resp or "#" not in resp:
+            return None
         return self._parse_tabular(resp)
 
     def _parse_tabular(self, text):
@@ -2783,7 +2830,20 @@ class _BlastWorker(QtCore.QThread):
                 time.sleep(1)
             ok, poll_reason = self._blast_poll(rid, batch_label)
             if ok:
-                return self._blast_get_tabular(rid), pairs
+                rows = self._blast_get_tabular(rid)
+                if rows is not None:
+                    return rows, pairs
+                if self._stop:
+                    return [], []
+                # The search finished but its results could not be downloaded:
+                # mark the batch missing (so it can be re-run) instead of
+                # reporting its sequences as "no hits".
+                self.statusUpdated.emit(
+                    "blast",
+                    f"BLAST       │ [{batch_label}] results of RID {rid} could not be "
+                    f"downloaded — {len(pairs)} sequence(s) marked missing."
+                )
+                return [], []
             reason = poll_reason
 
         if self._stop:

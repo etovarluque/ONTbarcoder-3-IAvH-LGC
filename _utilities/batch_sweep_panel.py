@@ -1,10 +1,12 @@
 from __future__ import annotations
 import os
 import time
+import datetime
+from typing import List
 from PyQt5 import QtCore, QtGui, QtWidgets
 from .shared import *
 from .shared import _tr, _get_base_dir
-from .batch_sweep import load_batch_config, swept_keys
+from .batch_sweep import load_batch_config, swept_keys, merge_runs, count_fasta_records
 
 # Combinations above this count get a visible (non-blocking) warning in the
 # panel, since each one is a full analysis. MainWindow additionally asks for
@@ -50,6 +52,52 @@ def _example_combos_cfg_path() -> str:
     return os.path.join(_get_base_dir(), "_profiles", "ontbarcoder_batch_combos.cfg")
 
 
+def _is_run_folder(path: str) -> bool:
+    """An analysis output folder: it holds its consensus_filtered.fa."""
+    return os.path.isfile(os.path.join(path, "consensus_filtered.fa"))
+
+
+def _run_folders_in(path: str) -> List[str]:
+    """`path` itself if it is a run folder, else the run folders directly
+    inside it (e.g. the whole output/ folder)."""
+    if _is_run_folder(path):
+        return [path]
+    try:
+        subs = sorted(os.path.join(path, d) for d in os.listdir(path))
+    except OSError:
+        return []
+    return [d for d in subs if os.path.isdir(d) and _is_run_folder(d)]
+
+
+class _RunFolderList(QtWidgets.QListWidget):
+    """Run folders to merge; accepts folders dropped from the file explorer."""
+    foldersDropped = QtCore.pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls()]
+        paths = [p for p in paths if p and os.path.isdir(p)]
+        if paths:
+            self.foldersDropped.emit(paths)
+        e.acceptProposedAction()
+
+
 class BatchSweepPanel(QtWidgets.QWidget):
     sweepRequested = QtCore.pyqtSignal(str)   # path to the batch config file
     stopRequested  = QtCore.pyqtSignal()
@@ -90,8 +138,14 @@ class BatchSweepPanel(QtWidgets.QWidget):
             color=TEXT_SEC
         )
         self._lbl_desc.setWordWrap(True)
+        self._lbl_summary_line = make_label(
+            "Runs the current dataset once per parameter combination and merges "
+            "the unique sequences per sample. Optional — not needed to reach Results.",
+            color=TEXT_SEC)
+        self._lbl_summary_line.setWordWrap(True)
         self._layout.addWidget(self._lbl_title)
-        self._layout.addWidget(self._lbl_desc)
+        self._layout.addWidget(self._lbl_summary_line)
+        self._layout.addWidget(make_collapsible(self._lbl_desc))
 
         self._lbl_conv_only = QtWidgets.QLabel(
             "⚠ Conventional analysis only — not available in Real-Time mode.")
@@ -143,8 +197,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
         )
         help_lbl.setWordWrap(True)
         help_lbl.setTextFormat(QtCore.Qt.RichText)
-        help_lbl.setStyleSheet(f"color:{TEXT_HINT}; font-size:13px;")
-        cl.addWidget(help_lbl)
+        cl.addWidget(make_collapsible(help_lbl, "Config file format (grid / combo list)"))
 
         example_row = QtWidgets.QHBoxLayout()
         example_btn = QtWidgets.QPushButton("Create example cfg (grid)")
@@ -161,6 +214,57 @@ class BatchSweepPanel(QtWidgets.QWidget):
         cl.addLayout(example_row)
 
         self._layout.addWidget(cfg_box)
+
+        # ── Merge existing runs (analyses already run by hand, no sweep) ──
+        merge_box = QtWidgets.QGroupBox("Merge existing runs")
+        merge_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        ml = QtWidgets.QVBoxLayout(merge_box)
+        ml.setSpacing(10)
+        ml.setContentsMargins(16, 16, 16, 16)
+
+        merge_help = QtWidgets.QLabel(
+            "Compare analyses already run by hand, without a batch: add their "
+            "output folders (button or drag &amp; drop) and merge them into the same "
+            "files a batch produces — <code>unique_consensus_filtered.fasta</code> "
+            "and, from the runs that had <b>Detect intra-sample sequence variants</b> "
+            "on, <code>unique_secondary_variants.fasta</code>. Adding a folder that "
+            "holds several runs (e.g. <code>output/</code>) adds every run inside it."
+        )
+        merge_help.setWordWrap(True)
+        merge_help.setTextFormat(QtCore.Qt.RichText)
+        ml.addWidget(make_collapsible(merge_help, "How merging works"))
+
+        self._merge_list = _RunFolderList()
+        self._merge_list.setMinimumHeight(130)
+        self._merge_list.foldersDropped.connect(self._add_merge_folders)
+        ml.addWidget(self._merge_list)
+
+        merge_row = QtWidgets.QHBoxLayout()
+        self._merge_add_btn = QtWidgets.QPushButton("Add run folder…")
+        self._merge_add_btn.setObjectName("secondary_btn")
+        self._merge_add_btn.setFixedHeight(self._BTN_H)
+        self._merge_add_btn.clicked.connect(self._on_merge_add_clicked)
+        merge_row.addWidget(self._merge_add_btn)
+        self._merge_remove_btn = QtWidgets.QPushButton("Remove selected")
+        self._merge_remove_btn.setObjectName("secondary_btn")
+        self._merge_remove_btn.setFixedHeight(self._BTN_H)
+        self._merge_remove_btn.clicked.connect(self._remove_merge_selected)
+        merge_row.addWidget(self._merge_remove_btn)
+        self._merge_clear_btn = QtWidgets.QPushButton("Clear")
+        self._merge_clear_btn.setObjectName("secondary_btn")
+        self._merge_clear_btn.setFixedHeight(self._BTN_H)
+        self._merge_clear_btn.clicked.connect(self._clear_merge)
+        merge_row.addWidget(self._merge_clear_btn)
+        merge_row.addStretch()
+        self._merge_btn = QtWidgets.QPushButton("Merge runs  →")
+        self._merge_btn.setObjectName("primary_btn")
+        self._merge_btn.setFixedHeight(self._BTN_H)
+        self._merge_btn.setEnabled(False)
+        self._merge_btn.clicked.connect(self._merge_existing_runs)
+        merge_row.addWidget(self._merge_btn)
+        ml.addLayout(merge_row)
+
+        self._layout.addWidget(merge_box)
         self._layout.addStretch()
 
         # ── Progress bars: overall (combinations) + current iteration (%) ──
@@ -311,6 +415,96 @@ class BatchSweepPanel(QtWidgets.QWidget):
         if self._cfg_path:
             self.sweepRequested.emit(self._cfg_path)
 
+    # ── Merge existing runs ───────────────────────────────────────────────
+
+    def _merge_folders(self) -> List[str]:
+        return [self._merge_list.item(i).data(QtCore.Qt.UserRole)
+                for i in range(self._merge_list.count())]
+
+    def _sync_merge_buttons(self):
+        self._merge_btn.setEnabled(self._merge_list.count() >= 2
+                                   and self._stop_btn.isHidden())   # no batch running
+
+    def _on_merge_add_clicked(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Add run folder (or a folder holding several runs)",
+            os.path.join(_get_base_dir(), "output"))
+        if path:
+            self._add_merge_folders([path])
+
+    def _add_merge_folders(self, paths: List[str]):
+        present = {os.path.normcase(os.path.abspath(p)) for p in self._merge_folders()}
+        not_runs = []
+        for path in paths:
+            found = _run_folders_in(path)
+            if not found:
+                not_runs.append(path)
+            for run in found:
+                key = os.path.normcase(os.path.abspath(run))
+                if key in present:
+                    continue
+                present.add(key)
+                has_var = count_fasta_records(
+                    os.path.join(run, "secondary_variants.fa")) > 0
+                item = QtWidgets.QListWidgetItem(
+                    os.path.basename(run) + ("   [variants]" if has_var else ""))
+                item.setData(QtCore.Qt.UserRole, run)
+                item.setToolTip(run)
+                self._merge_list.addItem(item)
+        if not_runs:
+            QtWidgets.QMessageBox.warning(
+                self, "Merge existing runs",
+                "No analysis output found (no consensus_filtered.fa) in:\n"
+                + "\n".join(not_runs))
+        self._sync_merge_buttons()
+
+    def _remove_merge_selected(self):
+        for item in self._merge_list.selectedItems():
+            self._merge_list.takeItem(self._merge_list.row(item))
+        self._sync_merge_buttons()
+
+    def _clear_merge(self):
+        self._merge_list.clear()
+        self._sync_merge_buttons()
+
+    def _merge_existing_runs(self):
+        folders = self._merge_folders()
+        if len(folders) < 2:
+            return
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        outdir = os.path.join(_get_base_dir(), "output", f"ont-barcoder_{ts}_merge")
+        # The folder path is the tag: two runs may share a folder name.
+        run_folders = [(f, f) for f in folders]
+        # secondary_variants.fa only exists (non-empty) when the run had
+        # 'Detect intra-sample sequence variants' on.
+        n_var = {f: count_fasta_records(os.path.join(f, "secondary_variants.fa"))
+                 for f in folders}
+        var_folders = [(f, f) for f in folders if n_var[f] > 0]
+        self._log.clear()
+        self._log.show()
+        self._open_folder_btn.hide()
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            n_filts = []
+            with open(os.path.join(outdir, "merge_run_summary.tsv"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("Run\tFolder\tN_consensus_filtered\tN_secondary_variants\n")
+                for i, f in enumerate(folders, start=1):
+                    n_filt = count_fasta_records(os.path.join(f, "consensus_filtered.fa"))
+                    n_filts.append(n_filt)
+                    fh.write(f"{i}\t{f}\t{n_filt}\t{n_var[f] or ''}\n")
+            summary = merge_runs(run_folders, outdir, var_folders)
+        except Exception as e:
+            self.append_log(f"ERROR: merge failed: {e}")
+            QtWidgets.QMessageBox.warning(self, "Merge existing runs", str(e))
+            return
+        summary.update({"n_filt_min": min(n_filts), "n_filt_max": max(n_filts)})
+        self._last_outdir = outdir
+        self._open_folder_btn.show()
+        self.append_log("\n".join(
+            [f"✓ Merged {len(folders)} existing run(s) -> {outdir}"]
+            + self._summary_lines(summary, "merge_run_summary.tsv")))
+
     def _open_output_folder(self):
         if self._last_outdir and os.path.isdir(self._last_outdir):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_outdir))
@@ -345,6 +539,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._start_btn.setEnabled(not running and bool(self._cfg_path))
         self._load_btn.setEnabled(not running)
         self._stop_btn.setVisible(running)
+        self._sync_merge_buttons()
         if running:
             self._log.clear()
             self._log.show()
@@ -380,12 +575,20 @@ class BatchSweepPanel(QtWidgets.QWidget):
             self._open_folder_btn.show()
 
         lines = [f"\n✓ Batch completed — {summary.get('n_runs', 0)} run(s)."]
+        lines += self._summary_lines(summary, "batch_run_summary.tsv")
+        self.append_log("\n".join(lines))
+
+    @staticmethod
+    def _summary_lines(summary: dict, run_summary_name: str) -> List[str]:
+        """Log lines for merge_runs() results — shared by the batch and by
+        'Merge existing runs'."""
+        lines = []
         if "n_filt_min" in summary:
             lo, hi = summary["n_filt_min"], summary["n_filt_max"]
             rng = f"{lo}" if lo == hi else f"{lo}–{hi}"
             lines.append(
                 f"  consensus_filtered.fa per run: {rng} barcode(s) — "
-                f"see batch_run_summary.tsv for the per-run parameters/count.")
+                f"see {run_summary_name} for the per-run count.")
         if "n_samples" in summary:
             lines.append(
                 f"  Deduplication across runs: {summary.get('n_samples', 0)} unique sample(s) "
@@ -394,7 +597,15 @@ class BatchSweepPanel(QtWidgets.QWidget):
                 f"sequences across runs -> {summary.get('n_sequences_written', 0)} sequence(s) "
                 f"written to unique_consensus_filtered.fasta "
                 f"(see batch_dedup_report.tsv for the per-sample breakdown).")
-        self.append_log("\n".join(lines))
+        if "variants" in summary:
+            v = summary["variants"]
+            lines.append(
+                f"  Secondary variants (raw + corrected) across runs: "
+                f"{v.get('n_samples', 0)} sample(s) with variants -> "
+                f"{v.get('n_sequences_written', 0)} distinct sequence(s) written to "
+                f"unique_secondary_variants.fasta "
+                f"(see batch_variants_dedup_report.tsv).")
+        return lines
 
     def on_error(self, msg: str):
         self.set_running(False)

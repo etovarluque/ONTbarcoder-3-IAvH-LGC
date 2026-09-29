@@ -62,6 +62,9 @@ def read_variants(path: str) -> Dict[str, List[float]]:
             if not line.startswith(">"):
                 continue
             fields = line[1:].strip().split(";")
+            # Count each variant once: skip the corrected copy of a raw record.
+            if "type=corrected" in fields:
+                continue
             sample = fields[0].rsplit("_var", 1)[0]
             div = float("nan")
             for f in fields[1:]:

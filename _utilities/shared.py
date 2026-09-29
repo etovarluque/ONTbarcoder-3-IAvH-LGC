@@ -478,6 +478,46 @@ def refresh_style(widget):
     widget.update()
 
 
+def make_collapsible(details: QtWidgets.QWidget, title: str = "How it works",
+                     expanded: bool = False) -> QtWidgets.QWidget:
+    """Collapsible help block: a '▸ title' link that shows/hides *details*.
+    Keeps long explanations out of the way while leaving them one click away.
+    Labels inside get readable contrast (TEXT_SEC) instead of hint gray."""
+    box = QtWidgets.QWidget()
+    lay = QtWidgets.QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    btn = QtWidgets.QToolButton()
+    btn.setCheckable(True)
+    btn.setChecked(expanded)
+    btn.setCursor(QtCore.Qt.PointingHandCursor)
+    btn.setStyleSheet(
+        f"QToolButton {{ border:none; background:transparent; color:{BLUE};"
+        f" font-size:16px; font-weight:500; padding:2px 0; }}"
+        f"QToolButton:hover {{ text-decoration: underline; }}")
+    frame = QtWidgets.QFrame()
+    frame.setStyleSheet(
+        f"QFrame#collapsibleBody {{ background:{WHITE}; border:1px solid {GRAY_LINE};"
+        f" border-radius:8px; }}")
+    frame.setObjectName("collapsibleBody")
+    fl = QtWidgets.QVBoxLayout(frame)
+    fl.setContentsMargins(12, 10, 12, 10)
+    fl.addWidget(details)
+    for lbl in [details] + details.findChildren(QtWidgets.QLabel):
+        if isinstance(lbl, QtWidgets.QLabel):
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:16px;")
+
+    def _sync(on):
+        btn.setText(("▾ " if on else "▸ ") + "ℹ " + title)
+        frame.setVisible(on)
+    btn.toggled.connect(_sync)
+    _sync(expanded)
+    lay.addWidget(btn, 0, QtCore.Qt.AlignLeft)
+    lay.addWidget(frame)
+    return box
+
+
 def _fmt_num(v):
     """Format a number compactly for axis labels: 1234567 -> '1.23M', 12345 -> '12.3K'."""
     if v >= 1_000_000:

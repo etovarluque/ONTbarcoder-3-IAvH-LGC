@@ -274,11 +274,17 @@ through the workflow panels in order:</p>
     <div class="d">Choose the mode and load the FASTQ + demultiplexing CSV.</div></div>
   <div class="step"><div class="n">PANEL 2</div><div class="t">Parameters</div>
     <div class="d">Configure lengths, mismatches, consensus and which phases to run.</div></div>
-  <div class="step"><div class="n">PANEL 3</div><div class="t">Progress</div>
+  <div class="step"><div class="n">PANEL 3</div><div class="t">Analysis</div>
     <div class="d">Live phase-by-phase progress, log, and barcode counters.</div></div>
   <div class="step"><div class="n">PANEL 4</div><div class="t">Results</div>
     <div class="d">Summary tables, output folders, and the Excel report.</div></div>
 </div>
+<p>The sidebar numbers these required steps (<b>1 Input files → 2 Parameters → 3 Analysis →
+4 Results</b>) and marks each completed one with a green <b>✓</b>. Steps that are not yet
+available are greyed out; hovering one explains why (load the FASTQ and the demultiplexing
+file first). <b>Parameter Batch</b> and <b>📈 RT Charts</b> are unnumbered: the first is
+optional and the second only appears in Real-Time mode. Utility panels with long
+explanations keep them in a collapsed <b>ℹ How it works</b> link, one click away.</p>
 
 <p>Internally the barcode-building pipeline runs in up to four phases:</p>
 <div class="phase-flow">
@@ -339,7 +345,10 @@ specimen</b>, with no header row. Columns:</p>
 When you load the CSV, the panel reports the detected number of specimens and primer
 pairs (computed as <code>(columns − 3) / 2</code>, after excluding a trailing genetic-code
 column if present). Use this to confirm the file parsed as expected. The file is read as
-UTF-8 (BOM tolerated).
+UTF-8 (with or without BOM, e.g. Excel's "CSV UTF-8"); ANSI files saved by Excel on Windows
+are read as cp1252, so names with accents or <i>ñ</i> are kept intact. Blank lines and
+spaces around values are ignored and tags are upper-cased. A row that has a sample name but
+fewer than three columns stops the analysis with a message giving its line number.
 </div>
 <div class="note">
 <b>Per-sample genetic code (mixed-code runs)</b>
@@ -419,6 +428,23 @@ and 2a run each cycle.
   <figcaption><b>Figure 4.</b> The <b>📈 RT Charts</b> panel: recovered barcodes plotted
   against reads/cycles during a live sequencing run.</figcaption>
 </figure>
+<p>Three buttons in the RT Charts header show or hide extra views; each button reads
+<i>Hide …</i> while its view is open and switches back when the view is closed, including
+with a floating window's <b>Close</b> button or its title-bar <b>X</b>:</p>
+<table>
+  <tr><th>Button</th><th>Shows</th></tr>
+  <tr><td><b>📊 Reads per sample</b></td>
+      <td>Floating window with the reads assigned to each sample, largest first.</td></tr>
+  <tr><td><b>⧉ Floating window</b></td>
+      <td>The two charts in a separate, resizable window.</td></tr>
+  <tr><td><b>📋 Coverage summary</b></td>
+      <td>Inline summary of every sample of the CSV in three groups, using the
+          <i>Minimum read coverage</i> of the run (e.g. with 5):
+          <b>samples with 0 reads</b> · <b>samples with 1–4 reads</b> ·
+          <b>samples with ≥ 5 reads</b>, each with its percentage. It gives an early idea
+          of how many barcodes the run can produce. Updated every cycle and reset to 0
+          when a new run starts.</td></tr>
+</table>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="params">6. Parameters reference</h2>
@@ -559,14 +585,15 @@ thumb, aim for at least <code>30 / fraction</code> reads per specimen: ~300 read
   <tr><th>Cap</th><th>Value</th><th>Effect</th></tr>
   <tr><td>Variants recovered per specimen</td><td>3</td>
       <td>Only the 3 most abundant secondary variants are re-processed (2a re-consensus +
-          Phase 3) into <code>secondary_variants_recovered.fa</code>. The rest are still
-          written in full to <code>secondary_variants.fa</code>, just uncorrected, and the
+          Phase 3) and added to <code>secondary_variants.fa</code> as <code>type=corrected</code>
+          records. The rest are still written there as <code>type=raw</code> only, and the
           count left out is reported in the <b>Variants beyond cap (not recovered)</b>
           column of the variants sheet.</td></tr>
   <tr><td>Ambiguities per secondary variant</td><td>&lt; 5 Ns</td>
       <td>A secondary consensus with 5 or more Ns is dropped from
           <code>secondary_variants.fa</code> and from recovery, to keep the file
-          informative.</td></tr>
+          informative. A corrected version that ends up with more than 10 Ns (deletions
+          are filled with N) is discarded; its <code>type=raw</code> record is kept.</td></tr>
   <tr><td>Linked polymorphic columns</td><td>≥ 2</td>
       <td>Single-SNP variants are never reported (anti-hotspot guard, above).</td></tr>
   <tr><td>Reads per cluster</td><td>≥ 3</td>
@@ -841,8 +868,6 @@ errors determines the output category (1–5, 6–10, 11–15, &gt;15 errors).</
       <td>per-category subfolders</td></tr>
   <tr><td>├── secondary_variants.fa</td>
       <td>minority haplotypes from mixed samples (if enabled, §6.1)</td></tr>
-  <tr><td>├── secondary_variants_recovered.fa</td>
-      <td>secondary variants recovered on a later pass</td></tr>
   <tr><td>├── runsummary.xlsx</td><td>full report (see §8.1)</td></tr>
   <tr><td class="dir">├── barcodesets/</td><td>intermediate consensus sets</td></tr>
   <tr><td class="dir">├── 2a_ConsensusByLength.zip</td><td></td></tr>
@@ -856,8 +881,10 @@ Only produced when <b>Detect intra-sample sequence variants</b> (§6.1) is enabl
 least one specimen is found to be mixed. Minority haplotypes are never silently discarded —
 they land here so they can be reviewed instead of contaminating the main barcode set. Each
 header carries the cluster's read fraction and its divergence from the dominant haplotype
-(<code>div=…%</code>). A companion <code>secondary_variants_recovered.fa</code> holds the
-same variants after error correction.
+(<code>div=…%</code>). Each variant is written as-is (<code>type=raw</code>) and, when
+phase-3 recovery corrected it, followed by its corrected version (<code>type=corrected</code>,
+with <code>coverage</code>, <code>fixed_indels</code> and <code>Ns</code>) under the same
+<code>{sample}_var{i}</code> name, so both can be compared and either one rescued.
 </div>
 
 <h4>Output categories explained</h4>
@@ -882,7 +909,9 @@ same variants after error correction.
 <p>A multi-sheet Excel report is generated at the run root:</p>
 <table>
   <tr><th>Sheet</th><th>Contents</th></tr>
-  <tr><td><b>1. Demultiplexing</b></td><td>Reads per specimen after demultiplexing.</td></tr>
+  <tr><td><b>1. Demultiplexing</b></td><td>Reads per specimen after demultiplexing — every
+      specimen of the CSV, including those with 0 reads or below <i>Minimum read
+      coverage</i> (their barcode columns in sheets 2a/2b show <code>NA</code>).</td></tr>
   <tr><td><b>2a Consensus by length</b></td>
       <td>Per-specimen length, barcode and translation/length check from Phase 2a.</td></tr>
   <tr><td><b>2b Consensus by similarity</b></td>
@@ -891,9 +920,13 @@ same variants after error correction.
       <td>Final per-specimen barcode, stage, type (e.g. "removed N indels"), length,
           ambiguities and validation flag.</td></tr>
   <tr><td><b>Sample QC status</b></td>
-      <td>One row per demultiplexed specimen: reads demultiplexed, whether a barcode was
+      <td>One row per specimen of the CSV: reads demultiplexed, whether a barcode was
           produced, a color-coded status (green/amber/red), length, number of Ns and
-          number of indels. A quick per-sample health check across the whole run.</td></tr>
+          number of indels. Status values: <i>QC-compliant</i>, <i>Filtered (within
+          accepted errors)</i>, <i>Exceeds accepted errors</i>, <i>No barcode
+          (unresolved)</i>, <i>Below minimum read coverage (&lt;N)</i> and <i>No reads
+          (not demultiplexed)</i>. A quick per-sample health check across the whole run,
+          also written when a Real-Time run is stopped by the user.</td></tr>
   <tr><td><b>Intra-sample variants</b></td>
       <td>Only present when <b>Detect intra-sample sequence variants</b> (§6.1) is
           enabled and finds mixed samples. Per haplotype cluster: sample, read count,
@@ -903,8 +936,14 @@ same variants after error correction.
           plus samples flagged "needs review" or with more variants than the recovery cap,
           and advisory rows for samples with a bimodal read-length distribution.</td></tr>
   <tr><td><b>Final results / RT Timeline</b></td>
-      <td>In real-time runs: summary and a timeline of recovered barcodes per cycle.</td></tr>
+      <td>Run metrics — <i>Total samples</i> (every specimen of the CSV), <i>Samples with
+          ≥ N reads</i> (N = the run's <i>Minimum read coverage</i>), barcode counts and
+          total time (e.g. <code>3 h 43 min 1 s</code>) — and, in real-time runs, a
+          timeline of recovered barcodes per cycle.</td></tr>
 </table>
+<p>The HTML report (<code>report.html</code>) summarizes the same run; its <b>Breakdown by
+coverage — Phase 2a</b> table counts every barcode resolved at each coverage level,
+accumulated over all Real-Time cycles.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="profiles">9. Parameter profiles</h2>
@@ -937,8 +976,9 @@ against a curated reference.</p>
   <tr><th>State</th><th>Meaning</th></tr>
   <tr><td><b>Identical</b></td><td>Character-for-character equal.</td></tr>
   <tr><td><b>Compatible (IUPAC)</b></td>
-      <td>Equal once IUPAC ambiguity codes are treated as matches; the count of ambiguous
-          positions is reported.</td></tr>
+      <td>Equal once IUPAC ambiguity codes are treated as matches — against a base or
+          against another code sharing a base (e.g. <code>N</code>/<code>R</code>,
+          <code>R</code>/<code>D</code>); the count of ambiguous positions is reported.</td></tr>
   <tr><td><b>Different</b></td><td>Incompatible; the edit distance is reported.</td></tr>
   <tr><td><b>Only in reference</b></td>
       <td>(Versus-a-reference mode.) The ID exists in the reference file but in none of
@@ -952,7 +992,14 @@ colour-coded <code>summary.xlsx</code> plus per-category FASTA files
 (<code>identical.fa</code>, <code>compatible_iupac.fa</code>, <code>different.fa</code>,
 <code>only_in_reference.fa</code>, <code>without_reference.fa</code>,
 <code>best_barcodes.fa</code>). When sequences differ, the "best" barcode is chosen by
-fewest ambiguities → fewest gaps → highest coverage.</p>
+fewest ambiguities → fewest gaps → highest coverage. Ambiguities and length are taken from
+the header (<code>ambs=</code>, second field); when a header lacks them — e.g. phase-2a
+<code>consensus_N_barcodes.fa</code> files or FASTA from other tools — they are counted in
+the sequence itself. If an output cannot be written (typically <code>summary.xlsx</code>
+open in Excel), a warning lists the affected files; close them and run the comparison
+again.</p>
+<p>Load the files first: the <b>Sample ID extraction</b> settings sit below the file area
+and preview the ID extracted from a real header of the loaded files.</p>
 
 <h4>Reading the summary with many files</h4>
 <p>With more than two or three files, a full file path in every column header — and every
@@ -1047,20 +1094,42 @@ processing</b> to treat them as a single dataset, or process each file individua
 </table>
 
 <h2 id="util-fastq">12. Utility — FASTQ Inspector</h2>
-<p>Drag a FASTQ file (<code>.fastq</code> or <code>.fastq.gz</code>) to get a full
-descriptive quality report. <b>All reads are analysed</b>; only the scatter plot uses a
-random sample of 10,000 points for responsiveness.</p>
+<p>Drag one or several FASTQ files, or a whole folder, to get a full descriptive quality
+report (<code>.fastq</code>, <code>.fq</code>, <code>.fastq.gz</code>, <code>.fq.gz</code>;
+<b>Browse files…</b> allows multiple selection and <b>Browse folder…</b> picks a folder).
+Folders are searched recursively, so an ONT <code>fastq_pass/</code> with its
+<code>barcode01/</code>, <code>barcode02/</code>… sub-folders can be dropped as is; all
+files are analysed together. <b>All reads are analysed</b>; only the scatter plot uses a
+random sample of 10,000 points for responsiveness. Once the input is chosen it collapses to
+a single row (<b>Change…</b> to pick another), the progress bar shows the percentage of
+input read (also for gzip), and <b>Stop</b> cancels the analysis while keeping the input
+loaded.</p>
 
 <figure class="">
   <img src="images/util-fastq.png" alt="FASTQ Inspector utility">
   <figcaption><b>Figure 9.</b> The FASTQ Inspector utility with its descriptive statistics
   and histograms.</figcaption>
 </figure>
-<p>Reported metrics include: read count, total bases, mean / median / min / max length,
-N50, length distribution buckets (&lt;500, 500–2k, &gt;2k bp), mean quality and the
-fraction of reads at Q≥10/15/20, mean and standard deviation of GC%, and histograms for
-length, quality and GC. Large uncompressed files are processed in parallel across CPU
-cores; gzip files are streamed sequentially.</p>
+<p>Reported metrics include: read count, total bases, input size and number of files,
+mean / median / min / max length, N50, length distribution buckets (&lt;500, 500–1000,
+&gt;1000 bp), mean quality, the fraction of reads at Q≥10/15/20 and the fraction of
+<b>bases</b> carried by those reads (the usable yield an equivalent quality filter would
+keep), mean and standard deviation of GC%, and histograms for length, quality and GC.
+Large uncompressed files are processed in parallel across CPU cores; gzip files are
+streamed sequentially.</p>
+<div class="note">
+<b>How the per-read Q is computed</b>
+Each read's quality is <code>−10·log10(mean error probability)</code> of its bases — the ONT
+convention, and exactly how the analysis <i>Minimum mean read quality</i> filter (§6.1)
+scores reads. So the Q≥N percentages predict what that filter keeps. It is lower than the
+plain average of the Phred values, which barely moves when a few bases are very poor.
+</div>
+<h4>Breakdown by group</h4>
+<p>When the input holds two or more groups, a sortable table lists per group: files,
+reads, % of reads, bases, mean length, mean Q and reads Q≥10. Groups are the first-level
+sub-folders of a dropped folder (files directly inside it form a <i>(folder root)</i>
+group), or each dropped file/folder when several are dropped together. It shows at a
+glance which barcode under-performed. The PDF export includes the same table.</p>
 
 <h2 id="util-blast">13. Utility — BLAST</h2>
 <p>The BLAST utility has two tabs, for the two ways of getting NCBI hits into ONTbarcoder:
@@ -1099,7 +1168,9 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
   <li>Sequences that were queried but returned <b>no hit</b> are collected in
       <code>nohit_seqs_&lt;ts&gt;.fa</code>, ready to be re-run against another database.
       Sequences of batches that failed or were never processed go instead to
-      <code>missing_seqs_&lt;ts&gt;.fa</code>. Both counts, and the names of the
+      <code>missing_seqs_&lt;ts&gt;.fa</code> — including a batch whose search finished
+      but whose results could not be downloaded (the log gives its RID), so a network
+      failure is never reported as "no hit". Both counts, and the names of the
       no-match queries, are recorded in <code>blast_run_log_&lt;ts&gt;.txt</code>.</li>
 </ul>
 <h4>Batch size &mdash; Automatic and Manual</h4>
@@ -1167,6 +1238,8 @@ The FASTA and the results table share the same base name on purpose
 (<code>blast-20260908-210439.fa</code> + <code>.xlsx</code>), which is how
 <a href="#util-best">§14</a> pairs a run's sequences with its BLAST table. Running BLAST on
 each parameter set therefore leaves the input for that utility ready, with no renaming.
+When a search finishes, the <b>Open in Best Sequence →</b> button loads that FASTA and its
+table as a pair in §14 and switches to it.
 Remember that &sect;14 additionally requires the <code>Query_*</code> taxonomy columns — tick
 the reference-file option below (§13.3) and this tab writes them into the table itself, so it
 already satisfies that requirement by the time it reaches Best Sequence.
@@ -1176,6 +1249,7 @@ already satisfies that requirement by the time it reaches Best Sequence.
 The panel requires a personal NCBI API key before it will submit queries (registered free
 at NCBI); it is saved automatically once entered so you only need to set it up once per
 machine — <b>BLAST web results</b> (§13.2) reuses the same key for its own taxonomy lookups.
+The key is masked on screen; <b>Show</b> / <b>Hide</b> next to the field toggles it.
 </div>
 <div class="warn">
 <b>Network &amp; usage policy</b>
@@ -1380,7 +1454,11 @@ at all is still handled.</p>
 <h3>14.2 How the best sequence is chosen</h3>
 <p>Sequences are grouped by <b>sample ID</b>: the text before the first <code>;</code> in
 the header, minus the suffix configured in the panel (<code>_all.fa</code> by default), so
-<code>DNS-1343_all.fa;758;807;ambs=0;estgaps=0</code> → <code>DNS-1343</code>.</p>
+<code>DNS-1343_all.fa;758;807;ambs=0;estgaps=0</code> → <code>DNS-1343</code>. Length,
+reads, ambiguities and indels are read from the header; when a header has no
+<code>ambs=</code> field (e.g. phase-2a consensus files) the ambiguities are counted in the
+sequence, so the ambiguity penalty still applies. A header containing spaces is also
+matched in the <code>_</code> form the BLAST utility submits it with.</p>
 <p>With a single run each sample has one candidate, so the steps below do not apply: the
 sequence is kept as it is and only its taxonomic level is computed. The scoring matters
 only when there is more than one candidate to compare.</p>
@@ -1557,6 +1635,15 @@ situation from BLAST returning nothing.</p>
   <tr><td><code>near_tie</code></td>
       <td>The runner-up scored within 1 point — the winner is defensible but marginal.</td>
       <td>Compare the two runs by hand if the sample matters.</td></tr>
+  <tr><td><code>secondary_variant_selected</code></td>
+      <td>A secondary variant (<code>{sample}_var{i}</code>, from
+          <code>secondary_variants.fa</code> / <code>unique_secondary_variants.fasta</code>)
+          beat the sample's barcode — typically the dominant haplotype was a contaminant.
+          Variants are grouped with their host sample and scored with their
+          <code>len</code>, <code>coverage</code>, <code>Ns</code> and
+          <code>fixed_indels</code> fields.</td>
+      <td>Check the BLAST hit; add the variants FASTA (with its BLAST table) as one more
+          pair to let them compete.</td></tr>
   <tr><td><code>missing_in_N_run(s)</code></td>
       <td>The sample was not recovered in <i>N</i> of the runs supplied.</td>
       <td>Fewer candidates were available to compare.</td></tr>
@@ -1820,6 +1907,10 @@ three files, and keeps things readable even for a sweep of 40+ combinations:</p>
       in every run that produced it appears <b>once</b>, header untouched. A sample with
       different sequences across runs gets <b>one entry per distinct variant</b>, header
       suffixed with the run number that produced it (<code>;run3</code>).</li>
+  <li><code>unique_secondary_variants.fasta</code> — only for runs with <b>Detect
+      intra-sample sequence variants</b> enabled: the <code>secondary_variants.fa</code>
+      (raw + corrected) of those runs merged the same way, grouping every variant of a host
+      sample together. Per-sample breakdown in <code>batch_variants_dedup_report.tsv</code>.</li>
   <li><code>batch_dedup_report.tsv</code> — one row per sample: <code>N_variants</code>
       (how many distinct sequences it had across the sweep), <code>N_runs_present</code> /
       <code>N_runs_total</code> (e.g. <code>18</code> and <code>40</code>, as two plain
@@ -1832,6 +1923,14 @@ three files, and keeps things readable even for a sweep of 40+ combinations:</p>
       date when the <code>.tsv</code> is opened directly. Cross-reference a run number
       against <code>batch_run_summary.tsv</code> for its parameters.</li>
 </ul>
+<p><b>Merge existing runs.</b> The same merge also works on analyses run by hand, without a
+batch: in the <b>Merge existing runs</b> box of the Parameter Batch panel, add two or more
+run folders (button or drag &amp; drop; a folder holding several runs, such as
+<code>output/</code>, adds every run inside it) and click <b>Merge runs</b>. The results go to
+a new <code>output/ont-barcoder_&lt;timestamp&gt;_merge</code> folder, with
+<code>merge_run_summary.tsv</code> numbering the runs as the <code>;run&lt;N&gt;</code> tags do.
+Runs marked <code>[variants]</code> (a non-empty <code>secondary_variants.fa</code>) also feed
+<code>unique_secondary_variants.fasta</code>.</p>
 <p>BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
 stay manual steps, run afterwards on that merged FASTA — remote BLAST is rate-limited
 and can queue for 10–40&nbsp;minutes per batch, which makes it impractical to run once
@@ -1945,6 +2044,14 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
           to 5%, and make sure the <i>Coverage list</i> reaches high enough values
           (a cluster also needs ≥ 3 reads in absolute terms). See
           <a href="#manyvariants">§6.1 — many-variant specimens</a>.</td></tr>
+  <tr><td>"The analysis stopped because of an error"</td>
+      <td>A background step of the pipeline failed (e.g. a file locked by an antivirus or
+          OneDrive, or a malformed input). The error is shown in red in the log, the run is
+          stopped cleanly and partial results are saved; the full traceback goes to
+          <code>ONTbarcoder_crash.log</code> in your home folder.</td></tr>
+  <tr><td>Demultiplexing file: "line N … needs at least 3 columns"</td>
+      <td>That row has a sample name but is missing its tags. Fix or delete the row in the
+          CSV. See <a href="#inputs">§4.2</a>.</td></tr>
   <tr><td>Application crashes</td>
       <td>A crash log is written to <code>ONTbarcoder_crash.log</code> in your home folder
           (<code>%USERPROFILE%</code>). Include it when reporting issues.</td></tr>

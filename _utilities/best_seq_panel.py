@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import re
 import csv
 import time
 import datetime
@@ -75,10 +76,21 @@ def read_tax_reference(path: str):
 # Module-level so both Best Sequence and the BLAST panel can apply a reference
 # file to a table without duplicating the matching/writing logic.
 
+# Secondary-variant records (secondary_variants.fa / unique_secondary_variants
+# .fasta) are named "{sample}_var{i}": the suffix is removed so a variant
+# competes with — and takes the taxonomy of — its host sample.
+_VARIANT_SUFFIX = re.compile(r"_var\d+$")
+
+
+def is_variant_header(header) -> bool:
+    return bool(_VARIANT_SUFFIX.search(str(header).split(";", 1)[0].strip()))
+
+
 def sample_id_of(query_name, strip_suffix: str = "") -> str:
     """Sample ID of a BLAST Query_name: the text before the first ';',
-    with the configured suffix removed if present."""
-    sample = str(query_name).split(";", 1)[0].strip()
+    without a secondary-variant '_var{i}' suffix, and with the configured
+    suffix removed if present."""
+    sample = _VARIANT_SUFFIX.sub("", str(query_name).split(";", 1)[0].strip())
     if strip_suffix and sample.endswith(strip_suffix):
         sample = sample[:-len(strip_suffix)]
     return sample
@@ -961,8 +973,14 @@ class BestSeqPanel(QtWidgets.QWidget):
             color=TEXT_SEC
         )
         self._lbl_desc.setWordWrap(True)
+        self._lbl_summary_line = make_label(
+            "Pair each FASTA with its BLAST table (same base name) to pick the best "
+            "sequence per sample, or to classify a single run by taxonomic match.",
+            color=TEXT_SEC)
+        self._lbl_summary_line.setWordWrap(True)
         self._layout.addWidget(self._lbl_title)
-        self._layout.addWidget(self._lbl_desc)
+        self._layout.addWidget(self._lbl_summary_line)
+        self._layout.addWidget(make_collapsible(self._lbl_desc))
 
         self._lbl_req = QtWidgets.QLabel(
             "<table cellspacing='0' cellpadding='0'><tr>"
@@ -1046,7 +1064,7 @@ class BestSeqPanel(QtWidgets.QWidget):
             "The weights are fixed: taxonomic concordance always outranks raw score.",
             size=15, color=TEXT_HINT)
         self._lbl_rule.setWordWrap(True)
-        self._layout.addWidget(self._lbl_rule)
+        self._layout.addWidget(make_collapsible(self._lbl_rule, "How the score works"))
 
         # ── Drop zone ──
         self._drop = _PairDropZone()
@@ -1421,6 +1439,10 @@ class _BestSeqWorker(QtCore.QThread):
 
     TAX_BONUS = {"organism": 400, "genus": 300, "family": 200, "order": 100, "none": 0}
 
+    # Secondary-variant header fields -> the metrics used for scoring.
+    _VARIANT_KEYS = {"len": "length", "coverage": "reads",
+                     "ns": "ambs", "fixed_indels": "estgaps"}
+
     # Report layout: 4 colour zones (identity · sequence metrics · BLAST · decision)
     _COLUMNS = [
         # zone 1 - which sequence was kept
@@ -1479,18 +1501,20 @@ class _BestSeqWorker(QtCore.QThread):
         return seqs
 
     def _parse_header(self, header: str) -> dict:
-        """DNS-1343_all.fa;758;807;ambs=0;estgaps=0 -> sample id + metrics."""
+        """DNS-1343_all.fa;758;807;ambs=0;estgaps=0 -> sample id + metrics.
+        Secondary variants (DNS-1343_var1;type=corrected;len=..;coverage=..;
+        fixed_indels=..;Ns=..) map to their host sample and the same metrics."""
         parts = header.split(";")
-        sample = parts[0].strip()
-        suffix = self.cfg.get("strip_suffix", "")
-        if suffix and sample.endswith(suffix):
-            sample = sample[:-len(suffix)]
+        sample = sample_id_of(header, self.cfg.get("strip_suffix", ""))
+        # ambs stays None when the header has no 'ambs='/'Ns=' field; the
+        # caller then counts the ambiguities in the sequence itself.
         info = {"sample": sample, "length": None, "reads": None,
-                "ambs": 0, "estgaps": 0}
+                "ambs": None, "estgaps": 0}
         for i, part in enumerate(parts[1:], start=1):
             if "=" in part:
                 key, value = part.split("=", 1)
                 key = key.strip().lower()
+                key = self._VARIANT_KEYS.get(key, key)
                 if key in info:
                     try:
                         info[key] = int(float(value))
@@ -1868,12 +1892,21 @@ class _BestSeqWorker(QtCore.QThread):
             total_seqs += len(seqs)
             for header, seq in seqs.items():
                 info = self._parse_header(header)
-                hits = blast.get(header, [])
-                qtax = query_tax.get(header, _EMPTY_TAX)
+                if info["ambs"] is None:
+                    info["ambs"] = sum(1 for c in seq.upper() if c not in "ACGT-")
+                if info["length"] is None:
+                    info["length"] = len(seq)
+                # The BLAST panel submits headers with spaces replaced by '_',
+                # so a header with spaces is looked up in that form too.
+                qkey = header
+                if qkey not in raw_counts and " " in header:
+                    qkey = header.replace(" ", "_")
+                hits = blast.get(qkey, [])
+                qtax = query_tax.get(qkey, _EMPTY_TAX)
                 best_hit, level = self._evaluate(hits, qtax)
                 candidates.setdefault(info["sample"], []).append({
                     "file": label, "header": header, "seq": seq, "info": info,
-                    "n_hits": len(hits), "n_hits_raw": raw_counts.get(header, 0),
+                    "n_hits": len(hits), "n_hits_raw": raw_counts.get(qkey, 0),
                     "qtax": qtax, "best_hit": best_hit, "level": level,
                 })
             self.progressUpdated.emit(i + 1, n_files + max(len(candidates), 1))
@@ -1941,8 +1974,11 @@ class _BestSeqWorker(QtCore.QThread):
                 best      = cands[0]
                 runner_up = cands[1] if len(cands) > 1 else None
 
-                in_all_files = len(cands) == n_files
-                if n_files == 1:
+                # A sample can have several candidates per file (its barcode
+                # plus its secondary variants), so presence counts files.
+                n_cand_files = len({c["file"] for c in cands})
+                in_all_files = n_cand_files == n_files
+                if len(cands) == 1 and n_files == 1:
                     # Nothing to compare: the run is being classified by its
                     # taxonomic match, not chosen against other runs.
                     decision = "single_run"
@@ -1973,7 +2009,11 @@ class _BestSeqWorker(QtCore.QThread):
                         and abs(best["score"] - runner_up["score"]) < 1.0):
                     flags.append("near_tie")
                 if not in_all_files and n_files > 1:
-                    flags.append("missing_in_%d_run(s)" % (n_files - len(cands)))
+                    flags.append("missing_in_%d_run(s)" % (n_files - n_cand_files))
+                if is_variant_header(best["header"]):
+                    # The secondary variant beat the barcode (e.g. the dominant
+                    # haplotype was a contaminant): worth a manual look.
+                    flags.append("secondary_variant_selected")
                 if best["info"]["ambs"]:
                     flags.append("ambs=%d" % best["info"]["ambs"])
                 for f in flags:

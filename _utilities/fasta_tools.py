@@ -1013,6 +1013,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         outer.addWidget(footer)
 
         self._worker: Optional[_FastaToolsWorker] = None
+        # Workers stopped by Clear that were still busy: referenced here so
+        # Python does not destroy a running QThread (which aborts the app).
+        self._retired_workers: list = []
         self._files: list = []
         self._last_outputs: list = []
 
@@ -1304,7 +1307,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
                 except RuntimeError:
                     pass
             self._worker.stop()
-            self._worker.wait(500)
+            if not self._worker.wait(500):
+                self._retired_workers.append(self._worker)
+            self._worker = None
 
         self._drop.clear()
         self._files = []
@@ -1481,6 +1486,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._log_edit.clear()
         self._log_edit.show()
 
+        self._retired_workers = [w for w in self._retired_workers if w.isRunning()]
         self._worker = _FastaToolsWorker(self._files, operation, params, out_dir)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_line.connect(self._on_log_line)

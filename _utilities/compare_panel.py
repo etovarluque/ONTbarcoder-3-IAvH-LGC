@@ -334,8 +334,23 @@ class ComparePanel(QtWidgets.QWidget):
             color=TEXT_SEC
         )
         self._lbl_compare_desc.setWordWrap(True)
+        self._lbl_summary_line = make_label(
+            "Compare the barcodes of the same samples across runs: identical, "
+            "IUPAC-compatible, different or unique.", color=TEXT_SEC)
+        self._lbl_summary_line.setWordWrap(True)
         self._layout.addWidget(self._lbl_compare_title)
-        self._layout.addWidget(self._lbl_compare_desc)
+        self._layout.addWidget(self._lbl_summary_line)
+        self._layout.addWidget(make_collapsible(self._lbl_compare_desc))
+
+        # ── File area first: the ID settings below preview a real header ──
+        self._drop = MultiDropZone()
+        self._drop.filesDropped.connect(self._on_files)
+        self._layout.addWidget(self._drop)
+
+        self._lbl_id_section = make_label(
+            "Sample ID extraction — check the preview once files are loaded",
+            size=17, bold=True, color=TEXT_PRI)
+        self._layout.addWidget(self._lbl_id_section)
 
         # ── ID extraction block ─────────────────────────────────────────────
         id_block = QtWidgets.QFrame()
@@ -579,11 +594,6 @@ class ComparePanel(QtWidgets.QWidget):
         self._layout.addWidget(outdir_row)
         outdir_row.hide()          # The folder is chosen in the dialog at startup
         self._custom_outdir = ""   # empty = use automatic default
-
-        # ── File area ──
-        self._drop = MultiDropZone()
-        self._drop.filesDropped.connect(self._on_files)
-        self._layout.addWidget(self._drop)
 
         # ── Progress bar ──
         self._comp_bar = QtWidgets.QProgressBar()
@@ -840,6 +850,15 @@ class ComparePanel(QtWidgets.QWidget):
         self._comp_bar.setValue(n)
 
     @QtCore.pyqtSlot(list, list, list)
+    def show_write_errors(self, errors: list):
+        """Output files that could not be written (e.g. summary.xlsx open in Excel)."""
+        QtWidgets.QMessageBox.warning(
+            self, "Compare — files not saved",
+            "Some output files could not be written:\n\n"
+            + "\n".join(f"• {e}" for e in errors)
+            + "\n\nIf a file is open in another program (e.g. Excel), "
+              "close it and run the comparison again.")
+
     def show_results(self, rows, headers, runs_info=None):
         self._comp_bar.hide()
         self._comp_bar.setValue(0)
@@ -972,16 +991,12 @@ _IUPAC: Dict[str, set] = {
     'N': {'A', 'C', 'G', 'T'},
 }
 
-# IUPAC equalities list for edlib (same as original code)
+# IUPAC equalities for edlib: every pair of distinct codes whose base sets
+# overlap, so ambiguity-vs-ambiguity (e.g. N/R, R/D) is also compatible,
+# not only ambiguity-vs-base.
 _EDLIB_AMBIGUITY = [
-    ("R", "A"), ("R", "G"), ("M", "A"), ("M", "C"),
-    ("S", "C"), ("S", "G"), ("Y", "C"), ("Y", "T"),
-    ("K", "G"), ("K", "T"), ("W", "A"), ("W", "T"),
-    ("V", "A"), ("V", "C"), ("V", "G"),
-    ("H", "A"), ("H", "C"), ("H", "T"),
-    ("D", "A"), ("D", "G"), ("D", "T"),
-    ("B", "C"), ("B", "G"), ("B", "T"),
-    ("N", "A"), ("N", "G"), ("N", "C"), ("N", "T"),
+    (a, b) for a, b in itertools.combinations(sorted(_IUPAC), 2)
+    if _IUPAC[a] & _IUPAC[b]
 ]
 
 _REVCOMP_TABLE = str.maketrans("ACGTRYSWKMBDHVNacgtryswkmbdhvn",
@@ -1139,7 +1154,10 @@ def _parse_fasta_header(header_line: str, cfg=None) -> Tuple[str, int, int, int,
         coverage = int(parts[2]) if len(parts) > 2 else 0
     except ValueError:
         coverage = 0
-    ambs = gaps = 0
+    # ambs stays None when the header has no 'ambs=' field (e.g. phase-2a
+    # consensus files or other tools); the caller then counts it in the sequence.
+    ambs = None
+    gaps = 0
     for p in parts[3:]:
         if p.startswith("ambs="):
             try:
@@ -1396,6 +1414,10 @@ def _parse_fasta_file(path: str, cfg=None) -> Dict[str, Tuple[str, int, int, int
             while j < len(lines) and not lines[j].strip().startswith(">"):
                 seq += lines[j].strip().upper()
                 j += 1
+            if ambs is None:
+                ambs = sum(1 for c in seq if c not in "ACGT-")
+            if not length:
+                length = len(seq)
             cand = (seq, length, cov, ambs, gaps)
             if sid not in result:
                 result[sid] = cand
@@ -1422,8 +1444,9 @@ def _align_pair(seq1: str, seq2: str):
     NW ensures that the difference in length is reflected in the distance,
     which is correct for both Coding (same length) and non-Coding (variable length).
     """
-    d_noamb = edlib.align(seq1, seq2, mode='NW', task='path')['editDistance']
-    d_amb   = edlib.align(seq1, seq2, mode='NW', task='path',
+    # Only the distance is used: task='distance' skips the traceback.
+    d_noamb = edlib.align(seq1, seq2, mode='NW', task='distance')['editDistance']
+    d_amb   = edlib.align(seq1, seq2, mode='NW', task='distance',
                           additionalEqualities=_EDLIB_AMBIGUITY)['editDistance']
     return d_noamb, d_amb
 
@@ -1505,16 +1528,17 @@ _COLOR_MAP_HEX = {
 }
 
 
-def _write_fasta(path: str, entries: List[Tuple[str, str]]) -> None:
-    """Write pairs (header, seq) to a FASTA file."""
+def _write_fasta(path: str, entries: List[Tuple[str, str]]) -> str:
+    """Write pairs (header, seq) to a FASTA file. Returns '' or the error."""
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             for hdr, seq in entries:
                 if seq:
                     f.write(f">{hdr}\n{seq}\n")
-    except Exception:
-        pass
+        return ""
+    except Exception as exc:
+        return f"{os.path.basename(path)}: {exc}"
 
 
 def _write_outputs(
@@ -1525,9 +1549,9 @@ def _write_outputs(
     ref_bn: Optional[str],
     seqs_store: Dict[str, Dict[str, Tuple[str, int, int, int, int]]],
     runs_info: Optional[List[dict]] = None,
-) -> None:
+) -> List[str]:
     """
-    Generate all output files:
+    Generate all output files and return the write errors (empty if none):
       • summary.xlsx (with colors)
       • best_barcodes.fa
       • identical.fa
@@ -1538,6 +1562,7 @@ def _write_outputs(
       • unique_<basename>.fa (one per file)
     """
     os.makedirs(outdir, exist_ok=True)
+    errors: List[str] = []
 
     # ── XLSX ────────────────────────────────────────────────────────────────
 
@@ -1681,7 +1706,8 @@ def _write_outputs(
 
         wb.close()
     except Exception as exc:
-        print(f"[XLSX] Writing error: {exc}")
+        # Typically summary.xlsx open in Excel (PermissionError)
+        errors.append(f"summary.xlsx: {exc}")
 
     # ── Helpers ─────────────────────────────────────────────────────────────
     def get_seq(bn: str, sid: str):
@@ -1757,21 +1783,22 @@ def _write_outputs(
                 unique_entries[src_bn].append((sid, r[0]))
 
     # ── Write FASTAs ─────────────────────────── ───────────────────────────
-    _write_fasta(os.path.join(outdir, "best_barcodes.fa"), best_entries)
-    if identical_entries:
-        _write_fasta(os.path.join(outdir, "identical.fa"), identical_entries)
-    if compat_entries:
-        _write_fasta(os.path.join(outdir, "compatible_iupac.fa"), compat_entries)
-    if diff_entries:
-        _write_fasta(os.path.join(outdir, "different.fa"), diff_entries)
-    if only_ref_entries:
-        _write_fasta(os.path.join(outdir, "only_in_reference.fa"), only_ref_entries)
-    if no_ref_entries:
-        _write_fasta(os.path.join(outdir, "without_reference.fa"), no_ref_entries)
+    fasta_jobs = [("best_barcodes.fa", best_entries),
+                  ("identical.fa", identical_entries),
+                  ("compatible_iupac.fa", compat_entries),
+                  ("different.fa", diff_entries),
+                  ("only_in_reference.fa", only_ref_entries),
+                  ("without_reference.fa", no_ref_entries)]
     for bn, entries in unique_entries.items():
-        if entries:
-            safe = bn.replace("/", "_").replace("\\", "_")
-            _write_fasta(os.path.join(outdir, f"unique_{safe}.fa"), entries)
+        safe = bn.replace("/", "_").replace("\\", "_")
+        fasta_jobs.append((f"unique_{safe}.fa", entries))
+    for i, (name, entries) in enumerate(fasta_jobs):
+        # best_barcodes.fa is always written; the rest only when non-empty
+        if i == 0 or entries:
+            err = _write_fasta(os.path.join(outdir, name), entries)
+            if err:
+                errors.append(err)
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -1786,6 +1813,7 @@ class _CompareWorker(QtCore.QThread):
     """
     notifyProgress = QtCore.pyqtSignal(int)
     taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
+    writeErrors    = QtCore.pyqtSignal(list)               # output files not written
 
     def __init__(self, file_list: List[str], outdir: str, extract_cfg=None,
                  parent=None):
@@ -1959,13 +1987,15 @@ class _CompareWorker(QtCore.QThread):
         headers.append("Note")
 
         # Outputs
-        _write_outputs(
+        write_errors = _write_outputs(
             rows, headers, self.outdir,
             all_bns=basenames,
             ref_bn=None, seqs_store=seqs,
             runs_info=runs_info,
         )
 
+        if write_errors:
+            self.writeErrors.emit(write_errors)
         self.taskFinished.emit(rows, headers, runs_info)
 
 
@@ -1983,6 +2013,7 @@ class _PairCompareWorker(QtCore.QThread):
     """
     notifyProgress = QtCore.pyqtSignal(int)
     taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
+    writeErrors    = QtCore.pyqtSignal(list)               # output files not written
 
     def __init__(self, file_list: List[str], ref_path: str,
                  outdir: str, extract_cfg=None, parent=None):
@@ -2221,11 +2252,13 @@ class _PairCompareWorker(QtCore.QThread):
         headers.append("Note")
 
         # Outputs
-        _write_outputs(
+        write_errors = _write_outputs(
             rows, headers, self.outdir,
             all_bns=[ref_bn] + list(comp_bns),
             ref_bn=ref_bn, seqs_store=seqs,
             runs_info=runs_info,
         )
 
+        if write_errors:
+            self.writeErrors.emit(write_errors)
         self.taskFinished.emit(rows, headers, runs_info)

@@ -229,7 +229,7 @@ from _utilities.bold_formatter import BoldFormatterPanel
 from _utilities.notes_panel import NotesPanel
 from _utilities.batch_sweep_panel import BatchSweepPanel
 from _utilities.batch_sweep import (load_batch_config, swept_keys, apply_overrides,
-                                     combo_label, dedup_consensus_filtered, phase1_key)
+                                     combo_label, merge_runs, phase1_key)
 # ── i18n ──────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import xml.etree.ElementTree as _ET
@@ -238,14 +238,14 @@ _LANG_CONFIG = os.path.join(os.path.expanduser("~"), ".ontbarcoder_lang.json")
 
 def _load_lang():
     try:
-        with open(_LANG_CONFIG) as f:
+        with open(_LANG_CONFIG, encoding="utf-8", errors="replace") as f:
             return _json_mod.load(f).get("lang", "en")
     except Exception:
         return "en"
 
 def _save_lang(lang):
     try:
-        with open(_LANG_CONFIG, "w") as f:
+        with open(_LANG_CONFIG, "w", encoding="utf-8") as f:
             _json_mod.dump({"lang": lang}, f)
     except Exception:
         pass
@@ -711,6 +711,21 @@ QDialog QDialogButtonBox QPushButton[default="true"]:hover {{
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
+def fmt_duration(seconds) -> str:
+    """Human-readable duration, e.g. '3 h 43 min 1 s', '12 min 5 s', '45 s'."""
+    total = max(0, int(seconds))
+    d, rem = divmod(total, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d} d {h} h {m} min"
+    if h:
+        return f"{h} h {m} min {sec} s"
+    if m:
+        return f"{m} min {sec} s"
+    return f"{sec} s"
+
+
 def make_label(text, size=19, bold=False, color=TEXT_PRI):
     lbl = QtWidgets.QLabel(text)
     weight = "600" if bold else "400"
@@ -778,6 +793,18 @@ class SidebarWidget(QtWidgets.QWidget):
     # optional, self-contained, not a required step to reach Results).
     _ITALIC_ITEMS = {"batch_sweep"}
 
+    # Required workflow steps are numbered so the order reads at a glance;
+    # optional/auxiliary items (Parameter Batch, RT Charts) stay unnumbered.
+    _STEP_NUMBERS = {"setup": 1, "params": 2, "progress": 3, "results": 4}
+
+    _TOOLTIPS = {
+        "batch_sweep": "Optional: runs the dataset once per parameter combination.\n"
+                       "Not required to reach Results.",
+        "live_chart":  "Real-Time charts (only in Real-Time mode).",
+    }
+    _LOCKED_TOOLTIP = "Locked — load the FASTQ and the demultiplexing file\n" \
+                      "in 'Input files' first."
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sidebar")
@@ -844,9 +871,29 @@ class SidebarWidget(QtWidgets.QWidget):
         self._lbl_workflow.setText(("  " + _tr(ctx, "Workflow")).upper())
         self._lbl_tools.setText(("  " + _tr(ctx, "Utilities")).upper())
         self._quit_btn.setText(_tr(ctx, "Quit"))
-        for key, src_label in self.ITEMS + self.TOOLS:
-            if key in self._buttons:
-                self._buttons[key].setText(_tr(ctx, src_label))
+        for key in self._buttons:
+            self._refresh_item(key)
+
+    def _refresh_item(self, key):
+        """Text and tooltip of one item from its state: step number, a check
+        mark once done, and why it is locked."""
+        btn = self._buttons.get(key)
+        if btn is None:
+            return
+        ctx = "SidebarWidget"
+        src = dict(self.ITEMS + self.TOOLS)[key]
+        text = _tr(ctx, src)
+        num = self._STEP_NUMBERS.get(key)
+        if num:
+            text = f"{num}  {text}"
+        state = self._states.get(key)
+        if state == "done" and key in dict(self.ITEMS):
+            text += "  ✓"
+        btn.setText(text)
+        if state == "locked":
+            btn.setToolTip(_tr(ctx, self._LOCKED_TOOLTIP))
+        else:
+            btn.setToolTip(_tr(ctx, self._TOOLTIPS.get(key, "")))
 
     def changeEvent(self, event):
         if event.type() == QtCore.QEvent.LanguageChange:
@@ -875,6 +922,7 @@ class SidebarWidget(QtWidgets.QWidget):
             btn.setProperty("state", "locked")
             btn.setCursor(QtCore.Qt.ForbiddenCursor)
             refresh_style(btn)
+        self._refresh_item(key)
 
     def unlock_item(self, key):
         """Unlock a panel allowing navigation."""
@@ -889,9 +937,11 @@ class SidebarWidget(QtWidgets.QWidget):
                 btn.setProperty("state", "pending")
                 btn.setCursor(QtCore.Qt.PointingHandCursor)
                 refresh_style(btn)
+        self._refresh_item(key)
 
     def set_active(self, key):
         for k, btn in self._buttons.items():
+            self._refresh_item(k)
             # Never override a locked item: keep its locked look and cursor so
             # navigating elsewhere doesn't desync _states from the button.
             if self._states.get(k) == "locked":
@@ -914,6 +964,7 @@ class SidebarWidget(QtWidgets.QWidget):
             btn.setProperty("state", "done")
             refresh_style(btn)
         btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._refresh_item(key)
 
     def show_item(self, key):
         if key in self._buttons:
@@ -4576,6 +4627,16 @@ class _ChartWidget(QtWidgets.QWidget):
 
 
 class DetachedChartsWindow(QtWidgets.QDialog):
+    visibilityChanged = QtCore.pyqtSignal(bool)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibilityChanged.emit(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibilityChanged.emit(False)
+
     def __init__(self, parent=None):
         super().__init__(parent, QtCore.Qt.Window)
         self.setWindowTitle("Real-Time charts — ONTbarcoder")
@@ -4701,11 +4762,58 @@ class LiveChartPanel(BasePanel):
         self._btn_detach.clicked.connect(self._toggle_detach)
         header_lay.addWidget(self._btn_detach, 0, QtCore.Qt.AlignBottom)
 
+        self._btn_cov_summary = QtWidgets.QPushButton("📋 Coverage summary")
+        self._btn_cov_summary.setFixedHeight(34)
+        self._btn_cov_summary.setToolTip(
+            "Show or hide a summary of the number of samples by read count\n"
+            "relative to the Minimum read coverage.")
+        self._btn_cov_summary.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {AMBER_LT};
+                color: {AMBER};
+                border: 1px solid {AMBER};
+                border-radius: 8px;
+                padding: 6px 14px;
+                font-size: 15px;
+                font-weight: 500;
+            }}
+            QPushButton:hover {{
+                background-color: {AMBER};
+                color: white;
+            }}
+        """)
+        self._btn_cov_summary.clicked.connect(self._toggle_cov_summary)
+        header_lay.addWidget(self._btn_cov_summary, 0, QtCore.Qt.AlignBottom)
+
         self.add(header_w)
 
         # Internal bar widget (data source for floating window)
         self._bar_chart_widget = _SampleBarChartWidget()
         self._bar_chart_widget.hide()
+
+        # ── Coverage summary (hidden until requested) ─────────────────────
+        self._min_cov = 5
+        self._cov_frame = QtWidgets.QFrame()
+        self._cov_frame.setStyleSheet(
+            f"QFrame#covFrame {{ background:{GRAY_CARD}; border:1px solid {GRAY_LINE};"
+            f" border-radius:8px; }}")
+        self._cov_frame.setObjectName("covFrame")
+        cov_lay = QtWidgets.QGridLayout(self._cov_frame)
+        cov_lay.setContentsMargins(14, 10, 14, 10)
+        cov_lay.setHorizontalSpacing(24)
+        cov_lay.setVerticalSpacing(4)
+        self._cov_title = make_label("", size=14, bold=True)
+        cov_lay.addWidget(self._cov_title, 0, 0, 1, 3)
+        self._cov_cells = []   # (count_lbl, desc_lbl) per category
+        for col, color in enumerate((RED, AMBER, GREEN)):
+            n_lbl = make_label("0", size=22, bold=True, color=color)
+            d_lbl = make_label("", size=13, color=TEXT_SEC)
+            cov_lay.addWidget(n_lbl, 1, col)
+            cov_lay.addWidget(d_lbl, 2, col)
+            self._cov_cells.append((n_lbl, d_lbl))
+        self._cov_frame.hide()
+        self.add(self._cov_frame)
+        self._refresh_cov_summary()
 
         self.add(hline())
 
@@ -4734,8 +4842,10 @@ class LiveChartPanel(BasePanel):
         ctx = "LiveChartPanel"
         self._lbl_chart_title.setText(_tr(ctx, "Real-Time charts"))
         self._lbl_chart_desc.setText(_tr(ctx, "Graphs update automatically while the analysis runs."))
-        self._btn_bar_chart.setText(_tr(ctx, "📊 Reads per sample"))
-        self._btn_detach.setText(_tr(ctx, "⧉ Floating window"))
+        self._update_bar_btn(bool(self._bar_window and self._bar_window.isVisible()))
+        self._update_detach_btn(bool(self._detach_window and self._detach_window.isVisible()))
+        self._update_cov_btn()
+        self._refresh_cov_summary()
         self._chart_reads.retranslateUi()
         self._chart_ok.retranslateUi()
 
@@ -4753,6 +4863,8 @@ class LiveChartPanel(BasePanel):
         self._chart_reads.add_point(0.0, 0)
         self._chart_reads.add_point2(0.0, 0)
         self._chart_ok.add_point(0.0, 0)
+        # Reset per-sample data so the coverage summary starts at 0
+        self.update_sample_bar_chart({})
 
     def record(self, n_dem: int, n_ok: int, n_total: int = 0, cycle: int = 0):
         if self._t0 is None:
@@ -4786,38 +4898,87 @@ class LiveChartPanel(BasePanel):
             px.save(os.path.join(outpath, name), "PNG")
         return self._timeline
 
-    def update_sample_bar_chart(self, sampleids: dict):
+    def update_sample_bar_chart(self, sampleids: dict, min_cov: int = None):
         """Updates the per-sample bar graph with the data from the last cycle."""
         self._bar_chart_widget.set_data(sampleids)
         if self._bar_window and self._bar_window.isVisible():
             self._bar_window.update_chart(sampleids)
+        if min_cov is not None:
+            self._min_cov = max(1, int(min_cov))
+        self._refresh_cov_summary()
+
+    def _refresh_cov_summary(self):
+        """Count samples with 0 reads, 1..min_cov-1 reads and >= min_cov reads."""
+        ctx = "LiveChartPanel"
+        m = self._min_cov
+        counts = list(self._bar_chart_widget._data.values())
+        total = len(counts)
+        n_zero = sum(1 for c in counts if c <= 0)
+        n_low = sum(1 for c in counts if 0 < c < m)
+        n_ok = sum(1 for c in counts if c >= m)
+        self._cov_title.setText(
+            _tr(ctx, "Samples by read count (Minimum read coverage = {m}; total = {t})")
+            .format(m=m, t=total))
+        low_range = f"1–{m - 1}" if m > 2 else "1"
+        descs = (
+            _tr(ctx, "samples with 0 reads"),
+            _tr(ctx, "samples with {r} reads").format(r=low_range),
+            _tr(ctx, "samples with ≥ {m} reads").format(m=m),
+        )
+        for (n_lbl, d_lbl), n, desc in zip(self._cov_cells, (n_zero, n_low, n_ok), descs):
+            pct = f" ({100.0 * n / total:.1f}%)" if total else ""
+            n_lbl.setText(f"{n:,}{pct}")
+            d_lbl.setText(desc)
+        # With min_cov = 1 the middle category cannot exist
+        for w in self._cov_cells[1]:
+            w.setVisible(m > 1)
+
+    def _update_cov_btn(self):
+        ctx = "LiveChartPanel"
+        self._btn_cov_summary.setText(
+            _tr(ctx, "📋 Hide summary") if not self._cov_frame.isHidden()
+            else _tr(ctx, "📋 Coverage summary"))
+
+    def _toggle_cov_summary(self):
+        self._cov_frame.setVisible(self._cov_frame.isHidden())
+        self._update_cov_btn()
+
+    def _update_detach_btn(self, visible: bool):
+        ctx = "LiveChartPanel"
+        self._btn_detach.setText(
+            _tr(ctx, "⧉ Hide window") if visible else _tr(ctx, "⧉ Floating window"))
+
+    def _update_bar_btn(self, visible: bool):
+        ctx = "LiveChartPanel"
+        self._btn_bar_chart.setText(
+            _tr(ctx, "📊 Hide chart") if visible else _tr(ctx, "📊 Reads per sample"))
 
     def _toggle_detach(self):
         if self._detach_window is None:
             self._detach_window = DetachedChartsWindow(self)
+            # Keep button text in sync when closed via Close/X
+            self._detach_window.visibilityChanged.connect(self._update_detach_btn)
         if self._detach_window.isVisible():
             self._detach_window.hide()
-            self._btn_detach.setText("⧉ Floating window")
         else:
             self._detach_window.sync_from(self._chart_reads, self._chart_ok)
             self._detach_window.show()
             self._detach_window.raise_()
-            self._btn_detach.setText("⧉ Hide window")
 
     def _toggle_bar_window(self):
         """Show or hide the bar chart floating window per sample."""
         if self._bar_window is None:
             self._bar_window = SampleBarChartWindow(self)
             self._bar_window.set_data(self._bar_chart_widget._data)
+            # Keep button text in sync when closed via Close/X
+            self._bar_window.visibilityChanged.connect(self._update_bar_btn)
 
         if self._bar_window.isVisible():
             self._bar_window.hide()
-            self._btn_bar_chart.setText("📊 Reads per sample")
         else:
             self._bar_window.set_data(self._bar_chart_widget._data)
             self._bar_window.show()
             self._bar_window.raise_()
-            self._btn_bar_chart.setText("📊 Hide chart")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4965,6 +5126,15 @@ class _SampleBarChartWidget(QtWidgets.QWidget):
 
 class SampleBarChartWindow(QtWidgets.QDialog):
     """Floating window with the bar graph of reads per sample."""
+    visibilityChanged = QtCore.pyqtSignal(bool)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.visibilityChanged.emit(True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.visibilityChanged.emit(False)
 
     def __init__(self, parent=None):
         super().__init__(parent, QtCore.Qt.Window)
@@ -5151,6 +5321,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
+        self._cov2a_level = {}   # sample -> coverage level where 2a resolved it
         self.ngoodbarcodescounter = 0
         self.con200goodn = 0
         self.con200errn = 0
@@ -5290,6 +5461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_blast.blastRequested.connect(self._start_blast)
         self._panel_blast.blastFileRequested.connect(self._start_blast_file)
         self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
+        self._panel_blast.sendToBestSeq.connect(self._open_in_best_seq)
         self._panel_batch_sweep.sweepRequested.connect(self._start_batch_sweep)
         self._panel_batch_sweep.stopRequested.connect(self._stop_batch_sweep)
         self._panel_results.resetRequested.connect(self._on_reset_analysis)
@@ -5300,6 +5472,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Lock panels until user configures input files
         for key in ("params", "batch_sweep", "progress", "results"):
             self._sidebar.lock_item(key)
+
+    def _open_in_best_seq(self, paths: list):
+        """BLAST → Best Sequence: load the queried FASTA and its results table
+        as a pair and show the panel."""
+        self._panel_best_seq._drop._add_files(paths)
+        self._switch_panel("best_seq")
 
     def _on_ui_scale_changed(self, value):
         """The UI scale only reaches Qt through QT_SCALE_FACTOR, which is read
@@ -5779,6 +5957,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
+        self._cov2a_level = {}   # sample -> coverage level where 2a resolved it
         self.n90trans = {}
         self.n90length = {}
         self.n90barcodes = {}
@@ -6099,6 +6278,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f"— consensus_filtered.fa: {n_filt} barcode(s)")
         if self._batch_current_tag in self._batch_run_meta:
             self._batch_run_meta[self._batch_current_tag]["n_filt"] = n_filt
+            # Whether this run had 'Detect intra-sample sequence variants' on:
+            # only those runs feed unique_secondary_variants.fasta.
+            self._batch_run_meta[self._batch_current_tag]["variants"] = bool(
+                (getattr(self, "_params", {}) or {})
+                .get("resolve_mixed", {}).get("enabled", False))
 
         # Snapshot this combination's Phase 1 output so the next combination can
         # reuse it if its phase1_key() matches (see _run_next_batch_combo).
@@ -6174,11 +6358,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 summary["n_filt_min"] = min(n_filts)
                 summary["n_filt_max"] = max(n_filts)
 
-            out_fasta = os.path.join(self._batch_outdir, "unique_consensus_filtered.fasta")
-            out_report = os.path.join(self._batch_outdir, "batch_dedup_report.tsv")
+            # consensus_filtered.fa of every run, plus the secondary variants
+            # (raw + corrected) of the runs that had intra-sample variant
+            # detection on, merged by host sample across runs.
+            var_folders = [(f, t) for f, t in self._batch_run_folders
+                           if self._batch_run_meta.get(t, {}).get("variants")]
             try:
-                stats = dedup_consensus_filtered(self._batch_run_folders, out_fasta, out_report)
-                summary.update(stats)
+                summary.update(merge_runs(self._batch_run_folders,
+                                          self._batch_outdir, var_folders))
             except Exception as e:
                 self._panel_batch_sweep.append_log(f"  Warning: deduplication failed: {e}")
 
@@ -6216,6 +6403,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.worker_prep.notifyMessage.connect(self._panel_progress.on_log_message, QtCore.Qt.QueuedConnection)
         self.worker_prep.taskFinished.connect(self._on_prep_demultiplex_done)
+        self.worker_prep.taskFailed.connect(self._on_worker_failed)
         self.worker_prep.start()
 
         self._panel_progress.set_phase("1", "Preparing demultiplexing...")
@@ -6262,7 +6450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sampleids = dict(reuse["sampleids"])
         self.totalseqs = reuse["totalseqs"]
         self.ndemultiplexed = reuse["ndemultiplexed"]
-        self.nsampledemultiplexed5 = reuse["nsampledemultiplexed5"]
+        self.nsampledemultiplexed5 = self._count_samples_mincov()
         self.nseqspasslen = reuse["nseqspasslen"]
         self.nseqsfordemultiplexing = reuse["nseqsfordemultiplexing"]
 
@@ -6283,7 +6471,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Reusing Phase 1 output from the previous combination (demultiplex "
             "parameters unchanged) — demultiplexing skipped.", "info")
         self._panel_progress.append_log(f"Demultiplexed reads: {self.ndemultiplexed:,}", "ok")
-        self._panel_progress.append_log(f"Samples with ≥5 reads: {self.nsampledemultiplexed5}", "ok")
+        self._panel_progress.append_log(f"Samples with ≥{self._min_cov()} reads: {self.nsampledemultiplexed5}", "ok")
         self._panel_progress.update_stat_dem(self.ndemultiplexed, self.totalseqs, final=True)
 
         try:
@@ -7120,6 +7308,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.mymergedatasets.notifyProgress.connect(self._on_merge_progress)
             self.mymergedatasets.taskFinished.connect(self._on_merge_done)
+            self.mymergedatasets.taskFailed.connect(self._on_worker_failed)
             self.mymergedatasets.start()
 
             self._panel_progress.set_phase("1", "Merging demultiplexed files...")
@@ -7142,16 +7331,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for sample, count in self.sampleids.items():
             self.ndemultiplexed += count
-            if count >= 5:
-                self.nsampledemultiplexed5 += 1
+        self.nsampledemultiplexed5 = self._count_samples_mincov()
 
         self._panel_progress.append_log(f"Demultiplexed reads: {self.ndemultiplexed:,}", "ok")
-        self._panel_progress.append_log(f"Samples with ≥5 reads: {self.nsampledemultiplexed5}", "ok")
+        self._panel_progress.append_log(f"Samples with ≥{self._min_cov()} reads: {self.nsampledemultiplexed5}", "ok")
         self._panel_progress.update_stat_dem(self.ndemultiplexed, getattr(self, 'totalseqs', 0), final=True)
 
         # Update bar chart per sample in RT panel
         if self._is_live():
-            self._panel_live_chart.update_sample_bar_chart(self.sampleids)
+            self._panel_live_chart.update_sample_bar_chart(
+                self.sampleids,
+                getattr(self, "_params", {}).get("mincoverage", 5))
 
         # In provisional RT cycles, writing to Excel is omitted;
         # it is only written in conventional analysis or in the final RT loop.
@@ -7334,18 +7524,18 @@ class MainWindow(QtWidgets.QMainWindow):
                         exist_ok=True)
             # Truncate accumulated files at the beginning of the first coverage level
             for fname in ["consensusgood_temp.fa"]:
-                open(os.path.join(outpath, "barcodesets", "temps", fname), 'w').close()
+                open(os.path.join(outpath, "barcodesets", "temps", fname), 'w', encoding="utf-8").close()
             for fname in ["consensus_all_step1.fa",
                           "consensus_all_prederr_barcodes.fa"]:
                 open(os.path.join(outpath, "barcodesets", "consensus_by_length",
-                                  fname), 'w').close()
+                                  fname), 'w', encoding="utf-8").close()
 
         # Truncate files from this coverage at the beginning of each level,
         # ensuring they do not accumulate data from previous RT cycles
         open(os.path.join(outpath, "barcodesets", "consensus_by_length",
-                          f"consensus_{current_cov}_barcodes.fa"), 'w').close()
+                          f"consensus_{current_cov}_barcodes.fa"), 'w', encoding="utf-8").close()
         open(os.path.join(outpath, "barcodesets", "consensus_by_length",
-                          f"consensus{current_cov}prederr_barcodes.fa"), 'w').close()
+                          f"consensus{current_cov}prederr_barcodes.fa"), 'w', encoding="utf-8").close()
 
         job = [
             self.inlistforconsensus,
@@ -7373,6 +7563,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.myconsensus1 = runconsensusparts(job)
         self.myconsensus1.notifyProgress.connect(self._on_consensus_progress)
         self.myconsensus1.taskFinished.connect(self._on_consensus_done)
+        self.myconsensus1.taskFailed.connect(self._on_worker_failed)
         self.myconsensus1.start()
 
     def _coverage_descending(self) -> bool:
@@ -7478,7 +7669,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
         if self.selectlenscounter == 0:
-            self.sampleids = self.myconsensus1.sampleids
+            # Keep every sample of the sample sheet (incl. 0 reads / below
+            # Minimum read coverage) and only refresh the counts of the
+            # samples processed by the consensus worker.
+            _all_ids = dict(self.sampleids)
+            _all_ids.update(self.myconsensus1.sampleids)
+            self.sampleids = _all_ids
 
         _n_processed = len(self.inlistforconsensus)  # samples sent to worker in this cycle
         self.inlistforconsensus = []
@@ -7499,8 +7695,8 @@ class MainWindow(QtWidgets.QMainWindow):
         _next_cov = (self.selectlens[_next_idx]
                      if _next_idx < len(self.selectlens) else None)
 
-        with open(consensus_fa, 'a') as outfile, \
-             open(prederr_fa, 'a') as outfile3:
+        with open(consensus_fa, 'a', encoding="utf-8") as outfile, \
+             open(prederr_fa, 'a', encoding="utf-8") as outfile3:
             for each in self.resultlist:
                 for k in each[0]:
                     self.con200trans[k] = each[0][k]
@@ -7538,6 +7734,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if each[2][k]:
                         # Coding: translation validation step -> resolved
                         self.con200flags[k] = True
+                        self._cov2a_level[k] = current_cov
                         outfile.write(f">{k}_all.fa;{slen};{cov}\n{seq}\n")
                         self._panel_progress.append_log(
                             f"  🟢 {k} — {slen} bp", "info")
@@ -7557,6 +7754,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                 # With Ns -> next level of coverage.
                                 if ambs == 0:
                                     self.con200flags[k] = True
+                                    self._cov2a_level[k] = current_cov
                                     _n_this_good += 1
                                 else:
                                     # It has Ns: go to the next level.
@@ -7597,7 +7795,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # in both modes. _n_this_good counts those in this cycle.
         n_good_this = _n_this_good
         n_good_accum = sum(1 for v in self.con200flags.values() if v)
-        self.cov2a_counts[current_cov] = n_good_this
+        # Breakdown over ALL resolved samples (not only this call's): in RT,
+        # con200flags persists across cycles while cov2a_counts is reset per
+        # cycle, so counting only new resolutions left the table at 0.
+        _lvl = getattr(self, "_cov2a_level", {})
+        self.cov2a_counts = {}
+        for _k, _ok in self.con200flags.items():
+            if _ok and _k in _lvl:
+                self.cov2a_counts[_lvl[_k]] = self.cov2a_counts.get(_lvl[_k], 0) + 1
 
 
         # Apply floor only in provisional RT cycles, never in the final analysis
@@ -7641,9 +7846,9 @@ class MainWindow(QtWidgets.QMainWindow):
             good_temp = os.path.join(outpath, "barcodesets", "temps",
                                      "consensusgood_temp.fa")
 
-            with open(all_step1, 'a') as outfile, \
-                 open(good_temp, 'a') as outfile2, \
-                 open(all_prederr, 'a') as outfile3:
+            with open(all_step1, 'a', encoding="utf-8") as outfile, \
+                 open(good_temp, 'a', encoding="utf-8") as outfile2, \
+                 open(all_prederr, 'a', encoding="utf-8") as outfile3:
                 # Sort so that consensusgood_temp.fa and consensus_all_prederr_barcodes.fa
                 # have the same order in conventional and real time
                 for k in sorted(self.con200barcodes.keys()):
@@ -7682,6 +7887,7 @@ class MainWindow(QtWidgets.QMainWindow):
         params = self._params
         outpath = self._outpath
         _resolve_enabled = bool(params.get("resolve_mixed", {}).get("enabled", False))
+        self._variant_raw_records = []
         if not _resolve_enabled:
             self._resolve_stats = {"enabled": False, "mixed": 0,
                                    "recovered": 0, "needs_review": 0,
@@ -7689,41 +7895,40 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         _mixed = {k: v for k, v in getattr(self, 'mixinfo_all', {}).items()
                   if k in self.con200barcodes and v.get("secondary")}
-        variants_fa = os.path.join(outpath, "barcodesets",
-                                   "consensus_by_length",
-                                   "secondary_variants.fa")
         # ALL secondary variants per sample are reported (not just one). No
         # cross-sample "source" is inferred: an analysis routinely contains
         # several samples of the same species, so a secondary matching
         # another sample's barcode does NOT imply it is the source.
         # Skip low-quality secondaries (≥5 Ns) to keep the file informative.
         _MAX_VARIANT_N = 5
-        _n_written = 0
-        with open(variants_fa, 'w') as cf:
-            for k in sorted(_mixed.keys()):
-                v = _mixed[k]
-                # Prefer the full per-cluster breakdown; fall back to the
-                # back-compat single 'secondary' field if absent.
-                _secs = v.get("secondaries")
-                if not _secs:
-                    _secs = [{"frac": 1.0 - float(v.get("frac", 0)),
-                              "seq": v.get("secondary", ""),
-                              "translates": None}]
-                for _i, s in enumerate(_secs, start=1):
-                    seq = s.get("seq", "")
-                    if not seq or seq.count("N") >= _MAX_VARIANT_N:
-                        continue
-                    _tr = s.get("translates")
-                    _tr_tag = ("yes" if _tr is True
-                               else "no" if _tr is False else "NA")
-                    _dv = s.get("divergence")
-                    _dv_tag = (f"{float(_dv)*100:.1f}%"
-                               if _dv is not None else "NA")
-                    cf.write(
-                        f">{k}_var{_i};frac={float(s.get('frac',0))*100:.0f}%;"
-                        f"len={len(seq)};div={_dv_tag};"
-                        f"translates={_tr_tag}\n{seq}\n")
-                    _n_written += 1
+        for k in sorted(_mixed.keys()):
+            v = _mixed[k]
+            # Prefer the full per-cluster breakdown; fall back to the
+            # back-compat single 'secondary' field if absent.
+            _secs = v.get("secondaries")
+            if not _secs:
+                _secs = [{"frac": 1.0 - float(v.get("frac", 0)),
+                          "seq": v.get("secondary", ""),
+                          "translates": None}]
+            for _i, s in enumerate(_secs, start=1):
+                seq = s.get("seq", "")
+                if not seq or seq.count("N") >= _MAX_VARIANT_N:
+                    continue
+                _tr = s.get("translates")
+                _tr_tag = ("yes" if _tr is True
+                           else "no" if _tr is False else "NA")
+                _dv = s.get("divergence")
+                _dv_tag = (f"{float(_dv)*100:.1f}%"
+                           if _dv is not None else "NA")
+                self._variant_raw_records.append(
+                    (f"{k}_var{_i}",
+                     f"frac={float(s.get('frac',0))*100:.0f}%;"
+                     f"len={len(seq)};div={_dv_tag};translates={_tr_tag};"
+                     f"coverage={s.get('size') if s.get('size') is not None else 'NA'};"
+                     f"Ns={seq.count('N')}",
+                     seq))
+        _n_written = len(self._variant_raw_records)
+        self._write_secondary_variants_fa()
         # "Recovered" = mixed samples that became QC-compliant barcodes
         # thanks to resolution (they would otherwise fail on Ns / frame).
         _n90 = getattr(self, "n90flags", {}) or {}
@@ -7743,6 +7948,42 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"resolved ({_n_recovered} now QC-compliant){_rev_txt}; "
                 f"{_n_written} secondary variant(s) written to "
                 f"secondary_variants.fa.", "warn")
+
+    def _write_secondary_variants_fa(self, corrected=None):
+        """Writes the single secondary_variants.fa (consensus_by_length and the
+        output root). Each secondary consensus is written as-is (type=raw) and,
+        when phase-3 recovery corrected it, followed by its corrected version
+        (type=corrected) under the same {sample}_var{i} name.
+
+        corrected: {name: (header_fields, seq)} from _recover_secondary_variants.
+        """
+        corrected = corrected or {}
+        raw = getattr(self, "_variant_raw_records", []) or []
+        raw_names = {name for name, _h, _s in raw}
+        # Corrected variants whose raw consensus was not exported (more Ns than
+        # the raw export allows) still go in, after the raw/corrected pairs.
+        extra = sorted(n for n in corrected if n not in raw_names)
+        variants_fa = os.path.join(self._outpath, "barcodesets",
+                                   "consensus_by_length",
+                                   "secondary_variants.fa")
+        with open(variants_fa, "w", encoding="utf-8") as fh:
+            for name, hdr, seq in raw:
+                fh.write(f">{name};type=raw;{hdr}\n{seq}\n")
+                if name in corrected:
+                    c_hdr, c_seq = corrected[name]
+                    fh.write(f">{name};type=corrected;{c_hdr}\n{c_seq}\n")
+            for name in extra:
+                c_hdr, c_seq = corrected[name]
+                fh.write(f">{name};type=corrected;{c_hdr}\n{c_seq}\n")
+        # Surface in the output root next to the consensus_*.fa files.
+        dst = os.path.join(self._outpath, "secondary_variants.fa")
+        try:
+            if os.path.getsize(variants_fa) > 0:
+                shutil.copyfile(variants_fa, dst)
+            elif os.path.isfile(dst):
+                os.remove(dst)
+        except OSError:
+            pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # NON-CODING MODE: Build final files from phase 2a (without 2b or 3)
@@ -7812,9 +8053,9 @@ class MainWindow(QtWidgets.QMainWindow):
         n_good = 0
         n_err  = 0
 
-        with open(final_all_path,  'w') as f_all, \
-             open(final_good_path, 'w') as f_good, \
-             open(prederr_path,    'w') as f_err:
+        with open(final_all_path,  'w', encoding="utf-8") as f_all, \
+             open(final_good_path, 'w', encoding="utf-8") as f_good, \
+             open(prederr_path,    'w', encoding="utf-8") as f_err:
 
             for k in sorted(self.con200barcodes.keys()):
                 seq  = self.con200barcodes.get(k, "")
@@ -7900,8 +8141,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if consensus90stat:
             self.mycheckmsa.taskFinished.connect(self._on_msa1_done_with_similarity)
+            self.mycheckmsa.taskFailed.connect(self._on_worker_failed)
         else:
             self.mycheckmsa.taskFinished.connect(self._on_msa_to_phase3)
+            self.mycheckmsa.taskFailed.connect(self._on_worker_failed)
 
         self.mycheckmsa.start()
 
@@ -7995,6 +8238,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._panel_progress.update_stat_ok(self.ngoodbarcodescounter)
             ))
         self.myconsensus2.taskFinished.connect(self._on_consensus2_done)
+        self.myconsensus2.taskFailed.connect(self._on_worker_failed)
         self.myconsensus2.start()
 
     @_phase_callback
@@ -8027,16 +8271,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # Truncate similarity files before writing,
         # ensuring they do not accumulate data from previous RT cycles
         open(os.path.join(outpath, "barcodesets", "consensus_by_similarity",
-                          "90perc_barcodes.fa"), 'w').close()
+                          "90perc_barcodes.fa"), 'w', encoding="utf-8").close()
         open(os.path.join(outpath, "barcodesets", "consensus_by_similarity",
-                          "90perc_prederr_barcodes.fa"), 'w').close()
+                          "90perc_prederr_barcodes.fa"), 'w', encoding="utf-8").close()
 
         with open(os.path.join(outpath, "barcodesets", "consensus_by_similarity",
-                               "90perc_barcodes.fa"), 'a') as outfile, \
+                               "90perc_barcodes.fa"), 'a', encoding="utf-8") as outfile, \
              open(os.path.join(outpath, "barcodesets", "temps",
-                               "consensusgood_temp.fa"), 'a') as outfile2, \
+                               "consensusgood_temp.fa"), 'a', encoding="utf-8") as outfile2, \
              open(os.path.join(outpath, "barcodesets", "consensus_by_similarity",
-                               "90perc_prederr_barcodes.fa"), 'a') as outfile3:
+                               "90perc_prederr_barcodes.fa"), 'a', encoding="utf-8") as outfile3:
             for each in resultlist:
                 for k in each[0]:
                     self.n90trans[k] = each[0][k]
@@ -8140,6 +8384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mycheckmsa2.notifyProgress3.connect(
             lambda _: self._panel_progress.append_log("  MSA 2b built", "info"))
         self.mycheckmsa2.taskFinished.connect(self._on_msa_to_phase3)
+        self.mycheckmsa2.taskFailed.connect(self._on_worker_failed)
         self.mycheckmsa2.start()
 
     @_phase_callback
@@ -8156,7 +8401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def builddict_sequences(infile):
             seqdict = {}
             try:
-                with open(infile) as f:
+                with open(infile, encoding="utf-8", errors="replace") as f:
                     l = f.readlines()
                     for i, j in enumerate(l):
                         if ">" in j:
@@ -8186,7 +8431,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 gooddict = {}
                 donelist = []
                 with open(os.path.join(outpath, "barcodesets", "temps",
-                                       "consensus_90perc_predgood_combined_barcodes.fa"), 'w') as outfile:
+                                       "consensus_90perc_predgood_combined_barcodes.fa"), 'w', encoding="utf-8") as outfile:
                     for k in pgoodset:
                         outfile.write(f">{k}\n{pgoodset[k]}\n")
                         gooddict[k.split(";")[0]] = pgoodset[k]
@@ -8198,7 +8443,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
                 psetids = {k.split(';')[0]: k for k in pset}
                 with open(os.path.join(outpath, "barcodesets", "temps",
-                                       "consensus_90perc_prederr_combined_barcodes.fa"), 'w') as outfile:
+                                       "consensus_90perc_prederr_combined_barcodes.fa"), 'w', encoding="utf-8") as outfile:
                     for k in rset:
                         id_ = k.split(';')[0]
                         if id_ not in gooddict:
@@ -8220,13 +8465,13 @@ class MainWindow(QtWidgets.QMainWindow):
             gooddict = {}
             donelist = []
             with open(os.path.join(outpath, "barcodesets", "temps",
-                                   "consensus_90perc_predgood_combined_barcodes.fa"), 'w') as outfile:
+                                   "consensus_90perc_predgood_combined_barcodes.fa"), 'w', encoding="utf-8") as outfile:
                 for k in rgoodset:
                     if k.split(";")[0] not in donelist:
                         outfile.write(f">{k}\n{rgoodset[k]}\n")
                         gooddict[k.split(";")[0]] = rgoodset[k]
             with open(os.path.join(outpath, "barcodesets", "temps",
-                                   "consensus_90perc_prederr_combined_barcodes.fa"), 'w') as outfile:
+                                   "consensus_90perc_prederr_combined_barcodes.fa"), 'w', encoding="utf-8") as outfile:
                 for k in rset:
                     id_ = k.split(';')[0]
                     if id_ not in gooddict:
@@ -8254,7 +8499,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def builddict_sequences(infile):
             seqdict = {}
             try:
-                with open(infile) as f:
+                with open(infile, encoding="utf-8", errors="replace") as f:
                     l = f.readlines()
                     for i, j in enumerate(l):
                         if ">" in j:
@@ -8276,7 +8521,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "  empty predgood — reconstruction from phase 2a flags...", "warn")
             predgood_path = os.path.join(outpath, "barcodesets", "consensus_by_length",
                                          "consensusgood_predgood_barcodes.fa")
-            with open(predgood_path, "w") as pgf:
+            with open(predgood_path, "w", encoding="utf-8") as pgf:
                 for k, flag in self.con200flags.items():
                     if flag and k in self.con200barcodes:
                         seq = self.con200barcodes[k]
@@ -8294,9 +8539,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # only musclergoodset barcodes are written, identical to the original's
         # except IOError block.
         with open(os.path.join(outpath, "barcodesets",
-                               "Final_predgood_combined_barcodes.fa"), "w") as outfile, \
+                               "Final_predgood_combined_barcodes.fa"), "w", encoding="utf-8") as outfile, \
              open(os.path.join(outpath, "barcodesets",
-                               "Final_all_combined_barcodes.fa"), "w") as outfile2:
+                               "Final_all_combined_barcodes.fa"), "w", encoding="utf-8") as outfile2:
             for k in musclergoodset:
                 sample = k.split("_all.fa")[0]
                 ambs = self.con200barcodes.get(sample, "").count("N")
@@ -8333,7 +8578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         prederr_file = os.path.join(outpath, "barcodesets", "temps",
                                     "consensus_90perc_prederr_combined_barcodes.fa")
         try:
-            with open(prederr_file) as infile:
+            with open(prederr_file, encoding="utf-8", errors="replace") as infile:
                 l = infile.readlines()
                 for i, j in enumerate(l):
                     if ">" in j:
@@ -8352,7 +8597,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             with open(os.path.join(outpath, "barcodesets",
-                                   "Final_predgood_combined_barcodes.fa")) as infile:
+                                   "Final_predgood_combined_barcodes.fa"), encoding="utf-8", errors="replace") as infile:
                 l = infile.readlines()
                 for i, j in enumerate(l):
                     if ">" in j:
@@ -8390,6 +8635,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda i: self._panel_progress.update_phase_progress(
                 "3", i, len(partlist)))
         self.myfix.taskFinished.connect(self._on_fix_done)
+        self.myfix.taskFailed.connect(self._on_worker_failed)
         self.myfix.start()
 
     @_phase_callback
@@ -8437,7 +8683,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return "".join(sequence)
 
         def callconsensus(filepath, perc_thresh):
-            with open(filepath) as infile:
+            with open(filepath, encoding="utf-8", errors="replace") as infile:
                 l = infile.readlines()
             seqdict, poslist = {}, []
             for i, j in enumerate(l):
@@ -8522,7 +8768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dirlist = sorted(fnmatch.filter(os.listdir(fix_dir), "*aln.fa"))
         self.nfixed = 0
 
-        with open(fixed_fa, "w") as gfile:
+        with open(fixed_fa, "w", encoding="utf-8") as gfile:
             for each in dirlist:
                 try:
                     conseq, seqdict, refseq = callconsensus(
@@ -8566,7 +8812,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"  Phase 3 fix skipped for {each}: "
                         f"{type(e).__name__}: {e}", "warn")
 
-        with open(fixed_fa) as infile2, open(final_all, "a") as outfile:
+        with open(fixed_fa, encoding="utf-8", errors="replace") as infile2, open(final_all, "a", encoding="utf-8") as outfile:
             for line in infile2:
                 outfile.write(line)
 
@@ -8603,7 +8849,7 @@ class MainWindow(QtWidgets.QMainWindow):
         prederr_combined = os.path.join(outpath, "barcodesets", "temps",
                                         "consensus_90perc_prederr_combined_barcodes.fa")
         if os.path.isfile(prederr_combined):
-            with open(prederr_combined) as infile:
+            with open(prederr_combined, encoding="utf-8", errors="replace") as infile:
                 l = infile.readlines()
                 for i, j in enumerate(l):
                     if ">" in j:
@@ -8628,17 +8874,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         main = os.path.join(outpath, "Main_barcode_results")
         file_map = {
-            "QC_Compliant_barcodes_noamb_noerr.fa": open(os.path.join(main, "QC_Compliant_barcodes_noamb_noerr.fa"), 'w'),
-            "Filtered_barcodes_1percamb_upto5err.fa": open(os.path.join(main, "Filtered_barcodes_1percamb_upto5err.fa"), 'w'),
-            "Allbarcodes.fa": open(os.path.join(main, "Allbarcodes.fa"), 'w'),
-            "Fixed_barcodes_1to5err.fa": open(os.path.join(main, "Fixed_barcodes_1to5err.fa"), 'w'),
-            "Fixed_barcodes_6to10err.fa": open(os.path.join(main, "Fixed_barcodes_6to10err.fa"), 'w'),
-            "Fixed_barcodes_11to15err.fa": open(os.path.join(main, "Fixed_barcodes_11to15err.fa"), 'w'),
-            "Fixed_barcodes_16to20err.fa": open(os.path.join(main, "Fixed_barcodes_16to20err.fa"), 'w'),
+            "QC_Compliant_barcodes_noamb_noerr.fa": open(os.path.join(main, "QC_Compliant_barcodes_noamb_noerr.fa"), 'w', encoding="utf-8"),
+            "Filtered_barcodes_1percamb_upto5err.fa": open(os.path.join(main, "Filtered_barcodes_1percamb_upto5err.fa"), 'w', encoding="utf-8"),
+            "Allbarcodes.fa": open(os.path.join(main, "Allbarcodes.fa"), 'w', encoding="utf-8"),
+            "Fixed_barcodes_1to5err.fa": open(os.path.join(main, "Fixed_barcodes_1to5err.fa"), 'w', encoding="utf-8"),
+            "Fixed_barcodes_6to10err.fa": open(os.path.join(main, "Fixed_barcodes_6to10err.fa"), 'w', encoding="utf-8"),
+            "Fixed_barcodes_11to15err.fa": open(os.path.join(main, "Fixed_barcodes_11to15err.fa"), 'w', encoding="utf-8"),
+            "Fixed_barcodes_16to20err.fa": open(os.path.join(main, "Fixed_barcodes_16to20err.fa"), 'w', encoding="utf-8"),
         }
 
         try:
-            with open(final_all) as infile:
+            with open(final_all, encoding="utf-8", errors="replace") as infile:
                 l = infile.readlines()
                 for i, j in enumerate(l):
                     if ">" in j:
@@ -8713,7 +8959,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     sheet3.write(0, c, h)
                 row3 = 1
                 if os.path.isfile(final_all):
-                    with open(final_all) as fa_in:
+                    with open(final_all, encoding="utf-8", errors="replace") as fa_in:
                         lines3 = fa_in.readlines()
                     for i3, j3 in enumerate(lines3):
                         if ">" in j3:
@@ -8750,62 +8996,9 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self._panel_progress.append_log(f"  Warning Excel 3: {e}", "warn")
 
-            # ── Sheet: Sample QC status ──────────────────────────────────────
-            # One row per INITIAL (demultiplexed) sample with its outcome, so the
-            # failures and over-threshold barcodes can be spotted/filtered at a
-            # glance. "Accepted" = Filtered threshold (≤1% Ns and ≤5 indels).
-            try:
-                max_amb = explen * 0.01
-                ws = self.wb.add_worksheet("Sample QC status")
-                try:
-                    fmt_hdr = self.wb.add_format({"bold": True})
-                    fmt_green = self.wb.add_format({"bg_color": "#C6EFCE"})
-                    fmt_amber = self.wb.add_format({"bg_color": "#FFEB9C"})
-                    fmt_red = self.wb.add_format({"bg_color": "#FFC7CE"})
-                except Exception:
-                    fmt_hdr = fmt_green = fmt_amber = fmt_red = None
-                hdrs = ["SpecimenID", "Reads demultiplexed", "Barcode produced",
-                        "Status", "Length (bp)", "#Ns", "#indels"]
-                for c, h in enumerate(hdrs):
-                    ws.write(0, c, h, fmt_hdr)
-                # Every sample DEFINED in the CSV (incl. those with 0 reads), not
-                # only the ones that were demultiplexed.
-                all_samples = sorted(set(getattr(self, "_all_csv_samples", []) or [])
-                                     | set(self.sampleids.keys()))
-                r = 1
-                for skey in all_samples:
-                    reads = self.sampleids.get(skey, 0)
-                    info = self._final_bc_info.get(skey)
-                    if info is None:
-                        produced = "no"
-                        status = ("No reads (not demultiplexed)"
-                                  if not reads else "No barcode (unresolved)")
-                        blen, nns, ngaps, rowfmt = "", "", "", fmt_red
-                    else:
-                        blen = info["len"]
-                        nns = info["ambs"]
-                        ngaps = info["estgaps"]
-                        produced = "yes"
-                        if nns == 0 and ngaps == 0:
-                            status, rowfmt = "QC-compliant", fmt_green
-                        elif nns <= max_amb and ngaps <= 5:
-                            status, rowfmt = ("Filtered (within accepted errors)",
-                                              fmt_amber)
-                        else:
-                            status, rowfmt = ("Exceeds accepted errors", fmt_red)
-                    rowvals = [skey, reads, produced, status, blen, nns, ngaps]
-                    for c, val in enumerate(rowvals):
-                        ws.write(r, c, val, rowfmt)
-                    r += 1
-                # Filterable + frozen header for quick scanning.
-                if r > 1:
-                    ws.autofilter(0, 0, r - 1, len(hdrs) - 1)
-                ws.freeze_panes(1, 0)
-            except Exception as e:
-                self._panel_progress.append_log(
-                    f"  Warning Excel Sample QC status: {e}", "warn")
+            self._write_sample_qc_sheet(self._final_bc_info, explen)
 
-        with open(os.path.join(main, "Remaining.fa"), 'w') as outfile1:
+        with open(os.path.join(main, "Remaining.fa"), 'w', encoding="utf-8") as outfile1:
             for each in self.errbarcodeset:
                 if each not in alllist:
                     outfile1.write(self.errbarcodeset[each])
@@ -9170,7 +9363,10 @@ class MainWindow(QtWidgets.QMainWindow):
         n_many     = summary.get("many_indels", 0)
         total_reads = getattr(self, 'totalseqs', '—')
         n_dem       = getattr(self, 'ndemultiplexed', '—')
-        n_samples_dem = len(getattr(self, 'sampleids', {}))
+        # sampleids holds every CSV sample (incl. 0 reads): count demultiplexed ones
+        n_samples_dem = sum(1 for v in getattr(self, 'sampleids', {}).values()
+                            if isinstance(v, int) and v > 0)
+        _mincov_rep = self._min_cov()
         n_sam5      = getattr(self, 'nsampledemultiplexed5', '—')
 
         # Count total samples defined in the input CSV
@@ -9487,7 +9683,7 @@ class MainWindow(QtWidgets.QMainWindow):
   <div class="stat indigo">
     <div class="stat-label">Samples</div>
     <div class="stat-value" style="font-size:32px">{n_samples}</div>
-    <div class="stat-sub">Demultiplexed: {n_samples_dem} · ≥5 reads: {n_sam5}</div>
+    <div class="stat-sub">Demultiplexed: {n_samples_dem} · ≥{_mincov_rep} reads: {n_sam5}</div>
   </div>
   {rt_cycles_card}
 </div>
@@ -9741,7 +9937,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mixinfo_all; <max_variant_Ns Ns, cap max_variants per sample) and corrects
         it against the good-barcode reference panel using the SAME edlib + MSA
         comparison as phase 3 (`runtoptwenty` + the `_fixbarcodes` reconstruction),
-        writing the corrected variants to secondary_variants_recovered.fa.
+        adding the corrected variants (type=corrected) to secondary_variants.fa.
 
         Isolated / best-effort: it runs only at finalization, reuses the existing
         good-barcode panel (no reads needed), and is fully wrapped in try/except so
@@ -9777,12 +9973,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 if k not in getattr(self, "con200barcodes", {}):
                     continue
                 secs = v.get("secondaries") or []
-                elig = [s for s in secs
-                        if s.get("seq") and s["seq"].count("N") < maxn
-                        and (s.get("size") is None
-                             or int(s.get("size")) >= mincov)]
-                for idx, s in enumerate(elig[:maxvar], start=1):
-                    vname = f"{k}__var{idx}"
+                # idx is the position in the full secondaries list, so the
+                # corrected variant keeps the {sample}_var{i} name of its raw
+                # consensus in secondary_variants.fa.
+                n_taken = 0
+                for idx, s in enumerate(secs, start=1):
+                    if n_taken >= maxvar:
+                        break
+                    if not (s.get("seq") and s["seq"].count("N") < maxn
+                            and (s.get("size") is None
+                                 or int(s.get("size")) >= mincov)):
+                        continue
+                    n_taken += 1
+                    vname = f"{k}_var{idx}"
                     candidates.append((vname, s["seq"].replace("-", "").upper()))
                     cov_map[vname] = s.get("size")
                     frac_map[vname] = s.get("frac")
@@ -9809,7 +10012,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             refseqdict = {}
-            with open(ref_path) as fh:
+            with open(ref_path, encoding="utf-8", errors="replace") as fh:
                 rl = fh.readlines()
             for i, j in enumerate(rl):
                 if j.startswith(">") and i + 1 < len(rl):
@@ -9859,7 +10062,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return "".join(out)
 
             def _callcons(path, perc):
-                with open(path) as fh:
+                with open(path, encoding="utf-8", errors="replace") as fh:
                     l = fh.readlines()
                 pos = [i for i, j in enumerate(l) if ">" in j]
                 sd, q = {}, ""
@@ -9972,46 +10175,53 @@ class MainWindow(QtWidgets.QMainWindow):
                     # logs and guarantees main results are never affected.
                     continue
 
+            # Deletions are filled with N during correction, so a variant can
+            # leave with more Ns than it entered with: drop corrected versions
+            # above _MAX_CORRECTED_N (not worth rescuing; the raw one stays).
+            _MAX_CORRECTED_N = 10
+            n_too_many_n = sum(1 for r in recovered
+                               if r[1].count("N") > _MAX_CORRECTED_N)
+            recovered = [r for r in recovered
+                         if r[1].count("N") <= _MAX_CORRECTED_N]
+            if n_too_many_n:
+                self._panel_progress.append_log(
+                    f"  Variant recovery: {n_too_many_n} corrected variant(s) "
+                    f"discarded (> {_MAX_CORRECTED_N} Ns).", "info")
+
             if not recovered:
                 self._panel_progress.append_log(
                     "  Variant recovery: no variants could be corrected.", "info")
                 return
 
-            out_fa = os.path.join(outpath, "barcodesets", "consensus_by_length",
-                                  "secondary_variants_recovered.fa")
+            corrected = {}  # vname -> (header_fields, seq)
             n_ok = 0
-            with open(out_fa, "w") as of:
-                for vname, seq, tr, gaps in sorted(recovered):
-                    # non-Coding: translates=NA; "valid" = 0 Ns (no frame criterion).
-                    tr_tag = ("yes" if tr is True
-                              else "no" if tr is False else "NA")
-                    # Coverage the consensus was obtained with = number of reads in
-                    # the secondary cluster (analogous to con200cov in consensus_no_errors.fa).
-                    _size = cov_map.get(vname)
-                    cov_val = _size if _size is not None else "NA"
-                    # Fraction the cluster represents (same as secondary_variants.fa).
-                    _frac = frac_map.get(vname)
-                    frac_tag = (f"{float(_frac) * 100:.0f}%"
-                                if _frac is not None else "NA")
-                    _dvv = div_map.get(vname)
-                    div_tag = (f"{float(_dvv) * 100:.1f}%"
-                               if _dvv is not None else "NA")
-                    of.write(f">{vname};frac={frac_tag};div={div_tag};"
-                             f"len={len(seq)};"
-                             f"coverage={cov_val};"
-                             f"translates={tr_tag};"
-                             f"fixed_indels={gaps};Ns={seq.count('N')}\n{seq}\n")
-                    _valid = (seq.count("N") == 0) if not is_coi else (
-                        tr and seq.count("N") == 0)
-                    if _valid:
-                        n_ok += 1
-            # Surface in the output root next to the other consensus files.
-            try:
-                import shutil as _sh
-                _sh.copyfile(out_fa, os.path.join(outpath,
-                             "secondary_variants_recovered.fa"))
-            except OSError:
-                pass
+            for vname, seq, tr, gaps in recovered:
+                # non-Coding: translates=NA; "valid" = 0 Ns (no frame criterion).
+                tr_tag = ("yes" if tr is True
+                          else "no" if tr is False else "NA")
+                # Coverage the consensus was obtained with = number of reads in
+                # the secondary cluster (analogous to con200cov in consensus_no_errors.fa).
+                _size = cov_map.get(vname)
+                cov_val = _size if _size is not None else "NA"
+                # Fraction the cluster represents (same as the raw record).
+                _frac = frac_map.get(vname)
+                frac_tag = (f"{float(_frac) * 100:.0f}%"
+                            if _frac is not None else "NA")
+                _dvv = div_map.get(vname)
+                div_tag = (f"{float(_dvv) * 100:.1f}%"
+                           if _dvv is not None else "NA")
+                corrected[vname] = (f"frac={frac_tag};div={div_tag};"
+                                    f"len={len(seq)};"
+                                    f"coverage={cov_val};"
+                                    f"translates={tr_tag};"
+                                    f"fixed_indels={gaps};Ns={seq.count('N')}",
+                                    seq)
+                _valid = (seq.count("N") == 0) if not is_coi else (
+                    tr and seq.count("N") == 0)
+                if _valid:
+                    n_ok += 1
+            # Raw + corrected variants go to the single secondary_variants.fa.
+            self._write_secondary_variants_fa(corrected)
             self._resolve_stats = getattr(self, "_resolve_stats", {}) or {}
             self._resolve_stats["recovered_variants"] = len(recovered)
             self._resolve_stats["recovered_valid"] = n_ok
@@ -10020,7 +10230,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_progress.append_log(
                 f"  Variant recovery: {len(recovered)} corrected "
                 f"({n_ok} now {_ok_desc}) → "
-                f"secondary_variants_recovered.fa", "ok")
+                f"secondary_variants.fa (type=corrected)", "ok")
         except Exception as e:
             try:
                 self._panel_progress.append_log(
@@ -10113,7 +10323,7 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 lf.write(f"\n{'=' * 60}\n")
                 lf.write(f"  FINAL SUMMARY\n")
-                lf.write(f"  Total time: {int(elapsed//60)} min {int(elapsed%60)} s\n")
+                lf.write(f"  Total time: {fmt_duration(elapsed)}\n")
                 lf.write(f"  Total reads           : {getattr(self, 'totalseqs', 'N/A')}\n")
                 lf.write(f"  Demultiplexed reads   : {getattr(self, 'ndemultiplexed', 'N/A')}\n")
                 lf.write(f"  QC Compliant barcodes : {getattr(self, 'nperfectbarcodes', n_good_2a)}\n")
@@ -10139,7 +10349,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("Total reads", getattr(self, 'totalseqs', 'N/A')),
                 ("Demultiplexed reads", getattr(self, 'ndemultiplexed', 'N/A')),
                 ("Total samples", len(self.sampleids)),
-                ("Samples with ≥5 reads", getattr(self, 'nsampledemultiplexed5', 0)),
+                (f"Samples with ≥{self._min_cov()} reads", getattr(self, 'nsampledemultiplexed5', 0)),
                 ("Barcodes good 2a", n_good_2a),
                 ("Barcodes good 2b", getattr(self, 'n90goodn', 0)),
                 ("Barcodes corrected F3", getattr(self, 'nfixed', 0)),
@@ -10147,7 +10357,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("QC Compliant", getattr(self, 'nperfectbarcodes', 0)),
                 ("Filtered", getattr(self, 'nfilteredbarcodes', 0)),
                 ("Unresolved", getattr(self, 'nerr', 0)),
-                ("Total time", f"{int(elapsed//60)} min {int(elapsed%60)} s"),
+                ("Total time", fmt_duration(elapsed)),
             ]
             for i, (m, v) in enumerate(rows):
                 demsheet.write(i+1, 0, m)
@@ -10186,7 +10396,7 @@ class MainWindow(QtWidgets.QMainWindow):
         n_unres_val = getattr(self, 'nerr', 0)
 
         summary = {
-            "elapsed": f"{int(elapsed//60)} min {int(elapsed%60)} s",
+            "elapsed": fmt_duration(elapsed),
             "mode": "Real-Time" if self._is_live() else "Conventional",
             "total": n_final_val,
             "qc_ok": n_qc_val,
@@ -10599,7 +10809,7 @@ class MainWindow(QtWidgets.QMainWindow):
             n_qc = getattr(self, 'nperfectbarcodes', 0) or n_good_2a
             timeline = getattr(self._panel_live_chart, "_timeline", [])
             rt_summary = {
-                "elapsed": f"{int(elapsed // 60)} min {int(elapsed % 60)} s",
+                "elapsed": fmt_duration(elapsed),
                 "mode": "Real-Time (finalized)",
                 "total": getattr(self, 'nfinal', n_good_2a),
                 "qc_ok": n_qc,
@@ -10694,6 +10904,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._len_bimodal = {}
         self.con200cov = {}
         self.con200flags = {}
+        self._cov2a_level = {}   # sample -> coverage level where 2a resolved it
         self.n90trans = {}
         self.n90length = {}
         self.n90barcodes = {}
@@ -10873,22 +11084,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 shutil.copyfile(src_filtered, filtered_fa)
             if os.path.isfile(src_all):
                 shutil.copyfile(src_all, all_fa)
-            # Surface the secondary-variants file (intra-sample secondary
-            # haplotypes) in the output root, next to the consensus files, so it
-            # ships with the other results.
-            src_contam = os.path.join(outpath, "barcodesets",
-                                      "consensus_by_length", "secondary_variants.fa")
-            dst_contam = os.path.join(outpath, "secondary_variants.fa")
-            try:
-                if os.path.isfile(src_contam) and os.path.getsize(src_contam) > 0:
-                    shutil.copyfile(src_contam, dst_contam)
-            except OSError:
-                pass
-            n_good = sum(1 for line in open(good_fa) if line.startswith(">")) \
+            n_good = sum(1 for line in open(good_fa, encoding="utf-8", errors="replace") if line.startswith(">")) \
                 if os.path.isfile(good_fa) else 0
-            n_filt = sum(1 for line in open(filtered_fa) if line.startswith(">")) \
+            n_filt = sum(1 for line in open(filtered_fa, encoding="utf-8", errors="replace") if line.startswith(">")) \
                 if os.path.isfile(filtered_fa) else 0
-            n_all = sum(1 for line in open(all_fa) if line.startswith(">")) \
+            n_all = sum(1 for line in open(all_fa, encoding="utf-8", errors="replace") if line.startswith(">")) \
                 if os.path.isfile(all_fa) else 0
             self._panel_progress.append_log(
                 f"  consensus_no_errors.fa: {n_good} | "
@@ -11047,6 +11247,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._switch_panel("setup")
 
     @QtCore.pyqtSlot()
+    def _on_worker_failed(self, msg: str):
+        """A pipeline worker raised an exception: report it and stop the run
+        cleanly instead of leaving the UI waiting for a taskFinished that
+        will never arrive. Full traceback is in ~/ONTbarcoder_crash.log."""
+        if getattr(self, "_stopped", False):
+            return
+        self._panel_progress.append_log(f"  ✖ Error in {msg}", "error")
+        self._panel_progress.append_log(
+            "  The analysis was stopped. Details: ~/ONTbarcoder_crash.log", "error")
+        if not getattr(self, "_batch_running", False):
+            QtWidgets.QMessageBox.critical(
+                self, "Analysis error",
+                f"The analysis stopped because of an error:\n\n{msg}\n\n"
+                "Partial results were saved. Full details in "
+                "ONTbarcoder_crash.log (user folder).")
+        self._stop_analysis()
+
     def _stop_analysis(self):
         self._stopped = True   # tells all callbacks to ignore pending results
         self._analysis_active = False
@@ -11111,7 +11328,7 @@ class MainWindow(QtWidgets.QMainWindow):
         timeline = getattr(self._panel_live_chart, "_timeline", []) if self._is_live() else []
 
         summary = {
-            "elapsed": f"{int(elapsed//60)} min {int(elapsed%60)} s",
+            "elapsed": fmt_duration(elapsed),
             "mode": "Real-Time (stopped)" if self._is_live() else "Conventional (stopped)",
             "total": getattr(self, 'nfinal', n_good_2a),
             "qc_ok": n_qc,
@@ -11193,6 +11410,80 @@ class MainWindow(QtWidgets.QMainWindow):
         self._abort_batch_sweep(
             "Current combination was stopped from the Analysis panel — "
             "finishing the batch with the combinations completed so far.")
+
+    def _min_cov(self) -> int:
+        """Minimum read coverage of the current run (default 5)."""
+        try:
+            return max(1, int(getattr(self, "_params", {}).get("mincoverage", 5)))
+        except (TypeError, ValueError):
+            return 5
+
+    def _count_samples_mincov(self) -> int:
+        """Number of samples with >= Minimum read coverage demultiplexed reads."""
+        m = self._min_cov()
+        return sum(1 for v in getattr(self, "sampleids", {}).values()
+                   if isinstance(v, int) and v >= m)
+
+    def _write_sample_qc_sheet(self, bc_info: dict, explen):
+        """Sheet "Sample QC status": one row per sample of the input CSV with
+        its outcome, so failures and over-threshold barcodes can be
+        spotted/filtered at a glance. "Accepted" = Filtered threshold
+        (≤1% Ns and ≤5 indels). bc_info maps sample -> {len, ambs, estgaps}."""
+        try:
+            min_cov = self._min_cov()
+            max_amb = explen * 0.01
+            ws = self.wb.add_worksheet("Sample QC status")
+            try:
+                fmt_hdr = self.wb.add_format({"bold": True})
+                fmt_green = self.wb.add_format({"bg_color": "#C6EFCE"})
+                fmt_amber = self.wb.add_format({"bg_color": "#FFEB9C"})
+                fmt_red = self.wb.add_format({"bg_color": "#FFC7CE"})
+            except Exception:
+                fmt_hdr = fmt_green = fmt_amber = fmt_red = None
+            hdrs = ["SpecimenID", "Reads demultiplexed", "Barcode produced",
+                    "Status", "Length (bp)", "#Ns", "#indels"]
+            for c, h in enumerate(hdrs):
+                ws.write(0, c, h, fmt_hdr)
+            # Every sample DEFINED in the CSV (incl. those with 0 reads), not
+            # only the ones that were demultiplexed.
+            all_samples = sorted(set(getattr(self, "_all_csv_samples", []) or [])
+                                 | set(self.sampleids.keys()))
+            r = 1
+            for skey in all_samples:
+                reads = self.sampleids.get(skey, 0)
+                info = bc_info.get(skey)
+                if info is None:
+                    produced = "no"
+                    if not reads:
+                        status = "No reads (not demultiplexed)"
+                    elif isinstance(reads, int) and reads < min_cov:
+                        status = f"Below minimum read coverage (<{min_cov})"
+                    else:
+                        status = "No barcode (unresolved)"
+                    blen, nns, ngaps, rowfmt = "", "", "", fmt_red
+                else:
+                    blen = info["len"]
+                    nns = info["ambs"]
+                    ngaps = info["estgaps"]
+                    produced = "yes"
+                    if nns == 0 and ngaps == 0:
+                        status, rowfmt = "QC-compliant", fmt_green
+                    elif nns <= max_amb and ngaps <= 5:
+                        status, rowfmt = ("Filtered (within accepted errors)",
+                                          fmt_amber)
+                    else:
+                        status, rowfmt = ("Exceeds accepted errors", fmt_red)
+                rowvals = [skey, reads, produced, status, blen, nns, ngaps]
+                for c, val in enumerate(rowvals):
+                    ws.write(r, c, val, rowfmt)
+                r += 1
+            # Filterable + frozen header for quick scanning.
+            if r > 1:
+                ws.autofilter(0, 0, r - 1, len(hdrs) - 1)
+            ws.freeze_panes(1, 0)
+        except Exception as e:
+            self._panel_progress.append_log(
+                f"  Warning Excel Sample QC status: {e}", "warn")
 
     def _write_excel_on_stop(self):
         """Write the available sheets with data from the interrupted RT cycle into the workbook."""
@@ -11276,6 +11567,7 @@ class MainWindow(QtWidgets.QMainWindow):
         final_all = os.path.join(outpath, "barcodesets",
                                  "Final_all_combined_barcodes.fa") if outpath else ""
         con200cov = getattr(self, 'con200cov', {})
+        bc_info = {}   # per-sample barcode info for the Sample QC status sheet
         if sids and final_all and os.path.isfile(final_all):
             try:
                 sh3 = self.wb.add_worksheet("3.Final barcodes")
@@ -11286,7 +11578,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for c, h in enumerate(headers3):
                     sh3.write(0, c, h)
                 row3 = 1
-                with open(final_all) as fa_in:
+                with open(final_all, encoding="utf-8", errors="replace") as fa_in:
                     lines3 = fa_in.readlines()
                 for i3, j3 in enumerate(lines3):
                     if ">" in j3:
@@ -11303,6 +11595,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         btype3   = f"removed {gaps3} indels" if gaps3 > 0 else "correct"
                         cov_num3 = n90cov.get(smp3, con200cov.get(smp3, "NA"))
                         trans3   = 1 if (ambs3 == 0 and gaps3 == 0) else 0
+                        bc_info[smp3] = {"len": len(seq3), "ambs": seq3.count("N"),
+                                         "estgaps": gaps3}
                         sh3.write(row3, 0, smp3)
                         sh3.write(row3, 1, sids.get(smp3, "NA"))
                         sh3.write(row3, 2, cov_num3)
@@ -11317,6 +11611,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._panel_progress.append_log(
                     f"  Warning Excel stop (Hoja 3): {e}", "warn")
 
+        # Sample QC status: every CSV sample (incl. 0 reads / below coverage)
+        if sids:
+            self._write_sample_qc_sheet(bc_info, params.get("explen", 0) or 0)
+
         # Final results sheet: summary of metrics (always try to write)
         try:
             elapsed_s = time.time() - getattr(self, '_run_start', time.time())
@@ -11328,7 +11626,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("Total reads",             getattr(self, 'totalseqs', 'N/A')),
                 ("Demultiplexed reads",     getattr(self, 'ndemultiplexed', 'N/A')),
                 ("Total samples",           len(sids)),
-                ("Samples with ≥5 reads",   getattr(self, 'nsampledemultiplexed5', 0)),
+                (f"Samples with ≥{self._min_cov()} reads", getattr(self, 'nsampledemultiplexed5', 0)),
                 ("Good barcodes 2a",        n_good_2a),
                 ("Good barcodes 2b",        getattr(self, 'n90goodn', 0)),
                 ("Corrected barcodes F3",   getattr(self, 'nfixed', 0)),
@@ -11336,7 +11634,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 ("QC Compliant",            getattr(self, 'nperfectbarcodes', 0)),
                 ("Filtered",                getattr(self, 'nfilteredbarcodes', 0)),
                 ("Unresolved",              getattr(self, 'nerr', 0)),
-                ("Total time",              f"{int(elapsed_s//60)} min {int(elapsed_s%60)} s"),
+                ("Total time",              fmt_duration(elapsed_s)),
                 ("State",                   "Stopped by user"),
             ]
             for i, (m, v) in enumerate(rows_fr):
@@ -11477,6 +11775,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.comp_worker = _CompareWorker(file_list, outdir, extract_cfg)
 
         self.comp_worker.notifyProgress.connect(self._panel_compare.update_progress)
+        self.comp_worker.writeErrors.connect(self._panel_compare.show_write_errors)
         self.comp_worker.taskFinished.connect(self._panel_compare.show_results)
         self.comp_worker.start()
 
