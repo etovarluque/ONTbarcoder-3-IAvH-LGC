@@ -26,10 +26,10 @@ hidden += [
 # export of BLAST hits and of the best-sequence report)
 # within a try/except that degrades silently, so a missed bundle would disable
 # the feature with no error. Pull in all of its submodules to guarantee it ships.
-try:
-    hidden += collect_submodules('openpyxl')
-except Exception:
-    hidden += ['openpyxl']
+hidden += collect_submodules('openpyxl')
+if not any(h.startswith('openpyxl.') for h in hidden):
+    # Fail the build instead of shipping an exe that cannot read .xlsx files
+    raise SystemExit("openpyxl is not installed in the build environment")
 
 # Pillow is never imported by this project. It only gets pulled in because
 # collect_submodules('openpyxl') above reaches openpyxl.drawing.image, which

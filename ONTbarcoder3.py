@@ -5470,8 +5470,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._topbar.uiScaleChanged.connect(self._on_ui_scale_changed)
 
         # Lock panels until user configures input files
-        for key in ("params", "batch_sweep", "progress", "results"):
+        for key in ("params", "progress", "results"):
             self._sidebar.lock_item(key)
+        # Parameter Batch stays reachable: merging existing runs needs no dataset.
+        self._panel_batch_sweep.set_dataset_loaded(False)
 
     def _open_in_best_seq(self, paths: list):
         """BLAST → Best Sequence: load the queried FASTA and its results table
@@ -5665,8 +5667,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"QPushButton:hover {{ background-color: #0C4A82; }}"
             )
         # Unlock all panels upon completion of file setup
-        for key in ("params", "batch_sweep", "progress", "results"):
+        for key in ("params", "progress", "results"):
             self._sidebar.unlock_item(key)
+        self._panel_batch_sweep.set_dataset_loaded(True)
         self._runmode = runmode
         self._fastq = fastq
         self._demfile = demfile
@@ -11241,8 +11244,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sidebar.hide_item("live_chart")
 
         # Re-lock panels until new file configuration
-        for key in ("params", "batch_sweep", "progress", "results"):
+        for key in ("params", "progress", "results"):
             self._sidebar.lock_item(key)
+        self._panel_batch_sweep.set_dataset_loaded(False)
 
         self._switch_panel("setup")
 

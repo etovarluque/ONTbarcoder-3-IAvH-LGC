@@ -7,6 +7,11 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from .shared import *
 from .shared import _get_base_dir, _tr
 from .fasta_tools import _DragDropLineEdit
+from .best_seq_panel import (
+    read_tax_reference, QUERY_TAX_COLUMNS, sample_id_of, lookup_tax,
+    concordance_level, display_taxon,
+)
+from .blast_panel import _ReferenceFileGroup
 
 
 class _BoldFormatWorker(QtCore.QThread):
@@ -51,7 +56,17 @@ class _BoldFormatWorker(QtCore.QThread):
         "Species":   _ORANGE,
         "Indels":    _TEAL,
         "ID%":       _TEAL,
+        "Query_Order":      _BLUE,
+        "Query_Family":     _BLUE,
+        "Query_Genus":      _BLUE,
+        "Query_organism":   _BLUE,
+        "Tax_level_match":  _TEAL,
     }
+
+    # BOLD hit-taxonomy headers compared against the Query_* reference columns.
+    HIT_TAX_HEADERS = ("Order", "Family", "Genus", "Species")
+    TAX_RANK_KEYS   = ("order", "family", "genus", "organism")
+    MATCH_COL_NAME  = "Tax_level_match"
 
     WIDTH_BY_HEADER = {
         "Hit rank":  10,
@@ -67,13 +82,21 @@ class _BoldFormatWorker(QtCore.QThread):
         "Species":   28,
         "Indels":     9,
         "ID%":        9,
+        "Query_Order":      15,
+        "Query_Family":     16,
+        "Query_Genus":      18,
+        "Query_organism":   28,
+        "Tax_level_match":  16,
     }
 
-    def __init__(self, files: list, max_hits: Optional[int], out_dir: str, parent=None):
+    def __init__(self, files: list, max_hits: Optional[int], out_dir: str,
+                 ref_path: str = "", strip_suffix: str = "", parent=None):
         super().__init__(parent)
         self._files    = files
         self._max_hits = max_hits   # None = keep all hits
         self._out_dir  = out_dir
+        self._ref_path = ref_path   # optional query-taxonomy reference file
+        self._suffix   = strip_suffix
         self._stop     = False
 
     def stop(self):
@@ -140,6 +163,47 @@ class _BoldFormatWorker(QtCore.QThread):
                 records.append(([rank] + row, rank, gi, rank == 1))
 
         return out_headers, records, reordered
+
+    @classmethod
+    def _add_query_tax(cls, out_headers, records, ref, ref_lower, suffix):
+        """Append Query_* reference taxonomy and Tax_level_match to every row.
+
+        Returns (out_headers, records, n_filled, unknown_sample_ids). The hit
+        taxonomy is read from BOLD's Order/Family/Genus/Species columns; the
+        comparison rule is the same one the BLAST panel uses.
+        """
+        q_i = out_headers.index(cls.QUERY_COL_NAME)
+        hit_idx = [out_headers.index(h) if h in out_headers else None
+                   for h in cls.HIT_TAX_HEADERS]
+        new_headers = out_headers + list(QUERY_TAX_COLUMNS)
+        can_match = all(i is not None for i in hit_idx)
+        if can_match:
+            new_headers.append(cls.MATCH_COL_NAME)
+
+        cache = {}
+        unknown = set()
+        n_filled = 0
+        new_records = []
+        for values, rank, gi, first in records:
+            query = values[q_i]
+            if query not in cache:
+                sample = sample_id_of(query, suffix) if query is not None else ""
+                tax = lookup_tax(sample, ref, ref_lower)
+                if tax is None:
+                    unknown.add(sample)
+                    tax = ("", "", "", "")
+                cache[query] = tax
+            tax = cache[query]
+            if any(tax):
+                n_filled += 1
+            row = list(values) + list(tax)
+            if can_match:
+                qtax = {k: display_taxon(v) for k, v in zip(cls.TAX_RANK_KEYS, tax)}
+                hit = {k: display_taxon(values[i])
+                       for k, i in zip(cls.TAX_RANK_KEYS, hit_idx)}
+                row.append(concordance_level(hit, qtax))
+            new_records.append((row, rank, gi, first))
+        return new_headers, new_records, n_filled, sorted(unknown), can_match
 
     @classmethod
     def _write(cls, out_headers, records, out_path):
@@ -209,6 +273,10 @@ class _BoldFormatWorker(QtCore.QThread):
         try:
             outputs = []
             total = len(self._files)
+            ref = ref_lower = None
+            if self._ref_path:
+                _id_col, _tax_cols, ref = read_tax_reference(self._ref_path)
+                ref_lower = {k.lower(): v for k, v in ref.items()}
             for i, path in enumerate(self._files, 1):
                 if self._stop:
                     return
@@ -218,6 +286,12 @@ class _BoldFormatWorker(QtCore.QThread):
                     headers, groups, q_idx, id_idx = self._read_bold(path)
                     out_headers, records, reordered = self._build(
                         headers, groups, q_idx, id_idx, self._max_hits)
+                    tax_info = None
+                    if ref is not None:
+                        out_headers, records, n_fill, unknown, can_match = \
+                            self._add_query_tax(out_headers, records, ref,
+                                                ref_lower, self._suffix)
+                        tax_info = (n_fill, unknown, can_match)
                     out_path = os.path.join(
                         self._out_dir,
                         f"{os.path.splitext(name)[0]}_formatted.xlsx")
@@ -229,6 +303,18 @@ class _BoldFormatWorker(QtCore.QThread):
                         f"{name}: {len(groups)} Query ID(s) · "
                         f"{len(records)} row(s) (hits/group: {kept}) "
                         f"→ {os.path.basename(out_path)}")
+                    if tax_info:
+                        n_fill, unknown, can_match = tax_info
+                        self.log_line.emit(
+                            f"  Query taxonomy filled in {n_fill}/{len(records)} row(s)")
+                        if unknown:
+                            shown = ", ".join(unknown[:10]) + (" …" if len(unknown) > 10 else "")
+                            self.log_line.emit(
+                                f"  ⚠ {len(unknown)} sample ID(s) not in the reference: {shown}")
+                        if not can_match:
+                            self.log_line.emit(
+                                "  ⚠ Tax_level_match skipped: the BOLD table lacks "
+                                "Order/Family/Genus/Species columns")
                     if reordered:
                         self.log_line.emit(
                             f"  ⚠ {len(reordered)} group(s) were not sorted by "
@@ -321,6 +407,14 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._keep_all_chk.toggled.connect(
             lambda on: (self._hits_spin.setDisabled(on), lbl_hits.setDisabled(on)))
         self._layout.addWidget(self._keep_all_chk)
+
+        # ── Optional query-taxonomy reference file (same control as BLAST) ──
+        self._ref_group = _ReferenceFileGroup()
+        self._ref_group.apply_link.hide()   # BLAST-table tool, not applicable here
+        ref_form = QtWidgets.QFormLayout()
+        ref_form.setContentsMargins(0, 0, 0, 0)
+        self._ref_group.add_to(ref_form)
+        self._layout.addLayout(ref_form)
 
         # ── Status + progress ──
         self._status_lbl = make_label("", color=TEXT_SEC)
@@ -455,6 +549,8 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._file_edit.clear()
         self._hits_spin.setValue(5)
         self._keep_all_chk.setChecked(False)
+        self._ref_group.check.setChecked(False)
+        self._ref_group.zone.clear()
         self._status_lbl.setText("")
         self._status_lbl.setStyleSheet("")
         self._progress_bar.hide()
@@ -470,6 +566,9 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         if not os.path.isfile(path):
             QtWidgets.QMessageBox.warning(
                 self, "Input file", f"File not found:\n{path}")
+            return
+
+        if not self._ref_group.validate_or_warn(self):
             return
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -491,7 +590,9 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._open_folder_btn.hide()
 
         self._retire_worker()
-        self._worker = _BoldFormatWorker([path], max_hits, out_dir)
+        self._worker = _BoldFormatWorker(
+            [path], max_hits, out_dir,
+            self._ref_group.path, self._ref_group.suffix)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_line.connect(self._on_log_line)
         self._worker.finished.connect(self._on_finished)

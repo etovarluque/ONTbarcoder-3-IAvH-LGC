@@ -2249,6 +2249,13 @@ class _BlastWorker(QtCore.QThread):
             except Exception as e:
                 reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
                 self._interruptible_sleep(2)
+            if label and reason and attempt < self._MAX_RETRY - 1 and not self._stop:
+                # Make a stalled submission visible instead of silent
+                self.statusUpdated.emit(
+                    "blast",
+                    f"BLAST       │ [{label}] NCBI did not accept the request "
+                    f"({reason}) — retrying {attempt + 2}/{self._MAX_RETRY}…"
+                )
         if label:
             self.statusUpdated.emit(
                 "blast",

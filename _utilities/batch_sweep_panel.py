@@ -347,6 +347,21 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         self._cfg_path = ""
         self._last_outdir = ""
+        self._dataset_loaded = False
+        self._running = False
+
+    def set_dataset_loaded(self, loaded: bool):
+        """The sweep needs the dataset from Input files; merging does not."""
+        self._dataset_loaded = loaded
+        self._sync_start_btn()
+
+    def _sync_start_btn(self):
+        ok = bool(self._cfg_path) and self._dataset_loaded and not self._running
+        self._start_btn.setEnabled(ok)
+        self._start_btn.setToolTip(
+            "" if self._dataset_loaded else
+            "Load a dataset in the Input files panel to run a sweep. "
+            "Merging existing runs does not need one.")
 
     # ── Config loading ───────────────────────────────────────────────────
 
@@ -382,7 +397,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
             self._lbl_warn.show()
         else:
             self._lbl_warn.hide()
-        self._start_btn.setEnabled(True)
+        self._sync_start_btn()
 
     def _save_template(self, dialog_title: str, default_name: str,
                        template_path: str, fallback: str):
@@ -536,7 +551,8 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._run_progress.setValue(max(0, min(100, pct)))
 
     def set_running(self, running: bool):
-        self._start_btn.setEnabled(not running and bool(self._cfg_path))
+        self._running = running
+        self._sync_start_btn()
         self._load_btn.setEnabled(not running)
         self._stop_btn.setVisible(running)
         self._sync_merge_buttons()
