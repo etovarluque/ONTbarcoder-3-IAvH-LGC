@@ -18,6 +18,13 @@ repository):
 ## [Unreleased]
 
 ### Added
+- FASTA Tools: new **FASTA stats** operation (now the panel default). Writes
+  `<name>_stats.xlsx` with Summary (counts, length stats, N50/L50, ambiguous
+  bases, GC and base composition, homopolymers, gaps, invalid, empty and
+  duplicated sequences), per-sequence table and a length histogram with chart.
+  Optional stop-codon check (Standard, Vertebrate / Invertebrate mitochondrial,
+  Plant plastid) over all 6 frames, reporting best frame, stop count and
+  positions.
 - `_utilities/compare_runs_report.py`: standalone per-sample comparison of two
   run folders (or two runs of a Parameter Batch): QC-compliant / filtered
   barcodes gained, lost or changed, and secondary variants newly flagged;

@@ -1073,6 +1073,39 @@ processing</b> to treat them as a single dataset, or process each file individua
 </figure>
 <table>
   <tr><th>Operation</th><th>Description</th></tr>
+  <tr><td><b>FASTA stats</b> (default)</td>
+      <td>Descriptive statistics saved as <code>&lt;name&gt;_stats.xlsx</code> (one per file,
+          or a single one with <b>Merge files</b>); a short summary is also printed in the
+          panel log. Sheets:
+          <ul>
+            <li><b>Summary</b> — number of sequences, total bases, min / max / mean /
+                median / standard deviation of length, N50 / L50, ambiguous bases (total,
+                %, of which N, sequences with any), GC %, A / C / G / T %, longest
+                homopolymer (max and mean), gap characters, invalid characters, empty
+                sequences and duplicated sequences.</li>
+            <li><b>Sequences</b> — one row per sequence: length, ambiguous count and %, N,
+                GC %, A / C / G / T %, longest homopolymer, gaps and invalid characters
+                (autofilter, frozen header and ID column).</li>
+            <li><b>Length histogram</b> — length bins (width chosen automatically for
+                ~20 bins) with a column chart.</li>
+          </ul>
+          Ambiguous = any IUPAC code other than A / C / G / T / U (N included). GC % and
+          base composition are computed over unambiguous bases. Gap characters
+          (<code>-</code>, <code>.</code>) are counted but excluded from the length, so
+          aligned files report real sequence lengths.<br>
+          <b>Check stop codons</b> (optional, off by default — leave it off for
+          non-coding markers or files mixing markers): choose the genetic code
+          (<i>Standard</i>, <i>Vertebrate mitochondrial</i>, <i>Invertebrate
+          mitochondrial</i> or <i>Plant plastid</i>, e.g. for rbcL / matK). All six reading
+          frames (forward and reverse complement) are scanned codon by codon, terminal
+          codon included, and the frame with the fewest stops is reported (<i>Best
+          frame</i> +1…+3 / −1…−3, number of stops and their nucleotide positions on the
+          forward sequence). An ambiguous codon counts as a stop only when every IUPAC
+          reading is a stop (e.g. <code>TAR</code>). Stop codons in a coding barcode (COI,
+          rbcL, matK) point to pseudogenes (NUMTs), indel errors or a wrong marker.
+          The invertebrate mitochondrial code (stops TAA, TAG) is a subset of the
+          vertebrate one (TAA, TAG, AGA, AGG), so it is the conservative choice for files
+          mixing vertebrates and invertebrates.</td></tr>
   <tr><td><b>Extract unique sequences</b></td><td>Collapse duplicate sequences to a single
       representative.</td></tr>
   <tr><td><b>Extract identical sequences (duplicates)</b></td>

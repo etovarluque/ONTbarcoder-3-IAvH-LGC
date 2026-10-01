@@ -467,10 +467,240 @@ class _FastaToolsWorker(QtCore.QThread):
             outputs.append(out_path)
         return outputs
 
+    # Stop codons per genetic code (NCBI tables 1, 2, 5 and 11; DNA alphabet)
+    _STOPS = {
+        "Standard":                   {"TAA", "TAG", "TGA"},
+        "Vertebrate mitochondrial":   {"TAA", "TAG", "AGA", "AGG"},
+        "Invertebrate mitochondrial": {"TAA", "TAG"},
+        "Plant plastid":              {"TAA", "TAG", "TGA"},
+    }
+    _IUPAC = {
+        "A": "A", "C": "C", "G": "G", "T": "T", "R": "AG", "Y": "CT",
+        "S": "CG", "W": "AT", "K": "GT", "M": "AC", "B": "CGT", "D": "AGT",
+        "H": "ACT", "V": "ACG", "N": "ACGT",
+    }
+    _COMPLEMENT = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
+
+    @classmethod
+    def _is_stop(cls, codon: str, stops: set) -> bool:
+        """True if every possible reading of the codon (IUPAC expanded) is a stop."""
+        if codon in stops:
+            return True
+        opts = [cls._IUPAC.get(ch) for ch in codon]
+        if None in opts or all(len(o) == 1 for o in opts):
+            return False
+        return all(a + b + c in stops for a in opts[0] for b in opts[1] for c in opts[2])
+
+    @classmethod
+    def _scan_stops(cls, seq: str, stops: set):
+        """Count stop codons in all 6 frames (every codon, terminal included).
+        Returns (best_frame, n_stops, positions) for the frame with fewest stops;
+        frames are labelled +1..+3 (forward) and -1..-3 (reverse complement).
+        Positions are 1-based nucleotide starts on the forward (ungapped) sequence."""
+        L = len(seq)
+        rc = seq.translate(cls._COMPLEMENT)[::-1]
+        best = None
+        for strand, s_ in (("+", seq), ("-", rc)):
+            for f in range(3):
+                pos = [i for i in range(f, L - 2, 3) if cls._is_stop(s_[i:i + 3], stops)]
+                if strand == "-":
+                    pos = [L - i - 2 for i in pos][::-1]
+                else:
+                    pos = [i + 1 for i in pos]
+                if best is None or len(pos) < len(best[1]):
+                    best = (f"{strand}{f + 1}", pos)
+        return best[0], len(best[1]), best[1]
+
+    @classmethod
+    def _seq_stats(cls, seq: str, stops=None) -> dict:
+        """Per-sequence composition. Gaps ('-', '.') are excluded from the length.
+        Ambiguous = IUPAC codes other than A/C/G/T/U (N included).
+        GC% is computed over unambiguous bases (A/C/G/T/U).
+        Stop codons: all 6 frames are scanned codon by codon (terminal codon
+        included); the frame with fewest stops is reported."""
+        u = seq.upper().replace("U", "T")
+        gaps = u.count("-") + u.count(".")
+        length = len(u) - gaps
+        a, c, g, t = u.count("A"), u.count("C"), u.count("G"), u.count("T")
+        n = u.count("N")
+        ambig = n + sum(u.count(ch) for ch in "RYKMSWBDHV")
+        acgt = a + c + g + t
+        invalid = max(length - acgt - ambig, 0)
+
+        ungapped = u.replace("-", "").replace(".", "")
+        homo = max((len(m.group()) for m in re.finditer(r"A+|C+|G+|T+", ungapped)), default=0)
+
+        best_frame, best_stops, stop_pos = "", 0, []
+        if stops is not None and len(ungapped) >= 3:
+            best_frame, best_stops, stop_pos = cls._scan_stops(ungapped, stops)
+        return {
+            "length": length, "gaps": gaps, "n": n, "ambig": ambig,
+            "invalid": invalid, "gc": c + g, "acgt": acgt,
+            "a": a, "c": c, "g": g, "t": t, "homopolymer": homo,
+            "frame": best_frame, "stops": best_stops, "stop_pos": stop_pos,
+            "ambig_pct": 100.0 * ambig / length if length else 0.0,
+            "gc_pct": 100.0 * (c + g) / acgt if acgt else 0.0,
+        }
+
+    def _run_stats(self):
+        import statistics
+        outputs = []
+        gcode = self._params.get("genetic_code")
+        stops = self._STOPS.get(gcode)
+        for display_name, stem, records in self._iter_inputs():
+            if self._stop:
+                break
+            rows = [(hdr, self._seq_stats(seq, stops)) for hdr, seq in records]
+            lengths = [s["length"] for _, s in rows]
+            n_seq = len(rows)
+            total = sum(lengths)
+            total_ambig = sum(s["ambig"] for _, s in rows)
+            total_acgt = sum(s["acgt"] for _, s in rows)
+            total_gc = sum(s["gc"] for _, s in rows)
+
+            n50 = l50 = 0
+            acc = 0
+            for i, ln in enumerate(sorted(lengths, reverse=True), 1):
+                acc += ln
+                if acc * 2 >= total:
+                    n50, l50 = ln, i
+                    break
+
+            dup_seqs = n_seq - len({seq.upper() for _, seq in records})
+            summary = [
+                ("File(s)",                          display_name),
+                ("Number of sequences",              n_seq),
+                ("Total bases",                      total),
+                ("Minimum length",                   min(lengths) if lengths else 0),
+                ("Maximum length",                   max(lengths) if lengths else 0),
+                ("Mean length",                      round(total / n_seq, 2) if n_seq else 0),
+                ("Median length",                    statistics.median(lengths) if lengths else 0),
+                ("Std. deviation of length",         round(statistics.pstdev(lengths), 2) if lengths else 0),
+                ("N50",                              n50),
+                ("L50",                              l50),
+                ("Ambiguous bases (IUPAC, incl. N)", total_ambig),
+                ("Ambiguous bases (%)",              round(100.0 * total_ambig / total, 4) if total else 0),
+                ("  of which N",                     sum(s["n"] for _, s in rows)),
+                ("Sequences with ambiguous bases",   sum(1 for _, s in rows if s["ambig"])),
+                ("GC content (%)",                   round(100.0 * total_gc / total_acgt, 2) if total_acgt else 0),
+                ("Gap characters ('-' '.')",         sum(s["gaps"] for _, s in rows)),
+                ("Invalid characters",               sum(s["invalid"] for _, s in rows)),
+                ("Empty sequences",                  sum(1 for ln in lengths if ln == 0)),
+                ("Duplicated sequences (extra copies)", dup_seqs),
+            ]
+            for base in "acgt":
+                summary.append((f"{base.upper()} (%)",
+                                round(100.0 * sum(s[base] for _, s in rows) / total_acgt, 2)
+                                if total_acgt else 0))
+            homos = [s["homopolymer"] for _, s in rows]
+            summary.append(("Longest homopolymer (max)", max(homos) if homos else 0))
+            summary.append(("Longest homopolymer (mean)",
+                            round(sum(homos) / n_seq, 2) if n_seq else 0))
+            if stops is not None:
+                summary.append(("Genetic code", gcode))
+                summary.append(("Sequences with stop codons (best of 6 frames)",
+                                sum(1 for _, s in rows if s["stops"])))
+
+            xlsx_path = os.path.join(self._out_dir, f"{stem}_stats.xlsx")
+            wb = xlsxwriter.Workbook(xlsx_path)
+            hf = wb.add_format({"bold": True, "bg_color": "#4F81BD",
+                                "font_color": "#FFFFFF", "border": 1})
+            cf = wb.add_format({"border": 1, "valign": "top"})
+            nf = wb.add_format({"border": 1, "align": "center", "valign": "top"})
+            pf = wb.add_format({"border": 1, "align": "center", "valign": "top",
+                                "num_format": "0.00"})
+
+            ws_s = wb.add_worksheet("Summary")
+            ws_s.activate()
+            ws_s.write(0, 0, "Metric", hf)
+            ws_s.write(0, 1, "Value", hf)
+            ws_s.set_column(0, 0, 38)
+            ws_s.set_column(1, 1, 24)
+            for r, (k, v) in enumerate(summary, start=1):
+                ws_s.write(r, 0, k, cf)
+                ws_s.write(r, 1, v, nf)
+
+            ws_q = wb.add_worksheet("Sequences")
+            cols = ["ID", "Length", "Ambiguous", "Ambiguous (%)", "N",
+                    "GC (%)", "A (%)", "C (%)", "G (%)", "T (%)",
+                    "Longest homopolymer", "Gaps", "Invalid"]
+            if stops is not None:
+                cols += ["Best frame", "Stop codons", "Stop positions (nt)"]
+            for c, h in enumerate(cols):
+                ws_q.write(0, c, h, hf)
+            ws_q.set_column(0, 0, 40)
+            ws_q.set_column(1, len(cols) - 1, 14)
+            for r, (hdr, s) in enumerate(rows, start=1):
+                acgt = s["acgt"]
+                comp = [100.0 * s[b] / acgt if acgt else 0.0 for b in "acgt"]
+                vals = [(s["length"], nf), (s["ambig"], nf), (s["ambig_pct"], pf),
+                        (s["n"], nf), (s["gc_pct"], pf)]
+                vals += [(v, pf) for v in comp]
+                vals += [(s["homopolymer"], nf), (s["gaps"], nf), (s["invalid"], nf)]
+                if stops is not None:
+                    vals += [(s["frame"], nf), (s["stops"], nf),
+                             (", ".join(map(str, s["stop_pos"])), cf)]
+                ws_q.write(r, 0, hdr, cf)
+                for c, (v, fmt) in enumerate(vals, start=1):
+                    ws_q.write(r, c, v, fmt)
+            ws_q.freeze_panes(1, 1)
+            ws_q.autofilter(0, 0, max(n_seq, 1), len(cols) - 1)
+
+            # Length histogram with a "nice" bin width (~20 bins)
+            ws_h = wb.add_worksheet("Length histogram")
+            ws_h.write(0, 0, "Bin start", hf)
+            ws_h.write(0, 1, "Bin end", hf)
+            ws_h.write(0, 2, "Sequences", hf)
+            ws_h.set_column(0, 2, 14)
+            if lengths:
+                lo, hi = min(lengths), max(lengths)
+                raw = max((hi - lo) / 20.0, 1)
+                width = next(w for m in (1, 10, 100, 1000, 10000, 100000, 10 ** 9)
+                             for w in (m, 2 * m, 5 * m) if w >= raw)
+                start = (lo // width) * width
+                n_bins = (hi - start) // width + 1
+                counts = Counter((ln - start) // width for ln in lengths)
+                for b in range(n_bins):
+                    ws_h.write(b + 1, 0, start + b * width, nf)
+                    ws_h.write(b + 1, 1, start + (b + 1) * width - 1, nf)
+                    ws_h.write(b + 1, 2, counts.get(b, 0), nf)
+                chart = wb.add_chart({"type": "column"})
+                chart.add_series({
+                    "name":       "Sequences",
+                    "categories": ["Length histogram", 1, 0, n_bins, 0],
+                    "values":     ["Length histogram", 1, 2, n_bins, 2],
+                    "gap":        10,
+                })
+                chart.set_title({"name": f"Length distribution (bin = {width} bp)"})
+                chart.set_x_axis({"name": "Length (bin start, bp)"})
+                chart.set_y_axis({"name": "Sequences"})
+                chart.set_legend({"none": True})
+                chart.set_size({"width": 760, "height": 400})
+                ws_h.insert_chart(1, 4, chart)
+            wb.close()
+            outputs.append(xlsx_path)
+
+            self.log_line.emit(
+                f"{display_name}\n"
+                f"  Sequences          :  {n_seq}\n"
+                f"  Length min/max/mean:  {summary[3][1]} / {summary[4][1]} / {summary[5][1]}\n"
+                f"  Total bases        :  {total}\n"
+                f"  N50                :  {n50}\n"
+                f"  Ambiguous bases    :  {total_ambig}  ({summary[11][1]}%)\n"
+                f"  GC content         :  {summary[14][1]}%\n"
+                f"  Longest homopolymer:  {max(homos) if homos else 0}\n"
+                + (f"  With stop codons   :  {summary[-1][1]} sequence(s)\n"
+                   if stops is not None else "")
+                + f"  Stats file         :  {os.path.basename(xlsx_path)}\n"
+            )
+        return outputs
+
     def run(self):
         try:
             os.makedirs(self._out_dir, exist_ok=True)
-            if self._operation == "unique":
+            if self._operation == "stats":
+                outputs = self._run_stats()
+            elif self._operation == "unique":
                 outputs = self._run_unique()
             elif self._operation == "identical":
                 outputs = self._run_identical()
@@ -540,6 +770,8 @@ class _DragDropLineEdit(QtWidgets.QLineEdit):
 
 
 class FastaToolsPanel(QtWidgets.QWidget):
+    _FASTA_GCODES = list(_FastaToolsWorker._STOPS)
+
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -588,6 +820,17 @@ class FastaToolsPanel(QtWidgets.QWidget):
         ops_layout.setContentsMargins(0, 0, 0, 0)
         ops_layout.setSpacing(2)
 
+        self._radio_stats     = QtWidgets.QRadioButton("FASTA stats")
+        self._radio_stats.setToolTip(
+            "Summary statistics and per-sequence table, saved as <name>_stats.xlsx\n"
+            "  • Sheet 'Summary': number of sequences, total bases, min/max/mean/median\n"
+            "    length, N50/L50, ambiguous bases, GC content, gaps, duplicates\n"
+            "  • Sheet 'Sequences': length, ambiguous count and %, N, GC %, gaps per sequence\n\n"
+            "Ambiguous = IUPAC codes other than A/C/G/T/U (N included).\n"
+            "GC % is computed over unambiguous bases. Gaps ('-', '.') are not counted in length.\n"
+            "Also reports A/C/G/T composition, longest homopolymer, a length histogram\n"
+            "sheet with chart and, optionally, stop codons (best of 6 frames)."
+        )
         self._radio_unique    = QtWidgets.QRadioButton("Extract unique sequences")
         self._radio_identical = QtWidgets.QRadioButton("Extract identical sequences (duplicates)")
         self._radio_identical.setToolTip(
@@ -605,14 +848,38 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._radio_sort         = QtWidgets.QRadioButton("Sort sequences")
 
         self._op_group = QtWidgets.QButtonGroup(self)
-        for rb in (self._radio_unique, self._radio_identical,
+        for rb in (self._radio_stats, self._radio_unique, self._radio_identical,
                    self._radio_grep, self._radio_filter_fields,
                    self._radio_append, self._radio_reformat, self._radio_sort):
             self._op_group.addButton(rb)
 
-        self._radio_unique.setChecked(True)
+        self._radio_stats.setChecked(True)
         self._op_group.buttonClicked.connect(self._on_operation_changed)
 
+        ops_layout.addWidget(self._radio_stats)
+        self._stats_widget = QtWidgets.QWidget()
+        stl = QtWidgets.QHBoxLayout(self._stats_widget)
+        stl.setContentsMargins(20, 4, 0, 4)
+        stl.setSpacing(8)
+        self._stats_stops_chk = QtWidgets.QCheckBox("Check stop codons — genetic code:")
+        self._stats_stops_chk.setToolTip(
+            "Optional. Scans all 6 reading frames (forward and reverse complement),\n"
+            "codon by codon including the last one, and reports the frame with fewest stops.\n"
+            "Ambiguous codons count as stop only if every IUPAC reading is a stop (e.g. TAR).\n"
+            "Stop codons in coding barcodes (COI, rbcL, matK…) suggest pseudogenes (NUMTs)\n"
+            "or indel errors. Leave unchecked for non-coding markers or mixed-marker files."
+        )
+        stl.addWidget(self._stats_stops_chk)
+        self._stats_gcode_combo = QtWidgets.QComboBox()
+        for name in self._FASTA_GCODES:
+            self._stats_gcode_combo.addItem(name)
+        self._stats_gcode_combo.setCurrentText("Invertebrate mitochondrial")
+        self._stats_gcode_combo.setEnabled(False)
+        self._stats_stops_chk.toggled.connect(self._stats_gcode_combo.setEnabled)
+        stl.addWidget(self._stats_gcode_combo)
+        stl.addStretch(1)
+        ops_layout.addWidget(self._stats_widget)
+        ops_layout.addSpacing(4)
         ops_layout.addWidget(self._radio_unique)
         ops_layout.addWidget(self._radio_identical)
 
@@ -1063,6 +1330,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._update_ff_preview()
 
     def _on_operation_changed(self, _btn):
+        self._stats_widget.setVisible(self._radio_stats.isChecked())
         self._grep_widget.setVisible(self._radio_grep.isChecked())
         self._filter_widget.setVisible(self._radio_filter_fields.isChecked())
         self._append_widget.setVisible(self._radio_append.isChecked())
@@ -1323,7 +1591,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._set_run_enabled(False)
         self._merge_chk.setChecked(False)
 
-        self._radio_unique.setChecked(True)
+        self._radio_stats.setChecked(True)
+        self._stats_widget.show()
+        self._stats_stops_chk.setChecked(False)
+        self._stats_gcode_combo.setCurrentText("Invertebrate mitochondrial")
         self._grep_widget.hide()
         self._filter_widget.hide()
         self._append_widget.hide()
@@ -1381,6 +1652,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             return
 
         operation = (
+            "stats"          if self._radio_stats.isChecked()          else
             "unique"         if self._radio_unique.isChecked()         else
             "identical"      if self._radio_identical.isChecked()      else
             "grep"           if self._radio_grep.isChecked()           else
@@ -1391,7 +1663,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         )
 
         params: dict = {"merge": self._merge_chk.isChecked()}
-        if operation == "grep":
+        if operation == "stats":
+            if self._stats_stops_chk.isChecked():
+                params["genetic_code"] = self._stats_gcode_combo.currentText()
+        elif operation == "grep":
             params["use_regex"] = self._grep_regex_chk.isChecked()
             if self._grep_use_file_chk.isChecked():
                 params["pattern_file"] = self._grep_file_edit.text().strip()
