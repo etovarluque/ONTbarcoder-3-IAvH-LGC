@@ -19,6 +19,25 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 
 ---
 
+## [3.6.0] — 2026-10-06
+
+### Added
+- **Light / dark theme.** New toggle in the top bar (remembered between
+  sessions). The palette is now indigo; the theme engine lives in the new
+  `ont_ui.py` and recolours the shared `_utilities/` panels without editing
+  them.
+- **Tabbed sidebar:** *Workflow* and *Utilities* are two tabs; the tab follows
+  the active panel. Step numbers, done marks and locks are unchanged.
+- **Monochrome SVG icons** (same style as BarcodeSuite) beside every sidebar
+  item and before each tool panel's title; they follow the theme and the
+  item's state.
+
+### Changed
+- The top bar uses the theme surface instead of a fixed dark band.
+- Custom-painted charts keep a light background in dark mode.
+
+---
+
 ## [3.5.1] — 2026-10-06
 
 ### Changed

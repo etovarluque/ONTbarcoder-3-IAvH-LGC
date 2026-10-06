@@ -9,7 +9,7 @@ from __future__ import annotations
 # Single source of truth for the program version (MAJOR.MINOR.PATCH).
 # MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
 # PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
-__version__ = "3.5.1"
+__version__ = "3.6.0"
 # GitHub repository queried for newer releases at start-up.
 UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
 
@@ -228,7 +228,9 @@ import _utilities.pipeline as _ont_mp
 
 
 
+import ont_ui
 from _utilities.compare_panel import ComparePanel, _CompareWorker, _PairCompareWorker
+import _utilities.compare_panel as _compare_panel_mod
 from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
 from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.fastq_inspector import FastqInspectorPanel
@@ -379,69 +381,6 @@ QMessageBox {{
 QMessageBox QLabel {{
     color: {TEXT_PRI};
     background-color: transparent;
-}}
-
-/* ── Sidebar ── */
-#sidebar {{
-    background-color: {SIDEBAR_BG};
-    border-right: 1px solid {GRAY_LINE};
-}}
-#sidebar_item {{
-    padding: 12px 16px;
-    border-left: 8px solid transparent;
-    color: {TEXT_SEC};
-    background: transparent;
-    text-align: left;
-    border-radius: 0;
-    font-size: 20px;
-}}
-#sidebar_item:hover {{
-    background-color: {GRAY_BG};
-}}
-#sidebar_item[state="active"] {{
-    color: {GRAY_DARK};
-    background-color: {GRAY_BG};
-    border-left-color: {BLUE_MID};
-    font-weight: 500;
-}}
-#sidebar_item[state="done"] {{
-    color: {GREEN};
-    background: transparent;
-    border-left: 2px solid transparent;
-}}
-#sidebar_item[state="locked"] {{
-    color: {TEXT_HINT};
-    background: transparent;
-    border-left: 2px solid transparent;
-}}
-#sidebar_section {{
-    font-size: 10px;
-    font-weight: 600;
-    color: {TEXT_HINT};
-    padding: 8px 16px 2px;
-    letter-spacing: 0.5px;
-    background: transparent;
-}}
-
-/* ── Topbar ── */
-#topbar {{
-    background-color: {TOPBAR_BG};
-    border-bottom: 1px solid {GRAY_LINE};
-}}
-#topbar_logo {{
-    font-size: 28px;
-    font-weight: 600;
-    letter-spacing: -0.3px;
-    color: {WHITE};
-}}
-#topbar_badge {{
-    font-size: 15px;
-    padding: 2px 8px;
-    border-radius: 10px;
-    background-color: {GRAY_BG};
-    color: {BLUE};
-    margin-top: 8px;      /* ← Space above */
-    margin-bottom: 8px;   /* ← Space below */
 }}
 
 /* ── Cards ── */
@@ -778,6 +717,7 @@ def _fmt_num(v):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class SidebarWidget(QtWidgets.QWidget):
+    """Left navigation: two tabs (Workflow / Utilities), each with its own list."""
     panelRequested = QtCore.pyqtSignal(str)
 
     ITEMS = [
@@ -785,7 +725,7 @@ class SidebarWidget(QtWidgets.QWidget):
         ("params",      "Parameters"),
         ("batch_sweep", "Parameter Sweep"),
         ("progress",    "Analysis"),
-        ("live_chart",  "📈 RT Charts"),
+        ("live_chart",  "RT Charts"),
         ("results",     "Results"),
     ]
     TOOLS = [
@@ -795,11 +735,21 @@ class SidebarWidget(QtWidgets.QWidget):
         ("blast",           "BLAST"),
         ("best_seq",        "Best Sequence"),
         ("bold_formatter",  "BOLD Formatter"),
-        ("notes",           "NOTES 📝"),
+        ("notes",           "Notes"),
     ]
 
+    # Monochrome SVG icon (ont_ui._ICON_PATHS) shown beside each item and in
+    # the panel title; recoloured with the theme and the item's state.
+    ICONS = {
+        "setup": "setup", "params": "params", "batch_sweep": "sweep",
+        "progress": "analysis", "live_chart": "chart", "results": "results",
+        "compare": "compare", "fasta_tools": "fasta", "fastq_inspector": "fastq",
+        "blast": "blast", "best_seq": "best", "bold_formatter": "bold",
+        "notes": "notes",
+    }
+
     # Sidebar items shown in italics to signal they sit outside the linear
-    # Workflow even though they live in that section (e.g. Parameter Sweep:
+    # Workflow even though they live in that tab (e.g. Parameter Sweep:
     # optional, self-contained, not a required step to reach Results).
     _ITALIC_ITEMS = {"batch_sweep"}
 
@@ -818,59 +768,66 @@ class SidebarWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sidebar")
-        self.setFixedWidth(220)
+        self.setFixedWidth(250)
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
 
         self._buttons = {}
         self._states = {k: "pending" for k, _ in self.ITEMS + self.TOOLS}
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 12, 0, 12)
+        layout.setContentsMargins(12, 14, 12, 14)
         layout.setSpacing(0)
 
-        _section_style = (
-            f"font-size:18px; font-weight:600; color:{WHITE}; letter-spacing:0.5px;"
-            f" background-color:{TOPBAR_BG}; padding:4px 0px;"
-        )
-        self._lbl_workflow = make_section_label("  Workflow")
-        self._lbl_workflow.setStyleSheet(_section_style)
-        layout.addWidget(self._lbl_workflow)
-        layout.addSpacing(4)
+        # Tab selector (segmented control)
+        tabs = QtWidgets.QFrame()
+        tabs.setObjectName("sidebar_tabs")
+        tl = QtWidgets.QHBoxLayout(tabs)
+        tl.setContentsMargins(4, 4, 4, 4)
+        tl.setSpacing(4)
+        self._tab_group = QtWidgets.QButtonGroup(self)
+        self._tab_group.setExclusive(True)
+        self._tab_btns = []
+        for i, name in enumerate(("Workflow", "Utilities")):
+            tb = QtWidgets.QPushButton(name)
+            tb.setObjectName("sidebar_tab")
+            tb.setCheckable(True)
+            tb.setFixedHeight(36)
+            tb.setCursor(QtCore.Qt.PointingHandCursor)
+            tb.clicked.connect(lambda _, n=i: self._pages.setCurrentIndex(n))
+            self._tab_group.addButton(tb, i)
+            self._tab_btns.append(tb)
+            tl.addWidget(tb, 1)
+        self._tab_btns[0].setChecked(True)
+        layout.addWidget(tabs)
+        layout.addSpacing(12)
 
-        for key, label in self.ITEMS:
-            btn = self._make_item(key, label)
-            if key in self._ITALIC_ITEMS:
-                f = btn.font()
-                f.setItalic(True)
-                btn.setFont(f)
-            layout.addWidget(btn)
-            self._buttons[key] = btn
+        self._pages = QtWidgets.QStackedWidget()
+        self._pages.currentChanged.connect(
+            lambda i: self._tab_btns[i].setChecked(True))
+        for items in (self.ITEMS, self.TOOLS):
+            page = QtWidgets.QWidget()
+            pl = QtWidgets.QVBoxLayout(page)
+            pl.setContentsMargins(0, 0, 0, 0)
+            pl.setSpacing(4)
+            for key, label in items:
+                btn = self._make_item(key, label)
+                if key in self._ITALIC_ITEMS:
+                    f = btn.font()
+                    f.setItalic(True)
+                    btn.setFont(f)
+                pl.addWidget(btn)
+                self._buttons[key] = btn
+            pl.addStretch()
+            self._pages.addWidget(page)
+        layout.addWidget(self._pages, 1)
 
         # RT graphics only visible in live mode
         self._buttons["live_chart"].setVisible(False)
 
-        layout.addSpacing(12)
-        self._lbl_tools = make_section_label("  Utilities")
-        self._lbl_tools.setStyleSheet(_section_style)
-        layout.addWidget(self._lbl_tools)
-        layout.addSpacing(4)
-
-        for key, label in self.TOOLS:
-            btn = self._make_item(key, label)
-            layout.addWidget(btn)
-            self._buttons[key] = btn
-
-        layout.addStretch()
-
         self._quit_btn = QtWidgets.QPushButton("Quit")
-        self._quit_btn.setObjectName("secondary_btn")
+        self._quit_btn.setObjectName("sidebar_quit")
         self._quit_btn.setFixedHeight(40)
-        self._quit_btn.setStyleSheet(
-            f"QPushButton {{ margin:0 12px; color:{RED}; border-color:#F09595; "
-            f"background:transparent; border-radius:8px; padding:5px 10px; font-size:18px; }}"
-            f"QPushButton:hover {{ background-color:#F58181; color:{WHITE}; }}"
-            f"QPushButton:pressed {{ background-color:#EE5050; color:{WHITE}; }}"
-        )
+        self._quit_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self._quit_btn.clicked.connect(QtWidgets.QApplication.quit)
         layout.addWidget(self._quit_btn)
 
@@ -878,15 +835,15 @@ class SidebarWidget(QtWidgets.QWidget):
 
     def retranslateUi(self):
         ctx = "SidebarWidget"
-        self._lbl_workflow.setText(("  " + _tr(ctx, "Workflow")).upper())
-        self._lbl_tools.setText(("  " + _tr(ctx, "Utilities")).upper())
+        for tb, name in zip(self._tab_btns, ("Workflow", "Utilities")):
+            tb.setText(_tr(ctx, name))
         self._quit_btn.setText(_tr(ctx, "Quit"))
         for key in self._buttons:
             self._refresh_item(key)
 
     def _refresh_item(self, key):
-        """Text and tooltip of one item from its state: step number, a check
-        mark once done, and why it is locked."""
+        """Text and tooltip of one item from its state: step number or emoji,
+        a check mark once done, and why it is locked."""
         btn = self._buttons.get(key)
         if btn is None:
             return
@@ -894,8 +851,7 @@ class SidebarWidget(QtWidgets.QWidget):
         src = dict(self.ITEMS + self.TOOLS)[key]
         text = _tr(ctx, src)
         num = self._STEP_NUMBERS.get(key)
-        if num:
-            text = f"{num}  {text}"
+        text = f"{num}   {text}" if num else f"  {text}"
         state = self._states.get(key)
         if state == "done" and key in dict(self.ITEMS):
             text += "  ✓"
@@ -913,7 +869,8 @@ class SidebarWidget(QtWidgets.QWidget):
     def _make_item(self, key, label):
         btn = QtWidgets.QPushButton(label)
         btn.setObjectName("sidebar_item")
-        btn.setFixedHeight(58)
+        btn.setFixedHeight(48)
+        btn.setIconSize(QtCore.QSize(20, 20))
         btn.setCursor(QtCore.Qt.PointingHandCursor)
         btn.setProperty("state", "pending")
         btn.clicked.connect(lambda _, k=key: self._on_item_clicked(k))
@@ -924,6 +881,16 @@ class SidebarWidget(QtWidgets.QWidget):
             return   # ignore click on locked panel
         self.panelRequested.emit(key)
 
+    def _sync_icons(self):
+        """Icon colour follows the item's state and the current theme."""
+        for k, btn in self._buttons.items():
+            st = btn.property("state")
+            color = {"active": ont_ui.tok("accent_fg"), "done": ont_ui.tok("ok"),
+                     "locked": ont_ui.tok("text_hint")}.get(st, ont_ui.tok("text_sec"))
+            btn.setIcon(ont_ui.make_icon(self.ICONS[k], color))
+
+    refresh_theme = _sync_icons
+
     def lock_item(self, key):
         """Locks a panel: you cannot navigate to it from the sidebar."""
         self._states[key] = "locked"
@@ -933,6 +900,7 @@ class SidebarWidget(QtWidgets.QWidget):
             btn.setCursor(QtCore.Qt.ForbiddenCursor)
             refresh_style(btn)
         self._refresh_item(key)
+        self._sync_icons()
 
     def unlock_item(self, key):
         """Unlock a panel allowing navigation."""
@@ -948,8 +916,14 @@ class SidebarWidget(QtWidgets.QWidget):
                 btn.setCursor(QtCore.Qt.PointingHandCursor)
                 refresh_style(btn)
         self._refresh_item(key)
+        self._sync_icons()
 
     def set_active(self, key):
+        # Follow the selection: show the tab that holds the active panel.
+        if key in dict(self.TOOLS):
+            self._pages.setCurrentIndex(1)
+        elif key in dict(self.ITEMS):
+            self._pages.setCurrentIndex(0)
         for k, btn in self._buttons.items():
             self._refresh_item(k)
             # Never override a locked item: keep its locked look and cursor so
@@ -966,6 +940,7 @@ class SidebarWidget(QtWidgets.QWidget):
             else:
                 btn.setProperty("state", "pending")
             refresh_style(btn)
+        self._sync_icons()
 
     def mark_done(self, key):
         self._states[key] = "done"
@@ -975,6 +950,7 @@ class SidebarWidget(QtWidgets.QWidget):
             refresh_style(btn)
         btn.setCursor(QtCore.Qt.PointingHandCursor)
         self._refresh_item(key)
+        self._sync_icons()
 
     def show_item(self, key):
         if key in self._buttons:
@@ -1305,6 +1281,7 @@ class TopBar(QtWidgets.QWidget):
     languageChanged = QtCore.pyqtSignal(str)
     aboutRequested  = QtCore.pyqtSignal()
     uiScaleChanged  = QtCore.pyqtSignal(float)
+    themeToggled    = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1365,7 +1342,7 @@ class TopBar(QtWidgets.QWidget):
         # QT_SCALE_FACTOR can only be set before QApplication exists, so the
         # choice is stored in QSettings and applied on the next start-up.
         self._scale_label = QtWidgets.QLabel(_tr("TopBar", "UI size"))
-        self._scale_label.setStyleSheet(f"color:{WHITE}; font-size:15px;")
+        self._scale_label.setStyleSheet(f"color:{TEXT_SEC}; font-size:15px;")
         self._scale_combo = QtWidgets.QComboBox()
         self._scale_combo.setObjectName("ui_scale_combo")
         self._scale_combo.setFixedHeight(28)
@@ -1378,9 +1355,9 @@ class TopBar(QtWidgets.QWidget):
         ))
         self._scale_combo.setStyleSheet(f"""
             QComboBox {{
-                color: {WHITE};
+                color: {TEXT_PRI};
                 background-color: transparent;
-                border: 1px solid {WHITE};
+                border: 1px solid {GRAY_LINE};
                 border-radius: 8px;
                 padding: 3px 8px;
                 font-size: 15px;
@@ -1406,6 +1383,14 @@ class TopBar(QtWidgets.QWidget):
                 self._scale_combo.setCurrentIndex(_i)
                 break
         self._scale_combo.currentIndexChanged.connect(self._on_scale_changed)
+        self._theme_btn = QtWidgets.QPushButton()
+        self._theme_btn.setObjectName("theme_btn")
+        self._theme_btn.setFixedHeight(28)
+        self._theme_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self._theme_btn.clicked.connect(self.themeToggled)
+        self.refresh_theme_button()
+        layout.addWidget(self._theme_btn)
+        layout.addSpacing(16)
         layout.addWidget(self._scale_label)
         layout.addSpacing(6)
         layout.addWidget(self._scale_combo)
@@ -1416,9 +1401,9 @@ class TopBar(QtWidgets.QWidget):
         self._docs_btn.setFixedHeight(28)
         self._docs_btn.setStyleSheet(f"""
             QPushButton {{
-                color: {WHITE};
+                color: {TEXT_PRI};
                 background-color: transparent;
-                border: 1px solid {WHITE};
+                border: 1px solid {GRAY_LINE};
                 border-radius: 8px;
                 padding: 7px 16px;
                 font-size: 15px;
@@ -1446,9 +1431,9 @@ class TopBar(QtWidgets.QWidget):
         self._about_btn.setFixedHeight(28)
         self._about_btn.setStyleSheet(f"""
             QPushButton {{
-                color: {WHITE};
+                color: {TEXT_PRI};
                 background-color: transparent;
-                border: 1px solid {WHITE};
+                border: 1px solid {GRAY_LINE};
                 border-radius: 8px;
                 padding: 7px 16px;
                 font-size: 15px;
@@ -1465,6 +1450,12 @@ class TopBar(QtWidgets.QWidget):
         """)
         self._about_btn.clicked.connect(self.aboutRequested)
         layout.addWidget(self._about_btn)
+
+    def refresh_theme_button(self):
+        dark = ont_ui.current_theme() == "dark"
+        self._theme_btn.setIcon(ont_ui.make_icon("sun" if dark else "moon", ont_ui.tok("text_sec")))
+        self._theme_btn.setText(" Light" if dark else " Dark")
+        self._theme_btn.setToolTip("Switch to light theme" if dark else "Switch to dark theme")
 
     def _on_scale_changed(self, _index):
         """Store the new UI scale and let MainWindow offer a restart."""
@@ -1498,9 +1489,9 @@ class TopBar(QtWidgets.QWidget):
         """
         inactive_style = f"""
             QPushButton {{
-                color: {WHITE};
+                color: {TEXT_PRI};
                 background-color: transparent;
-                border: 1px solid {WHITE};
+                border: 1px solid {GRAY_LINE};
                 border-radius: 6px;
                 padding: 3px 10px;
                 font-size: 13px;
@@ -5633,6 +5624,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self._stack.addWidget(panel)
 
+        self._add_title_icons()
+        self._sidebar.refresh_theme()
+
         self._panel_map = {
             "setup": 0, "params": 1, "progress": 2,
             "live_chart": 3, "results": 4, "compare": 5,
@@ -5660,6 +5654,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._topbar.languageChanged.connect(self._on_language_changed)
         self._topbar.aboutRequested.connect(self._show_about)
         self._topbar.uiScaleChanged.connect(self._on_ui_scale_changed)
+        self._topbar.themeToggled.connect(self._toggle_theme)
 
         # Lock panels until user configures input files
         for key in ("params", "progress", "results"):
@@ -5671,6 +5666,62 @@ class MainWindow(QtWidgets.QMainWindow):
         if QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).value(
                 "check_updates", True, type=bool):
             QtCore.QTimer.singleShot(3000, self._start_update_check)
+
+    def _toggle_theme(self):
+        theme = "light" if ont_ui.current_theme() == "dark" else "dark"
+        ont_ui.apply_theme(QtWidgets.QApplication.instance(), theme, STYLESHEET)
+        self._topbar.refresh_theme_button()
+        self._sidebar.refresh_theme()
+        self._refresh_title_icons()
+        QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).setValue("ui/theme", theme)
+
+    def _add_title_icons(self):
+        """Put each tool panel's sidebar icon before its title. The panels
+        live in _utilities/ (shared verbatim with BarcodeSuite), so the title
+        labels are found by text here instead of being edited there."""
+        panels = {
+            "compare": self._panel_compare, "fasta_tools": self._panel_fasta_tools,
+            "fastq_inspector": self._panel_fastq_inspector, "blast": self._panel_blast,
+            "best_seq": self._panel_best_seq, "bold_formatter": self._panel_bold_formatter,
+            "notes": self._panel_notes, "batch_sweep": self._panel_batch_sweep,
+        }
+        # Title text each panel uses (not always the sidebar name).
+        titles = {
+            "compare": ("Compare barcode sets",), "fasta_tools": ("FASTA Tools",),
+            "fastq_inspector": ("FASTQ Inspector",),
+            "blast": ("BLAST API Search", "BLAST Web Results"),
+            "best_seq": ("Best Sequence Selector",),
+            "bold_formatter": ("BOLD Formatter",), "notes": ("Notes",),
+            "batch_sweep": ("Parameter Sweep (Optional)",),
+        }
+        self._title_icons = []
+        for key, panel in panels.items():
+            for lbl in panel.findChildren(QtWidgets.QLabel):
+                if lbl.text().strip() not in titles[key]:
+                    continue
+                layout = lbl.parentWidget().layout() if lbl.parentWidget() else None
+                if layout is None or layout.indexOf(lbl) < 0:
+                    continue
+                row = QtWidgets.QWidget()
+                hl = QtWidgets.QHBoxLayout(row)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(8)
+                ico = QtWidgets.QLabel()
+                ico.setFixedSize(24, 24)
+                hl.addWidget(ico)
+                layout.replaceWidget(lbl, row)
+                hl.addWidget(lbl, 1)
+                self._title_icons.append((ico, SidebarWidget.ICONS[key]))
+        self._refresh_title_icons()
+
+    def _refresh_title_icons(self):
+        color = ont_ui.tok("accent_fg")
+        for ico, name in self._title_icons:
+            ico.setPixmap(ont_ui.icon_pixmap(name, color, 24))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        ont_ui.set_dark_titlebar(self, ont_ui.current_theme() == "dark")
 
     def _start_update_check(self):
         self._update_checker = UpdateChecker(self)
@@ -12564,6 +12615,10 @@ def _write_crash_log(exc_type, exc_value, exc_tb):
         f.write("".join(traceback.format_exception(exc_type, exc_value, exc_tb)))
 
 
+def _load_ui_theme() -> str:
+    return QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).value("ui/theme", "light", type=str)
+
+
 def main():
     import traceback
     log_path = os.path.join(os.path.expanduser("~"), "ONTbarcoder_crash.log")
@@ -12613,7 +12668,9 @@ def main():
             pass
 
         app = QtWidgets.QApplication(sys.argv)
-        app.setStyleSheet(STYLESHEET)
+        ont_ui.install_hooks()
+        ont_ui.install_compare_results_hook(_compare_panel_mod._CompareResultsWindow)
+        ont_ui.apply_theme(app, _load_ui_theme(), STYLESHEET)
         app.setApplicationName("ONTbarcoder")
         app.setApplicationVersion(__version__)
 
