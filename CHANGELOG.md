@@ -19,6 +19,17 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 
 ---
 
+## [3.5.1] — 2026-10-06
+
+### Changed
+- Update check is platform-aware: only releases that ship this system's
+  package (`*_win.zip` on Windows, `*_linux.tar.gz` on Linux) count, so a
+  release published for Windows first no longer notifies Linux users with
+  nothing to download. The newest such release newer than the installed
+  version is offered.
+- The update dialog downloads that package directly (**Download v…**),
+  shows its name and size, and links to the release page.
+
 ## [3.5.0] — 2026-10-06
 
 ### Changed

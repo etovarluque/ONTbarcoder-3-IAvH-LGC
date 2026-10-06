@@ -9,7 +9,7 @@ from __future__ import annotations
 # Single source of truth for the program version (MAJOR.MINOR.PATCH).
 # MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
 # PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
-__version__ = "3.5.0"
+__version__ = "3.5.1"
 # GitHub repository queried for newer releases at start-up.
 UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
 
@@ -1136,7 +1136,8 @@ class AboutDialog(QtWidgets.QDialog):
         owner = self.parent()
         if owner is not None and hasattr(owner, "_on_update_available"):
             checker.updateAvailable.connect(
-                lambda t, u, n: owner._on_update_available(t, u, n, manual=True))
+                lambda t, u, n, a, al: owner._on_update_available(
+                    t, u, n, a, al, manual=True))
         checker.upToDate.connect(lambda: QtWidgets.QMessageBox.information(
             self, "Check for updates",
             f"ONTbarcoder v{__version__} is the latest version."))
@@ -1160,12 +1161,26 @@ def _version_tuple(text: str) -> tuple:
     return tuple((nums + [0, 0, 0])[:3])
 
 
+def _platform_asset_suffix() -> str:
+    """Release-asset name ending of this platform's package ('' when no
+    package is published for it, e.g. macOS: any newer release counts)."""
+    if sys.platform == "win32":
+        return "_win.zip"
+    if sys.platform.startswith("linux"):
+        return "_linux.tar.gz"
+    return ""
+
+
 class UpdateChecker(QtCore.QThread):
-    """Queries the latest GitHub release in the background.  Emits
-    updateAvailable(tag, page_url, notes) only when it is newer than
-    __version__; otherwise upToDate() or failed(message), which the silent
-    start-up check ignores."""
-    updateAvailable = QtCore.pyqtSignal(str, str, str)
+    """Looks for a newer GitHub release in the background.
+
+    Only releases that ship this platform's package (see
+    _platform_asset_suffix) count, so a release published for Windows first
+    does not notify Linux users until their package is uploaded.  Emits
+    updateAvailable(tag, page_url, notes, asset_url, asset_label) for the
+    newest such release newer than __version__; otherwise upToDate() or
+    failed(message), which the silent start-up check ignores."""
+    updateAvailable = QtCore.pyqtSignal(str, str, str, str, str)
     upToDate = QtCore.pyqtSignal()
     failed = QtCore.pyqtSignal(str)
 
@@ -1173,28 +1188,46 @@ class UpdateChecker(QtCore.QThread):
         try:
             import urllib.request
             req = urllib.request.Request(
-                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=30",
                 headers={"Accept": "application/vnd.github+json",
                          "User-Agent": f"ONTbarcoder/{__version__}"},
             )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = _json_mod.loads(resp.read().decode("utf-8"))
-            tag = str(data.get("tag_name") or "")
-            if tag and _version_tuple(tag) > _version_tuple(__version__):
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                releases = _json_mod.loads(resp.read().decode("utf-8"))
+            current = _version_tuple(__version__)
+            suffix = _platform_asset_suffix()
+            candidates = [r for r in releases
+                          if not r.get("draft") and not r.get("prerelease")
+                          and _version_tuple(r.get("tag_name") or "") > current]
+            candidates.sort(key=lambda r: _version_tuple(r.get("tag_name") or ""),
+                            reverse=True)
+            for rel in candidates:
+                asset = next((a for a in rel.get("assets") or []
+                              if suffix and str(a.get("name", "")).endswith(suffix)),
+                             None)
+                if suffix and asset is None:
+                    continue   # no package for this platform in that release
+                label = ""
+                if asset:
+                    label = (f"{asset.get('name', '')} · "
+                             f"{int(asset.get('size') or 0) / 1_048_576:.0f} MB")
                 self.updateAvailable.emit(
-                    tag, str(data.get("html_url") or ""),
-                    str(data.get("body") or "")[:1500])
-            else:
-                self.upToDate.emit()
+                    str(rel.get("tag_name") or ""), str(rel.get("html_url") or ""),
+                    str(rel.get("body") or "")[:1500],
+                    str(asset.get("browser_download_url") or "") if asset else "",
+                    label)
+                return
+            self.upToDate.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
 class UpdateDialog(QtWidgets.QDialog):
-    """Notice of a newer release.  After exec_(), `choice` is "open",
-    "skip" or "later"."""
+    """Notice of a newer release.  After exec_(), `choice` is "download",
+    "page", "skip" or "later"."""
 
-    def __init__(self, tag: str, notes: str, parent=None):
+    def __init__(self, tag: str, notes: str, asset_label: str = "",
+                 page_url: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Update available")
         self.setMinimumWidth(520)
@@ -1217,6 +1250,20 @@ class UpdateDialog(QtWidgets.QDialog):
             view.setMaximumHeight(240)
             layout.addWidget(view)
 
+        if asset_label:
+            pkg = make_label(
+                f"Package: {asset_label} — unzip it next to (or instead of) the "
+                f"current folder; keep your own _profiles and _notes.",
+                size=13, color=TEXT_SEC)
+            pkg.setWordWrap(True)
+            layout.addWidget(pkg)
+        if page_url:
+            link = QtWidgets.QLabel(
+                f'<a href="{page_url}">Open the release page</a>')
+            link.setOpenExternalLinks(True)
+            link.setStyleSheet("font-size:13px;")
+            layout.addWidget(link)
+
         self._chk = QtWidgets.QCheckBox("Check for updates at start-up")
         self._chk.setChecked(True)
         layout.addWidget(self._chk)
@@ -1226,11 +1273,15 @@ class UpdateDialog(QtWidgets.QDialog):
         btn_skip.setObjectName("secondary_btn")
         btn_later = QtWidgets.QPushButton("Remind me later")
         btn_later.setObjectName("secondary_btn")
-        btn_open = QtWidgets.QPushButton("Open download page")
+        # Direct download of this platform's package when there is one; the
+        # release page otherwise (e.g. a platform without its own package).
+        main_choice = "download" if asset_label else "page"
+        btn_open = QtWidgets.QPushButton(
+            f"Download {tag}" if asset_label else "Open download page")
         btn_open.setObjectName("primary_btn")
         btn_open.setDefault(True)
         for btn, choice in ((btn_skip, "skip"), (btn_later, "later"),
-                            (btn_open, "open")):
+                            (btn_open, main_choice)):
             btn.setMinimumHeight(40)
             btn.clicked.connect(lambda _=False, c=choice: self._finish(c))
 
@@ -5627,17 +5678,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_checker.start()
 
     def _on_update_available(self, tag: str, url: str, notes: str,
+                             asset_url: str = "", asset_label: str = "",
                              manual: bool = False):
-        """Offer the newer release; the user can skip that version or turn
-        the start-up check off.  A manual check ignores a skipped version."""
+        """Offer the newer release; the user can download this platform's
+        package directly, skip that version or turn the start-up check off.
+        A manual check ignores a skipped version."""
         cfg = QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP)
         if not manual and cfg.value("skipped_version", "") == tag:
             return
-        dlg = UpdateDialog(tag, notes, self)
+        dlg = UpdateDialog(tag, notes, asset_label if asset_url else "", url, self)
         dlg.exec_()
         cfg.setValue("check_updates", dlg.check_at_startup())
-        if dlg.choice == "open" and url:
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+        # The browser downloads the asset URL straight away (GitHub serves it
+        # as an attachment), so no download code is needed here.
+        target = asset_url if dlg.choice == "download" else (
+            url if dlg.choice == "page" else "")
+        if target:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(target))
         elif dlg.choice == "skip":
             cfg.setValue("skipped_version", tag)
 

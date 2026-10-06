@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.5.0 — User Manual</title>
+<title>ONTbarcoder 3.5.1 — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -113,7 +113,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.5.0 — User Manual</span>
+    <span class="ver">v3.5.1 — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -271,8 +271,12 @@ number, so two copies with the same version are always identical. The installed 
 shown in the top bar and in <b>About</b>.</p>
 <p>A few seconds after start-up ONTbarcoder checks GitHub for a newer release (in the
 background; nothing is sent besides the request itself, and no connection simply means no
-notice). When one exists, a dialog offers <b>Open download page</b>, <b>Skip this version</b>
-or <b>Remind me later</b>; untick <i>Check for updates at start-up</i> to turn the check off.
+notice). Only releases that include the package for your system count (<code>_win.zip</code> on
+Windows, <code>_linux.tar.gz</code> on Linux), so a release published for one system first does not
+notify the other until its package is uploaded. When one exists, a dialog offers
+<b>Download v…</b> (the browser downloads that package directly; unzip it and keep your own
+<code>_profiles</code> and <code>_notes</code>), a link to the release page, <b>Skip this
+version</b> or <b>Remind me later</b>; untick <i>Check for updates at start-up</i> to turn the check off.
 <b>About → Check for updates</b> checks on demand and turns the automatic check back on.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
@@ -2259,7 +2263,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.5.0 — User Manual · Generated for the research community ·
+ONTbarcoder 3.5.1 — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 
