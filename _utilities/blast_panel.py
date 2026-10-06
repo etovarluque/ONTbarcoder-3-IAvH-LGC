@@ -2177,6 +2177,18 @@ class _BlastWorker(QtCore.QThread):
             out.setdefault("api_key", key)
         return out
 
+    @staticmethod
+    def _ssl_context():
+        """Default verifying context minus Python 3.13's VERIFY_X509_STRICT,
+        which rejects some Windows root CAs ("Basic Constraints of CA cert
+        not marked critical"). Chain and hostname checks stay enabled."""
+        import ssl
+        ctx = ssl.create_default_context()
+        strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict:
+            ctx.verify_flags &= ~strict
+        return ctx
+
     def _http_get(self, url, params=None, timeout=60):
         import urllib.request, urllib.parse, urllib.error
         params = self._eutils_params(url, params)
@@ -2194,7 +2206,8 @@ class _BlastWorker(QtCore.QThread):
             try:
                 req = urllib.request.Request(
                     url, headers={"User-Agent": self._USER_AGENT})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout,
+                                            context=self._ssl_context()) as resp:
                     if resp.status == 200:
                         text = resp.read().decode("utf-8", errors="replace")
                         if text:
@@ -2248,7 +2261,8 @@ class _BlastWorker(QtCore.QThread):
                              "User-Agent": self._USER_AGENT},
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout,
+                                            context=self._ssl_context()) as resp:
                     if resp.status == 200:
                         text = resp.read().decode("utf-8", errors="replace")
                         if text:
