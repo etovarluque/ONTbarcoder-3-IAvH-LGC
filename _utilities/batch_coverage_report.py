@@ -1,9 +1,9 @@
-"""Standalone analysis: for a completed Parameter Batch run, work out exactly
+"""Standalone analysis: for a completed Parameter Sweep run, work out exactly
 which run combinations were needed to recover the taxonomically-identified
 best sequences produced by Best Sequence Selection (best_seq_panel.py).
 
 Given:
-  - a Parameter Batch output folder (the "..._batch" folder, containing
+  - a Parameter Sweep output folder (the "..._batch" folder, containing
     batch_run_summary.tsv, produced by batch_sweep.py), and
   - a Best Sequence Selection output folder (the "..._bestseq" folder,
     containing bestseq-<date>.tsv and bestseq-<date>_identified.fasta),
@@ -21,10 +21,10 @@ this script:
      the identified sequences as possible.
   4. Writes a multi-sheet Excel report with all of the above, plus
      minimal_run_set.cfg: the minimal set as a "# combos" batch config,
-     ready for "Load batch config..." in the Parameter Batch panel.
+     ready for "Load batch config..." in the Parameter Sweep panel.
 
 No Qt/PyQt import here on purpose: runnable standalone from the command
-line, and used by the "Coverage report" section of the Parameter Batch panel
+line, and used by the "Coverage report" section of the Parameter Sweep panel
 (run_coverage_report).
 
 Usage:
@@ -121,21 +121,35 @@ def find_one(pattern: str, description: str, log: Callable[[str], None] = print)
     return matches[0]
 
 
+# Run lists accepted as the "batch" input: a Parameter Sweep folder, or the
+# output of "Merge existing runs" (absolute run folders, no parameters, so
+# no minimal_run_set.cfg can be written for it).
+SUMMARY_NAMES = ("batch_run_summary.tsv", "merge_run_summary.tsv")
+
+
 def load_runs(batch_dir: str, output_root: str) -> Dict[int, dict]:
-    """Parse batch_run_summary.tsv -> {run_number: {folder, params, params_raw, n_consensus_filtered}}."""
-    summary_path = os.path.join(batch_dir, "batch_run_summary.tsv")
-    if not os.path.isfile(summary_path):
-        raise FileNotFoundError(f"batch_run_summary.tsv not found in {batch_dir}")
+    """Parse batch_run_summary.tsv (or merge_run_summary.tsv) ->
+    {run_number: {folder, params, params_raw, n_consensus_filtered}}."""
+    summary_path = next((os.path.join(batch_dir, n) for n in SUMMARY_NAMES
+                         if os.path.isfile(os.path.join(batch_dir, n))), None)
+    if summary_path is None:
+        raise FileNotFoundError(
+            f"Neither {' nor '.join(SUMMARY_NAMES)} found in {batch_dir}")
 
     runs: Dict[int, dict] = {}
     with open(summary_path, encoding="utf-8") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
             run_no = int(row["Run"])
+            folder = row["Folder"]
+            params_raw = row.get("Parameters") or ""
             runs[run_no] = {
-                "folder": os.path.join(output_root, "ont-barcoder_" + row["Folder"]),
-                "params_raw": row["Parameters"],
-                "params": parse_params(row["Parameters"]),
+                # A sweep lists folder tags under output/; a merge lists
+                # absolute paths of runs that can live anywhere.
+                "folder": (folder if os.path.isabs(folder)
+                           else os.path.join(output_root, "ont-barcoder_" + folder)),
+                "params_raw": params_raw,
+                "params": parse_params(params_raw),
                 "n_consensus_filtered": row.get("N_consensus_filtered", ""),
             }
     return runs
@@ -210,6 +224,73 @@ def greedy_set_cover(
     return chosen
 
 
+def minimal_set_cover(
+    winners: Dict[str, Tuple[str, str]], coverage: Dict[str, set],
+    runs: Dict[int, dict], time_limit: float = 15.0,
+) -> Tuple[List[Tuple[int, set]], bool]:
+    """Smallest set of runs covering every coverable winner.
+
+    Starts from the greedy solution (an upper bound) and runs an exact
+    branch-and-bound search over non-dominated runs; if `time_limit` seconds
+    pass first, the best set found so far is kept.  Returns (chosen, exact):
+    `chosen` is ordered greedily (largest marginal gain first) as
+    [(run, new samples it adds)], and `exact` is True when the search
+    finished, i.e. no smaller set exists."""
+    import math
+    import time
+
+    greedy = greedy_set_cover(winners, coverage, runs)
+    universe = frozenset().union(*(c for _r, c in greedy)) if greedy else frozenset()
+    best = [r for r, _c in greedy]
+    exact = True
+    if len(best) > 1:
+        # Keep only non-dominated runs (a run whose samples are a subset of
+        # another's never needs to be chosen); ties keep the lowest run number.
+        cand = sorted(((r, frozenset(s for s in universe if r in coverage[s]))
+                       for r in runs), key=lambda x: (-len(x[1]), x[0]))
+        kept: List[Tuple[int, frozenset]] = []
+        for r, s in cand:
+            if s and not any(s <= ks for _k, ks in kept):
+                kept.append((r, s))
+        by_elem = {e: [(r, s) for r, s in kept if e in s] for e in universe}
+        deadline = time.monotonic() + time_limit
+        chosen: List[int] = []
+
+        def search(uncovered: frozenset) -> bool:
+            """False when the time limit was hit."""
+            nonlocal best
+            if not uncovered:
+                if len(chosen) < len(best):
+                    best = list(chosen)
+                return True
+            gain = max(len(s & uncovered) for _r, s in kept)
+            if len(chosen) + math.ceil(len(uncovered) / gain) >= len(best):
+                return True
+            if time.monotonic() > deadline:
+                return False
+            # Branch on the sample with the fewest runs able to cover it.
+            e = min(uncovered, key=lambda x: len(by_elem[x]))
+            for r, s in sorted(by_elem[e], key=lambda x: -len(x[1] & uncovered)):
+                chosen.append(r)
+                ok = search(uncovered - s)
+                chosen.pop()
+                if not ok:
+                    return False
+            return True
+
+        exact = search(universe)
+
+    # Order the chosen runs by marginal gain, as the report expects.
+    remaining, ordered, pool = set(universe), [], set(best)
+    while remaining and pool:
+        r = max(sorted(pool), key=lambda x: sum(1 for s in remaining if x in coverage[s]))
+        cov = {s for s in remaining if r in coverage[s]}
+        ordered.append((r, cov))
+        remaining -= cov
+        pool.discard(r)
+    return ordered, exact
+
+
 # ---------------------------------------------------------------------------
 # Excel report
 # ---------------------------------------------------------------------------
@@ -240,6 +321,7 @@ def build_workbook(
     run_hit_count: Dict[int, int],
     chosen_runs: List[Tuple[int, set]],
     param_keys: List[str],
+    exact: bool = True,
 ) -> None:
     n_runs = len(runs)
     n_winners = len(winners)
@@ -256,15 +338,21 @@ def build_workbook(
     # --- Sheet 1: Summary ---
     ws = wb.active
     ws.title = "Summary"
-    ws.append(["Parameter Batch coverage report: minimal set of run combinations "
+    ws.append(["Parameter Sweep coverage report: minimal set of run combinations "
                "needed to recover the taxonomically-identified best sequences"])
     ws["A1"].font = Font(bold=True, size=13)
     ws.append([])
-    ws.append(["Total run combinations tested (Parameter Batch)", n_runs])
+    ws.append(["Total run combinations tested (Parameter Sweep)", n_runs])
     ws.append(["Total taxonomically-identified sequences", n_winners])
-    ws.append(["Sequences covered by the greedy minimal set", len(covered_by_set)])
+    n_coverable = n_winners - len(never_covered)
+    ws.append(["Sequences covered by the minimal set", len(covered_by_set)])
     ws.append(["Run combinations in the minimal set", len(chosen_runs)])
     ws.append(["Sequences not reproduced identically by any run folder", len(never_covered)])
+    ws.append(["Coverage of the sequences reproduced by at least one run (%)",
+               round(100 * len(covered_by_set) / n_coverable, 1) if n_coverable else 0])
+    ws.append(["Minimal set search",
+               "exact: no smaller set of combinations covers them" if exact else
+               "time limit reached: smallest set found, may not be minimal"])
     ws.append([])
     if run_hit_count:
         best_run = max(run_hit_count, key=lambda r: run_hit_count[r])
@@ -395,8 +483,14 @@ def run_coverage_report(batch_dir: str, bestseq_dir: str,
 
     log("Locating Best Sequence Selection output...")
     bestseq_tsv = find_one(os.path.join(bestseq_dir, "bestseq-*.tsv"), "bestseq report .tsv", log)
-    identified_fasta = find_one(os.path.join(bestseq_dir, "bestseq-*_identified.fasta"),
-                                "bestseq _identified.fasta", log)
+    # The FASTA of the SAME Best Sequence run (shared timestamp), so two runs
+    # saved in one folder are never mixed.
+    identified_fasta = bestseq_tsv[:-len(".tsv")] + "_identified.fasta"
+    if not os.path.isfile(identified_fasta):
+        raise FileNotFoundError(
+            f"{os.path.basename(identified_fasta)} not found next to "
+            f"{os.path.basename(bestseq_tsv)} in {bestseq_dir}")
+    log(f"  Using {os.path.basename(bestseq_tsv)} + {os.path.basename(identified_fasta)}")
 
     tax_info = load_tax_info(bestseq_tsv)
     winners = {sample_of(h): (host_of(h), seq.upper())
@@ -416,29 +510,34 @@ def run_coverage_report(batch_dir: str, bestseq_dir: str,
     log("Comparing each run's consensus and secondary variants against the winning sequences...")
     coverage, run_hit_count = compute_coverage(winners, runs, fasta_name, log)
 
-    log("Computing greedy minimal run set...")
-    chosen_runs = greedy_set_cover(winners, coverage, runs)
+    log("Computing minimal run set...")
+    chosen_runs, exact = minimal_set_cover(winners, coverage, runs)
     covered = sum(len(c) for _r, c in chosen_runs)
-    log(f"  {len(chosen_runs)} runs needed to cover {covered}/{len(winners)} sequences")
+    log(f"  {len(chosen_runs)} runs needed to cover {covered}/{len(winners)} sequences"
+        + ("" if exact else " (time limit reached: smallest set found, may not be minimal)"))
 
     log(f"Writing report to {out_path}")
     build_workbook(out_path, runs, winners, tax_info, coverage, run_hit_count,
-                   chosen_runs, param_keys)
+                   chosen_runs, param_keys, exact)
     cfg_path = os.path.join(os.path.dirname(out_path), CFG_NAME)
     if write_combo_cfg(cfg_path, runs, chosen_runs, len(winners), batch_dir):
         log(f"Minimal run set as a batch config: {cfg_path}")
     else:
         cfg_path = ""
+        if chosen_runs and not any(runs[r]["params_raw"].strip() for r, _c in chosen_runs):
+            log("  No parameters recorded for these runs (merged existing runs): "
+                "the minimal set is listed by folder in the report, no .cfg written.")
     log("Done.")
     return {"xlsx": out_path, "cfg": cfg_path, "n_runs": len(runs),
             "n_winners": len(winners), "n_chosen": len(chosen_runs),
-            "n_covered": covered, "n_never": len(winners) - covered}
+            "n_covered": covered, "n_never": len(winners) - covered,
+            "exact": exact}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--batch-dir", required=True,
-                     help="Parameter Batch output folder (contains batch_run_summary.tsv)")
+                     help="Parameter Sweep output folder (contains batch_run_summary.tsv)")
     ap.add_argument("--bestseq-dir", required=True,
                      help="Best Sequence Selection output folder (contains bestseq-<date>.tsv "
                           "and bestseq-<date>_identified.fasta)")

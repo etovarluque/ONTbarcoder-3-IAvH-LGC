@@ -17,9 +17,10 @@ _XLSX_MAX_DATA_ROWS = 1048575
 def extract_id(header: str, rule: Optional[dict] = None) -> str:
     """Sequence ID of a FASTA header (without '>') under an ID rule:
 
-      id_mode "token"  (default) - the header up to the first whitespace
       id_mode "before"           - the text before the first `id_sep`
-                                   (";", "|", " " or any custom string)
+                                   (";", "|", " " or any custom string);
+                                   what the panel always sends
+      id_mode "token" / no sep   - the header up to the first whitespace
       id_suffix                  - removed from the end of the ID if present
                                    (e.g. "_all.fa" for ONTbarcoder consensus)
 
@@ -405,6 +406,45 @@ class _FastaToolsWorker(QtCore.QThread):
             outputs.append(out_path)
         return outputs
 
+    # NCBI translation table for each genetic code offered in the panel.
+    _GCODE_TABLE = {"Standard": 1, "Vertebrate mitochondrial": 2,
+                    "Invertebrate mitochondrial": 5, "Plant plastid": 11}
+
+    def _run_orf_trim(self):
+        from .orf_trim_fasta import trim_records
+        gname = self._params.get("genetic_code", "Invertebrate mitochondrial")
+        table = self._GCODE_TABLE[gname]
+        min_cov = float(self._params.get("min_coverage", 0.95))
+        outputs = []
+        for display_name, stem, records in self._iter_inputs():
+            if self._stop:
+                break
+            out, counts, warns = trim_records(records, table, min_cov)
+            out_path = os.path.join(self._out_dir, f"{stem}_orf.fasta")
+            self._write_fasta(out, out_path)
+            lens = Counter(len(s) for _h, s in out).most_common(5)
+            n_empty = len(records) - len(out)
+            msg = (
+                f"{display_name}\n"
+                f"  Genetic code        :  {gname} (table {table})\n"
+                f"  Total sequences     :  {len(records)}\n"
+                f"  Trimmed to ORF      :  {counts['trimmed']}\n"
+                f"  Unchanged (clean)   :  {counts['unchanged']}\n"
+                f"  Left intact (ORF < {min_cov:.0%}):  {counts['short_orf']}\n"
+                + (f"  Empty, dropped      :  {n_empty}\n" if n_empty else "")
+                + f"  Most common lengths :  "
+                + ", ".join(f"{ln} bp ×{n}" for ln, n in lens) + "\n"
+            )
+            if warns:
+                shown = warns[:20]
+                msg += "  Short ORF (possible NUMT / pseudogene / wrong code):\n"
+                msg += "".join(f"    {w}\n" for w in shown)
+                if len(warns) > len(shown):
+                    msg += f"    … and {len(warns) - len(shown)} more\n"
+            self.log_line.emit(msg)
+            outputs.append(out_path)
+        return outputs
+
     def _run_sort(self):
         separator = self._params.get("separator", "|")
         levels    = self._params.get("levels", [{"field": 1, "order": "asc"}])
@@ -780,6 +820,8 @@ class _FastaToolsWorker(QtCore.QThread):
                 outputs = self._run_append()
             elif self._operation == "reformat":
                 outputs = self._run_reformat()
+            elif self._operation == "orf_trim":
+                outputs = self._run_orf_trim()
             elif self._operation == "sort":
                 outputs = self._run_sort()
             elif self._operation == "filter_fields":
@@ -863,7 +905,7 @@ class _IdRuleWidget(QtWidgets.QWidget):
 
     _SEPS = [(";", '";"  semicolon'), ("|", '"|"  pipe'), (" ", "space"), ("", "custom…")]
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_sep: str = ";"):
         super().__init__(parent)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -871,14 +913,13 @@ class _IdRuleWidget(QtWidgets.QWidget):
 
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(8)
-        row.addWidget(make_label("Match ID by:", color=TEXT_SEC))
-        self._mode = QtWidgets.QComboBox()
-        self._mode.addItem("Header up to first space", "token")
-        self._mode.addItem("Text before first separator", "before")
-        row.addWidget(self._mode)
+        row.addWidget(make_label("ID = header text before first:", color=TEXT_SEC))
         self._sep = QtWidgets.QComboBox()
         for value, label in self._SEPS:
             self._sep.addItem(label, value)
+        # Index restored by reset().
+        self._default_sep_idx = max(0, self._sep.findData(default_sep))
+        self._sep.setCurrentIndex(self._default_sep_idx)
         row.addWidget(self._sep)
         self._custom = QtWidgets.QLineEdit()
         self._custom.setPlaceholderText("separator")
@@ -898,16 +939,13 @@ class _IdRuleWidget(QtWidgets.QWidget):
         self._preview.setWordWrap(True)
         lay.addWidget(self._preview)
 
-        for sig in (self._mode.currentIndexChanged, self._sep.currentIndexChanged):
-            sig.connect(self._on_changed)
+        self._sep.currentIndexChanged.connect(self._on_changed)
         for edit in (self._custom, self._suffix):
             edit.textChanged.connect(self._on_changed)
         self._sync()
 
     def _sync(self):
-        before = self._mode.currentData() == "before"
-        self._sep.setVisible(before)
-        self._custom.setVisible(before and self._sep.currentData() == "")
+        self._custom.setVisible(self._sep.currentData() == "")
 
     def _on_changed(self, *_):
         self._sync()
@@ -917,17 +955,17 @@ class _IdRuleWidget(QtWidgets.QWidget):
         sep = self._sep.currentData()
         if sep == "":
             sep = self._custom.text()
-        return {"id_mode": self._mode.currentData(), "id_sep": sep,
+        # An empty custom separator falls back to the first space.
+        return {"id_mode": "before", "id_sep": sep,
                 "id_suffix": self._suffix.text().strip()}
 
     def reset(self):
-        for w in (self._mode, self._sep, self._custom, self._suffix):
+        for w in (self._sep, self._custom, self._suffix):
             w.blockSignals(True)
-        self._mode.setCurrentIndex(0)
-        self._sep.setCurrentIndex(0)
+        self._sep.setCurrentIndex(self._default_sep_idx)
         self._custom.clear()
         self._suffix.clear()
-        for w in (self._mode, self._sep, self._custom, self._suffix):
+        for w in (self._sep, self._custom, self._suffix):
             w.blockSignals(False)
         self._sync()
         self._preview.setText("")
@@ -1015,11 +1053,22 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._radio_append       = QtWidgets.QRadioButton("Append info to headers from .xlsx file")
         self._radio_reformat     = QtWidgets.QRadioButton("Reformat sequence lines")
         self._radio_sort         = QtWidgets.QRadioButton("Sort sequences")
+        self._radio_orf          = QtWidgets.QRadioButton(
+            "Trim to coding ORF (remove stop codon and 3′ tail)")
+        self._radio_orf.setToolTip(
+            "Trims each barcode to its longest clean open reading frame (6 frames),\n"
+            "removing the gene's stop codon and the non-coding 3′ tail, as coding-marker\n"
+            "mode does. Use it to make full-length non-coding barcodes (e.g. CytB with\n"
+            "stop) comparable in length with coding-mode barcodes before Compare.\n"
+            "Sequences that already translate cleanly are left unchanged; a header\n"
+            "length field (>id;LEN;…) is updated. Writes <name>_orf.fasta."
+        )
 
         self._op_group = QtWidgets.QButtonGroup(self)
         for rb in (self._radio_stats, self._radio_unique, self._radio_identical,
                    self._radio_grep, self._radio_filter_fields,
-                   self._radio_append, self._radio_reformat, self._radio_sort):
+                   self._radio_append, self._radio_reformat, self._radio_orf,
+                   self._radio_sort):
             self._op_group.addButton(rb)
 
         self._radio_stats.setChecked(True)
@@ -1233,10 +1282,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         note = make_label(
             "Excel format (.xlsx): column 1 = sequence ID, columns 2+ = fields to "
-            "append. By default the ID is the FASTA header up to its first space "
-            "(without '>'); use 'Match ID by' for headers with fields, e.g. "
-            "ONTbarcoder's 'DNS-1_all.fa;758;807' → text before ';' minus "
-            "suffix '_all.fa' = DNS-1. IDs and cell values are normalized: "
+            "append. The ID is the FASTA header text (without '>') before the "
+            "chosen separator — by default ';', e.g. ONTbarcoder's "
+            "'DNS-1_all.fa;758;807' → 'DNS-1_all.fa', or 'DNS-1' with suffix "
+            "'_all.fa' removed; pick 'space' for plain headers. IDs and cell values are normalized: "
             "leading/trailing spaces removed, spaces/dots/commas → '_', accents removed.",
             color=TEXT_SEC, size=15,
         )
@@ -1323,6 +1372,34 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         self._reformat_widget.hide()
         ops_layout.addWidget(self._reformat_widget)
+
+        ops_layout.addSpacing(4)
+        ops_layout.addWidget(self._radio_orf)
+        self._orf_widget = QtWidgets.QWidget()
+        orl = QtWidgets.QHBoxLayout(self._orf_widget)
+        orl.setContentsMargins(20, 4, 0, 4)
+        orl.setSpacing(8)
+        orl.addWidget(make_label("Genetic code:", color=TEXT_SEC))
+        self._orf_gcode_combo = QtWidgets.QComboBox()
+        for name in self._FASTA_GCODES:
+            self._orf_gcode_combo.addItem(name)
+        self._orf_gcode_combo.setCurrentText("Invertebrate mitochondrial")
+        orl.addWidget(self._orf_gcode_combo)
+        orl.addSpacing(12)
+        orl.addWidget(make_label("Min. ORF coverage:", color=TEXT_SEC))
+        self._orf_cov_spin = QtWidgets.QSpinBox()
+        self._orf_cov_spin.setRange(50, 100)
+        self._orf_cov_spin.setValue(95)
+        self._orf_cov_spin.setSuffix(" %")
+        self._orf_cov_spin.setFixedWidth(90)
+        self._orf_cov_spin.setToolTip(
+            "A sequence is trimmed only if its clean ORF covers at least this share\n"
+            "of its length; otherwise it is left intact and listed in the log\n"
+            "(possible NUMT / pseudogene, unusual length or wrong genetic code).")
+        orl.addWidget(self._orf_cov_spin)
+        orl.addStretch(1)
+        self._orf_widget.hide()
+        ops_layout.addWidget(self._orf_widget)
 
         ops_layout.addSpacing(4)
         ops_layout.addWidget(self._radio_sort)
@@ -1531,6 +1608,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._filter_widget.setVisible(self._radio_filter_fields.isChecked())
         self._append_widget.setVisible(self._radio_append.isChecked())
         self._reformat_widget.setVisible(self._radio_reformat.isChecked())
+        self._orf_widget.setVisible(self._radio_orf.isChecked())
         self._sort_widget.setVisible(self._radio_sort.isChecked())
         if self._radio_sort.isChecked():
             self._update_sort_preview()
@@ -1906,6 +1984,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._filter_widget.hide()
         self._append_widget.hide()
         self._reformat_widget.hide()
+        self._orf_widget.hide()
+        self._orf_gcode_combo.setCurrentText("Invertebrate mitochondrial")
+        self._orf_cov_spin.setValue(95)
         self._sort_widget.hide()
 
         self._grep_use_file_chk.setChecked(False)
@@ -1972,6 +2053,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             "filter_fields"  if self._radio_filter_fields.isChecked()  else
             "append"         if self._radio_append.isChecked()         else
             "reformat"       if self._radio_reformat.isChecked()       else
+            "orf_trim"       if self._radio_orf.isChecked()            else
             "sort"
         )
 
@@ -2038,6 +2120,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         elif operation == "reformat":
             params["mode"]      = "wrap" if self._rf_radio_wrap.isChecked() else "linearize"
             params["wrap_cols"] = self._wrap_cols_spin.value()
+        elif operation == "orf_trim":
+            params["genetic_code"] = self._orf_gcode_combo.currentText()
+            params["min_coverage"] = self._orf_cov_spin.value() / 100.0
         elif operation == "sort":
             if self._sort_sep_pipe.isChecked():
                 params["separator"] = "|"

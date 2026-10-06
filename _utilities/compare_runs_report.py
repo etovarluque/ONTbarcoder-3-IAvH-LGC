@@ -1,6 +1,6 @@
 """Standalone A/B comparison of two ONTbarcoder3 run folders, per sample.
 
-For any two runs of the same dataset: two combinations of a Parameter Batch
+For any two runs of the same dataset: two combinations of a Parameter Sweep
 (picked by run number from its batch_run_summary.tsv), or two analyses run by
 hand (e.g. the current version vs. a run made with an older one).
 
@@ -14,7 +14,7 @@ flagged / no longer flagged).
 
 Writes a per-sample TSV (only samples that differ, unless --all) and prints a
 summary. No Qt/PyQt import: runnable from the command line, and used by the
-"Compare two runs" section of the Parameter Batch panel (list_batch_runs /
+"Compare two runs" section of the Parameter Sweep panel (list_batch_runs /
 compare_runs).
 
 Usage:
@@ -162,7 +162,7 @@ def _maxdiv(divs: List[float]) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--batch-dir", help="Parameter Batch output folder "
+    ap.add_argument("--batch-dir", help="Parameter Sweep output folder "
                     "(contains batch_run_summary.tsv)")
     ap.add_argument("--runs", nargs=2, type=int, default=[1, 2], metavar=("A", "B"),
                     help="Run numbers to compare from the batch (default: 1 2)")

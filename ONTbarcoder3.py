@@ -5,6 +5,14 @@ ontbarcoder3_gui.py - Fixed version with full multiprocessing support
                     and identical results between conventional and real-time mode
 """
 from __future__ import annotations
+
+# Single source of truth for the program version (MAJOR.MINOR.PATCH).
+# MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
+# PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
+__version__ = "3.5.0"
+# GitHub repository queried for newer releases at start-up.
+UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
+
 import sys
 sys.setrecursionlimit(5000)
 import os
@@ -775,7 +783,7 @@ class SidebarWidget(QtWidgets.QWidget):
     ITEMS = [
         ("setup",       "Input files"),
         ("params",      "Parameters"),
-        ("batch_sweep", "Parameter Batch"),
+        ("batch_sweep", "Parameter Sweep"),
         ("progress",    "Analysis"),
         ("live_chart",  "📈 RT Charts"),
         ("results",     "Results"),
@@ -791,12 +799,12 @@ class SidebarWidget(QtWidgets.QWidget):
     ]
 
     # Sidebar items shown in italics to signal they sit outside the linear
-    # Workflow even though they live in that section (e.g. Parameter Batch:
+    # Workflow even though they live in that section (e.g. Parameter Sweep:
     # optional, self-contained, not a required step to reach Results).
     _ITALIC_ITEMS = {"batch_sweep"}
 
     # Required workflow steps are numbered so the order reads at a glance;
-    # optional/auxiliary items (Parameter Batch, RT Charts) stay unnumbered.
+    # optional/auxiliary items (Parameter Sweep, RT Charts) stay unnumbered.
     _STEP_NUMBERS = {"setup": 1, "params": 2, "progress": 3, "results": 4}
 
     _TOOLTIPS = {
@@ -999,7 +1007,7 @@ class AboutDialog(QtWidgets.QDialog):
 
         layout.addSpacing(4)
 
-        ver_lbl = make_label("Version 3.5b", size=16, color=TEXT_SEC)
+        ver_lbl = make_label(f"Version {__version__}", size=16, color=TEXT_SEC)
         ver_lbl.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(ver_lbl)
 
@@ -1104,16 +1112,143 @@ class AboutDialog(QtWidgets.QDialog):
         close_btn.setFixedHeight(34)
         close_btn.clicked.connect(self.accept)
 
+        update_btn = QtWidgets.QPushButton("Check for updates")
+        update_btn.setObjectName("secondary_btn")
+        update_btn.setFixedHeight(34)
+        update_btn.clicked.connect(self._check_updates)
+        self._update_btn = update_btn
+
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch()
+        btn_row.addWidget(update_btn)
+        btn_row.addSpacing(24)
         btn_row.addWidget(close_btn)
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+    def _check_updates(self):
+        """Manual check; also re-enables the start-up check."""
+        QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).setValue(
+            "check_updates", True)
+        self._update_btn.setEnabled(False)
+        self._update_btn.setText("Checking…")
+        checker = UpdateChecker(self)
+        owner = self.parent()
+        if owner is not None and hasattr(owner, "_on_update_available"):
+            checker.updateAvailable.connect(
+                lambda t, u, n: owner._on_update_available(t, u, n, manual=True))
+        checker.upToDate.connect(lambda: QtWidgets.QMessageBox.information(
+            self, "Check for updates",
+            f"ONTbarcoder v{__version__} is the latest version."))
+        checker.failed.connect(lambda err: QtWidgets.QMessageBox.warning(
+            self, "Check for updates",
+            f"Could not reach GitHub to check for updates.\n\n{err}"))
+        checker.finished.connect(lambda: (self._update_btn.setEnabled(True),
+                                          self._update_btn.setText("Check for updates")))
+        checker.start()
+        self._update_checker = checker
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TOPBAR
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _version_tuple(text: str) -> tuple:
+    """'v3.5.1' / '3.5.1-beta' / legacy '3.4b' -> (3, 5, 1) / (3, 5, 1) / (3, 4, 0)."""
+    import re
+    nums = [int(n) for n in re.findall(r"\d+", str(text).lstrip("vV").split("-")[0])]
+    return tuple((nums + [0, 0, 0])[:3])
+
+
+class UpdateChecker(QtCore.QThread):
+    """Queries the latest GitHub release in the background.  Emits
+    updateAvailable(tag, page_url, notes) only when it is newer than
+    __version__; otherwise upToDate() or failed(message), which the silent
+    start-up check ignores."""
+    updateAvailable = QtCore.pyqtSignal(str, str, str)
+    upToDate = QtCore.pyqtSignal()
+    failed = QtCore.pyqtSignal(str)
+
+    def run(self):
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json",
+                         "User-Agent": f"ONTbarcoder/{__version__}"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = _json_mod.loads(resp.read().decode("utf-8"))
+            tag = str(data.get("tag_name") or "")
+            if tag and _version_tuple(tag) > _version_tuple(__version__):
+                self.updateAvailable.emit(
+                    tag, str(data.get("html_url") or ""),
+                    str(data.get("body") or "")[:1500])
+            else:
+                self.upToDate.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class UpdateDialog(QtWidgets.QDialog):
+    """Notice of a newer release.  After exec_(), `choice` is "open",
+    "skip" or "later"."""
+
+    def __init__(self, tag: str, notes: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Update available")
+        self.setMinimumWidth(520)
+        self.choice = "later"
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 18)
+        layout.setSpacing(10)
+
+        layout.addWidget(make_label(
+            f"ONTbarcoder {tag} is available", size=18, bold=True))
+        layout.addWidget(make_label(
+            f"Installed version: v{__version__}", size=14, color=TEXT_SEC))
+
+        if notes.strip():
+            layout.addWidget(make_label("What's new", size=14, bold=True))
+            view = QtWidgets.QTextBrowser()
+            view.setMarkdown(notes)
+            view.setMinimumHeight(140)
+            view.setMaximumHeight(240)
+            layout.addWidget(view)
+
+        self._chk = QtWidgets.QCheckBox("Check for updates at start-up")
+        self._chk.setChecked(True)
+        layout.addWidget(self._chk)
+        layout.addSpacing(6)
+
+        btn_skip = QtWidgets.QPushButton("Skip this version")
+        btn_skip.setObjectName("secondary_btn")
+        btn_later = QtWidgets.QPushButton("Remind me later")
+        btn_later.setObjectName("secondary_btn")
+        btn_open = QtWidgets.QPushButton("Open download page")
+        btn_open.setObjectName("primary_btn")
+        btn_open.setDefault(True)
+        for btn, choice in ((btn_skip, "skip"), (btn_later, "later"),
+                            (btn_open, "open")):
+            btn.setMinimumHeight(40)
+            btn.clicked.connect(lambda _=False, c=choice: self._finish(c))
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(btn_skip)
+        row.addStretch()
+        row.addWidget(btn_later)
+        row.addSpacing(12)
+        row.addWidget(btn_open)
+        layout.addLayout(row)
+
+    def _finish(self, choice: str):
+        self.choice = choice
+        self.accept()
+
+    def check_at_startup(self) -> bool:
+        return self._chk.isChecked()
+
 
 class TopBar(QtWidgets.QWidget):
     languageChanged = QtCore.pyqtSignal(str)
@@ -1131,7 +1266,7 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
-        badge = QtWidgets.QLabel("v3.5b")
+        badge = QtWidgets.QLabel(f"v{__version__}")
         badge.setObjectName("topbar_badge")
 
         layout.addWidget(logo)
@@ -1994,28 +2129,29 @@ class SetupPanel(QtWidgets.QWidget):
             n_primer_pairs = 0
             n_gencode = 0          # named rows carrying a per-sample genetic code
             name_counts = Counter()  # to detect duplicate sample names
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                reader = csv.reader(f)
-                first_row_done = False
-                for row in reader:
-                    cells = [c.strip() for c in row]
-                    if not any(cells):
-                        continue
-                    if not cells[0]:
-                        continue
-                    n_samples += 1
-                    name_counts[cells[0]] += 1
-                    # Trailing integer column (NCBI table 0–33) = genetic code; a
-                    # primer is an IUPAC string and never a plain number.
-                    last = cells[-1] if len(cells) >= 6 else ""
-                    has_code = last.isdigit() and 0 <= int(last) <= 33
-                    if has_code:
-                        n_gencode += 1
-                    if not first_row_done:
-                        # Drop the genetic-code column before counting primer pairs.
-                        ncols = len(cells) - (1 if has_code else 0)
-                        n_primer_pairs = max(0, (ncols - 3) // 2)
-                        first_row_done = True
+            # Same decoding as the pipeline (UTF-8 / cp1252 / latin-1), so a
+            # CSV the run accepts is never rejected here.
+            reader = _ont_mp.read_csv_raw(path)
+            first_row_done = False
+            for row in reader:
+                cells = [c.strip() for c in row]
+                if not any(cells):
+                    continue
+                if not cells[0]:
+                    continue
+                n_samples += 1
+                name_counts[cells[0]] += 1
+                # Trailing integer column (NCBI table 0–33) = genetic code; a
+                # primer is an IUPAC string and never a plain number.
+                last = cells[-1] if len(cells) >= 6 else ""
+                has_code = last.isdigit() and 0 <= int(last) <= 33
+                if has_code:
+                    n_gencode += 1
+                if not first_row_done:
+                    # Drop the genetic-code column before counting primer pairs.
+                    ncols = len(cells) - (1 if has_code else 0)
+                    n_primer_pairs = max(0, (ncols - 3) // 2)
+                    first_row_done = True
             sample_word = _tr(ctx, "sample") if n_samples == 1 else _tr(ctx, "samples")
             pair_word = _tr(ctx, "primer pair") if n_primer_pairs == 1 else _tr(ctx, "primer pairs")
             hint_text = f"{n_samples} {sample_word}  ·  {n_primer_pairs} {pair_word}"
@@ -3588,7 +3724,7 @@ class ProgressPanel(QtWidgets.QWidget):
     finalizeRequested = QtCore.pyqtSignal()
     # Rough 0-100 progress of the CURRENT run (equal weight per active phase:
     # finished phases count fully, the running phase counts by its own %).
-    # Used by Parameter Batch to show per-iteration progress, not just how
+    # Used by Parameter Sweep to show per-iteration progress, not just how
     # many combinations have completed.
     overallProgressChanged = QtCore.pyqtSignal(int)
 
@@ -3741,7 +3877,7 @@ class ProgressPanel(QtWidgets.QWidget):
         # current run. Tracked separately from PhaseRow.isVisible(): that
         # reflects on-screen visibility, which is always False while this
         # panel isn't the active QStackedWidget page (e.g. during a
-        # Parameter Batch run, where Progress is never switched to).
+        # Parameter Sweep run, where Progress is never switched to).
         self._active_phase_ids = {pid for pid, _ in self.PHASES}
         # Highest overall % emitted since the last reset(). Some phases
         # (e.g. "1" moving from demultiplexing into file merging, or "2a"
@@ -4031,7 +4167,7 @@ class ProgressPanel(QtWidgets.QWidget):
         running one counts by its own bar %, pending phases count as 0.
         Uses _active_phase_ids rather than PhaseRow.isVisible(), since the
         latter is always False while this panel isn't the current
-        QStackedWidget page (e.g. during a Parameter Batch run).
+        QStackedWidget page (e.g. during a Parameter Sweep run).
 
         A "current" phase normally counts by its own displayed bar value, but
         a phase can register a separate _phase_true_frac override (see
@@ -5477,8 +5613,33 @@ class MainWindow(QtWidgets.QMainWindow):
         # Lock panels until user configures input files
         for key in ("params", "progress", "results"):
             self._sidebar.lock_item(key)
-        # Parameter Batch stays reachable: merging existing runs needs no dataset.
+        # Parameter Sweep stays reachable: merging existing runs needs no dataset.
         self._panel_batch_sweep.set_dataset_loaded(False)
+
+        # Look for a newer release a few seconds after start-up (non-blocking).
+        if QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP).value(
+                "check_updates", True, type=bool):
+            QtCore.QTimer.singleShot(3000, self._start_update_check)
+
+    def _start_update_check(self):
+        self._update_checker = UpdateChecker(self)
+        self._update_checker.updateAvailable.connect(self._on_update_available)
+        self._update_checker.start()
+
+    def _on_update_available(self, tag: str, url: str, notes: str,
+                             manual: bool = False):
+        """Offer the newer release; the user can skip that version or turn
+        the start-up check off.  A manual check ignores a skipped version."""
+        cfg = QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP)
+        if not manual and cfg.value("skipped_version", "") == tag:
+            return
+        dlg = UpdateDialog(tag, notes, self)
+        dlg.exec_()
+        cfg.setValue("check_updates", dlg.check_at_startup())
+        if dlg.choice == "open" and url:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+        elif dlg.choice == "skip":
+            cfg.setValue("skipped_version", tag)
 
     def _open_in_best_seq(self, paths: list):
         """BLAST → Best Sequence: load the queried FASTA and its results table
@@ -5551,6 +5712,11 @@ class MainWindow(QtWidgets.QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event):
+        # Unsaved note edits are kept, as when switching notes.
+        try:
+            self._panel_notes.save_pending()
+        except Exception:
+            pass
         if self._analysis_active:
             reply = QtWidgets.QMessageBox.question(
                 self, "Quit ONTbarcoder",
@@ -6105,7 +6271,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if self._is_live():
             self._panel_batch_sweep.on_error(
-                "Parameter Batch only supports Conventional mode, not Real-Time.")
+                "Parameter Sweep only supports Conventional mode, not Real-Time.")
             return False
         return True
 
@@ -6152,7 +6318,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if len(combos) > 200:
             reply = QtWidgets.QMessageBox.question(
-                self, "Parameter Batch",
+                self, "Parameter Sweep",
                 f"This sweep will run {len(combos)} analyses sequentially, one "
                 f"after another. This can take a very long time. Continue?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
@@ -6196,7 +6362,7 @@ class MainWindow(QtWidgets.QMainWindow):
             })
             notes = []
         except (OSError, TypeError, ValueError) as e:
-            notes = [f"Warning: could not save resume state ({e}) — this batch "
+            notes = [f"Warning: could not save resume state ({e}) — this sweep "
                      f"will not be resumable if interrupted."]
 
         self._launch_batch(combos, base_params, {}, _forced_resolve, notes=notes)
@@ -6213,12 +6379,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 os.path.join(batch_dir, BATCH_CFG_FILE))
             base_params = state["base_params"]
         except Exception as e:
-            self._panel_batch_sweep.on_error(f"Cannot resume this batch: {e}")
+            self._panel_batch_sweep.on_error(f"Cannot resume this sweep: {e}")
             return
         if len(combos) != state.get("n_combos"):
             self._panel_batch_sweep.on_error(
-                f"Cannot resume this batch: {BATCH_CFG_FILE} now expands to "
-                f"{len(combos)} combination(s), but the batch was started with "
+                f"Cannot resume this sweep: {BATCH_CFG_FILE} now expands to "
+                f"{len(combos)} combination(s), but the sweep was started with "
                 f"{state.get('n_combos')}.")
             return
 
@@ -6228,10 +6394,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (_same(state.get("fastq"), self._fastq)
                 and _same(state.get("demfile"), self._demfile)):
             reply = QtWidgets.QMessageBox.question(
-                self, "Resume batch",
-                "The dataset currently loaded is not the one this batch was "
+                self, "Resume sweep",
+                "The dataset currently loaded is not the one this sweep was "
                 "started with:\n\n"
-                f"Batch:   {state.get('fastq')}\n         {state.get('demfile')}\n"
+                f"Sweep:   {state.get('fastq')}\n         {state.get('demfile')}\n"
                 f"Loaded:  {self._fastq}\n         {self._demfile}\n\n"
                 "Mixing runs from different datasets in one merge is usually a "
                 "mistake. Resume anyway with the loaded dataset?",
@@ -6296,7 +6462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if forced_resolve:
             self._panel_batch_sweep.append_log(
                 "  Note: 'Detect intra-sample sequence variants' was turned ON "
-                "for this batch (the .cfg sweeps resolve_mixed.* keys), even "
+                "for this sweep (the .cfg sweeps resolve_mixed.* keys), even "
                 "though it is unchecked in the Parameters panel.")
         self._run_next_batch_combo()
 
@@ -6466,11 +6632,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._analysis_active:
             self._stop_analysis()   # ends in _abort_batch_sweep()
         else:
-            self._abort_batch_sweep("Stop now — finishing the batch with the "
+            self._abort_batch_sweep("Stop now — finishing the sweep with the "
                                     "combinations completed so far.")
 
     def _abort_batch_sweep(self, reason: str):
-        """End a batch interrupted from OUTSIDE the Parameter Batch panel
+        """End a batch interrupted from OUTSIDE the Parameter Sweep panel
         (Analysis Stop, Reset, app close). Those paths kill the running
         combination without ever emitting analysisFinished, so the queue would
         wait on it forever and _batch_running would stay set — blocking any
@@ -7574,33 +7740,32 @@ class MainWindow(QtWidgets.QMainWindow):
         demfile = getattr(self, "_demfile", "")
         if demfile and os.path.isfile(demfile):
             try:
-                import csv as _csv
-                with open(demfile, newline="", encoding="utf-8-sig") as _f:
-                    for row in _csv.reader(_f):
-                        cols = [c.strip() for c in row]
-                        if not any(cols):
-                            continue
-                        name = cols[0]
-                        if not name:
-                            continue
-                        total_named += 1
-                        name_counts[name] += 1
-                        last = cols[-1] if len(cols) >= 6 else ""
-                        # An integer in the NCBI table range is a genetic code; a
-                        # primer (IUPAC string) never is. Codes naming tables that
-                        # do not exist (7, 8, 17-20, 32) or 0 are recorded as
-                        # invalid so the run can be blocked with a clear message
-                        # instead of crashing inside Biopython per-sample.
-                        if last.isdigit() and 0 <= int(last) <= 33:
-                            code = int(last)
-                            if code in _VALID_NCBI_TABLES:
-                                n_with_code += 1
-                                by_table[code] += 1
-                                codes[name] = code
-                            else:
-                                invalid[name] = code
+                # same decoding as the pipeline (read_csv_raw)
+                for row in _ont_mp.read_csv_raw(demfile):
+                    cols = [c.strip() for c in row]
+                    if not any(cols):
+                        continue
+                    name = cols[0]
+                    if not name:
+                        continue
+                    total_named += 1
+                    name_counts[name] += 1
+                    last = cols[-1] if len(cols) >= 6 else ""
+                    # An integer in the NCBI table range is a genetic code; a
+                    # primer (IUPAC string) never is. Codes naming tables that
+                    # do not exist (7, 8, 17-20, 32) or 0 are recorded as
+                    # invalid so the run can be blocked with a clear message
+                    # instead of crashing inside Biopython per-sample.
+                    if last.isdigit() and 0 <= int(last) <= 33:
+                        code = int(last)
+                        if code in _VALID_NCBI_TABLES:
+                            n_with_code += 1
+                            by_table[code] += 1
+                            codes[name] = code
                         else:
-                            missing.append(name)
+                            invalid[name] = code
+                    else:
+                        missing.append(name)
             except Exception:
                 pass
         summary = {
@@ -9819,7 +9984,7 @@ class MainWindow(QtWidgets.QMainWindow):
 </nav>
 
 <header class="hero">
-  <div class="hero-eyebrow">ONTbarcoder v3.5b · Analysis report</div>
+  <div class="hero-eyebrow">ONTbarcoder v{__version__} · Analysis report</div>
   <h1>Run <span>{run_name}</span></h1>
   <div class="hero-meta">
     <span>📅 <strong>{ts_now}</strong></span>
@@ -9924,7 +10089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         {samples_section}
 
 <footer>
-  <span>ONTbarcoder v3.5b — generated {ts_now}</span>
+  <span>ONTbarcoder v{__version__} — generated {ts_now}</span>
   <span>{outpath}</span>
 </footer>
 
@@ -11315,7 +11480,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Before wiping state: a batch in progress must be closed out, or its
         # queue stays armed and a later single run would resume it.
         self._abort_batch_sweep(
-            "Analysis was reset — finishing the batch with the combinations "
+            "Analysis was reset — finishing the sweep with the combinations "
             "completed so far.")
 
         self._runmode = "1"
@@ -11591,10 +11756,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if getattr(self, "_batch_stop_now", False):
             reason = ("Stop now — current combination aborted; finishing the "
-                      "batch with the combinations completed so far.")
+                      "sweep with the combinations completed so far.")
         else:
             reason = ("Current combination was stopped from the Analysis panel — "
-                      "finishing the batch with the combinations completed so far.")
+                      "finishing the sweep with the combinations completed so far.")
         self._abort_batch_sweep(reason)
 
     def _min_cov(self) -> int:
@@ -12393,7 +12558,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(STYLESHEET)
         app.setApplicationName("ONTbarcoder")
-        app.setApplicationVersion("3.5b")
+        app.setApplicationVersion(__version__)
 
         icon = QtGui.QIcon()
         for icon_name in ("icon.ico",):

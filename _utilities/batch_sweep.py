@@ -455,7 +455,7 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
 def merge_runs(run_folders: List[Tuple[str, str]], outdir: str,
                variant_folders: List[Tuple[str, str]] = None) -> dict:
     """Merge the results of several run folders into `outdir` — shared by the
-    Parameter Batch (at the end of a sweep) and "Merge existing runs" (run
+    Parameter Sweep (at the end of a sweep) and "Merge existing runs" (run
     folders picked by hand):
       unique_consensus_filtered.fasta + batch_dedup_report.tsv
       unique_secondary_variants.fasta + batch_variants_dedup_report.tsv

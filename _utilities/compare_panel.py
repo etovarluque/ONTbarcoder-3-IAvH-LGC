@@ -116,7 +116,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
 
         if runs_info:
             # A grid, not a single row: with dozens of runs (e.g. a Parameter
-            # Batch) one row of chips would push the window wider than the
+            # Sweep) one row of chips would push the window wider than the
             # screen. Past 3 rows the legend scrolls instead of growing.
             legend_inner = QtWidgets.QWidget()
             legend_inner.setStyleSheet("background-color: #F7F6F2;")

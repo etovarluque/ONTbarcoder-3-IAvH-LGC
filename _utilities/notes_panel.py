@@ -100,15 +100,30 @@ class _Note:
         self.updated = updated
 
     # ── (de)serialization ────────────────────────────────────────────────
+    @staticmethod
+    def _read_text(path: str) -> str:
+        """UTF-8 first; a note written elsewhere in a legacy Windows encoding
+        falls back to cp1252 instead of having its accents replaced by '�'
+        (which the next save would write back permanently)."""
+        with open(path, "rb") as fh:
+            data = fh.read()
+        for enc in ("utf-8-sig", "cp1252"):
+            try:
+                return data.decode(enc).replace("\r\n", "\n").replace("\r", "\n")
+            except UnicodeDecodeError:
+                continue
+        return data.decode("latin-1").replace("\r\n", "\n").replace("\r", "\n")
+
     @classmethod
     def load(cls, path: str) -> "_Note":
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            raw = fh.read()
+        raw = cls._read_text(path)
 
         title = tags = created = updated = ""
         body = raw
 
         # Parse an optional leading frontmatter block delimited by '---' lines.
+        # It only counts as frontmatter when it holds at least one known key,
+        # so a note that merely starts with a '---' rule keeps its text.
         if raw.startswith("---"):
             lines = raw.splitlines()
             end = None
@@ -116,20 +131,18 @@ class _Note:
                 if lines[i].strip() == "---":
                     end = i
                     break
+            meta = {}
             if end is not None:
                 for line in lines[1:end]:
-                    if ":" not in line:
-                        continue
-                    key, _, val = line.partition(":")
-                    key, val = key.strip().lower(), val.strip()
-                    if key == "title":
-                        title = val
-                    elif key == "tags":
-                        tags = val
-                    elif key == "created":
-                        created = val
-                    elif key == "updated":
-                        updated = val
+                    key, sep, val = line.partition(":")
+                    key = key.strip().lower()
+                    if sep and key in ("title", "tags", "created", "updated"):
+                        meta[key] = val.strip()
+            if meta:
+                title = meta.get("title", "")
+                tags = meta.get("tags", "")
+                created = meta.get("created", "")
+                updated = meta.get("updated", "")
                 body = "\n".join(lines[end + 1:]).lstrip("\n")
 
         if not title:
@@ -162,8 +175,20 @@ class _Note:
             "---\n\n"
         )
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        with open(self.path, "w", encoding="utf-8") as fh:
+        # Write to a temp file and swap it in, so a crash or full disk
+        # mid-write cannot leave the note truncated.
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(frontmatter + self.body)
+        os.replace(tmp, self.path)
+
+    def haystack(self) -> str:
+        """Lower-cased searchable text, cached until the note changes."""
+        key = (self.title, self.tags, self.body)
+        if getattr(self, "_hay_key", None) != key:
+            self._hay_key = key
+            self._hay = f"{self.title}\n{self.tags}\n{self.body}".lower()
+        return self._hay
 
 
 class _MarkdownHighlighter(QtGui.QSyntaxHighlighter):
@@ -459,6 +484,7 @@ class NotesPanel(QtWidgets.QWidget):
             f" border-radius:8px; padding:10px; color:{TEXT_PRI}; }}"
         )
         self._editor.textChanged.connect(self._on_edited)
+        self._editor.cursorPositionChanged.connect(self._sync_heading_combo)
         self._highlighter = _MarkdownHighlighter(self._editor.document(),
                                                  self._BASE_PT)
         col.addWidget(self._editor, 1)
@@ -668,6 +694,13 @@ class NotesPanel(QtWidgets.QWidget):
         cur.endEditBlock()
         self._editor.setFocus()
 
+    def _sync_heading_combo(self):
+        """Show the heading level of the line under the cursor (H4–H6 are
+        shown as Heading 3, the smallest the combo offers).  setCurrentIndex
+        does not emit `activated`, so the line is not rewritten."""
+        m = re.match(r"^(#{1,6})\s", self._editor.textCursor().block().text())
+        self._heading_combo.setCurrentIndex(min(len(m.group(1)), 3) if m else 0)
+
     def _prefix_lines(self, numbered: bool) -> None:
         cur = self._editor.textCursor()
         start, end = cur.selectionStart(), cur.selectionEnd()
@@ -678,7 +711,12 @@ class NotesPanel(QtWidgets.QWidget):
         cur.movePosition(QtGui.QTextCursor.EndOfBlock, QtGui.QTextCursor.KeepAnchor)
         lines = cur.selectedText().split(" ")
         out = []
-        for i, ln in enumerate(lines, 1):
+        i = 0
+        for ln in lines:
+            if not ln.strip():
+                out.append(ln)   # blank lines stay blank, not "- "
+                continue
+            i += 1
             stripped = re.sub(r"^\s*([-*+]|\d+\.)\s+", "", ln)
             out.append((f"{i}. " if numbered else "- ") + stripped)
         cur.insertText("\n".join(out))
@@ -771,7 +809,9 @@ class NotesPanel(QtWidgets.QWidget):
             return
         rel = "_assets/" + os.path.basename(dst)
         alt = os.path.splitext(os.path.basename(dst))[0]
-        self._editor.textCursor().insertText(f"![{alt}]({rel})")
+        # <…> lets the path contain spaces; a bare one would not render.
+        target = f"<{rel}>" if " " in rel else rel
+        self._editor.textCursor().insertText(f"![{alt}]({target})")
         self._editor.setFocus()
 
     # ── Find & replace ───────────────────────────────────────────────────
@@ -1024,6 +1064,18 @@ class NotesPanel(QtWidgets.QWidget):
 
         notes.sort(key=lambda n: n.updated, reverse=True)
         self._notes = notes
+
+        # The note on screen was changed on disk (another program, a synced
+        # copy) while it has no unsaved edits here: show the new content, so a
+        # later save does not silently overwrite it with the stale text.
+        if current_path and not self._dirty:
+            fresh = next((n for n in notes if n.path == current_path), None)
+            cur = self._current
+            if fresh is not None and (fresh.title, fresh.tags, fresh.body) != (
+                    cur.title, cur.tags, cur.body):
+                self._load_into_editor(fresh)
+            elif fresh is not None:
+                self._current = fresh
         self._rebuild_list(select_path=current_path)
 
     def _rebuild_list(self, select_path: str | None = None) -> None:
@@ -1070,9 +1122,7 @@ class NotesPanel(QtWidgets.QWidget):
         for i in range(self._list.count()):
             item = self._list.item(i)
             note = by_path.get(item.data(QtCore.Qt.UserRole))
-            haystack = ""
-            if note:
-                haystack = f"{note.title}\n{note.tags}\n{note.body}".lower()
+            haystack = note.haystack() if note else ""
             item.setHidden(bool(needle) and needle not in haystack)
 
     # ── Editing / selection ──────────────────────────────────────────────
@@ -1168,6 +1218,10 @@ class NotesPanel(QtWidgets.QWidget):
             n += 1
         note = _Note(path, "Untitled note", "", "", now, now)
         note.save()
+        # An active search would hide the new note in the list.
+        self._search.blockSignals(True)
+        self._search.clear()
+        self._search.blockSignals(False)
         self.refresh()
         self._select_path(path)
         self._title_edit.setFocus()
@@ -1225,7 +1279,9 @@ class NotesPanel(QtWidgets.QWidget):
             return
         self._current.title = self._title_edit.text().strip() or "Untitled note"
         self._current.tags = self._tags_edit.text().strip()
-        self._current.body = self._editor.toPlainText().strip() + "\n"
+        # Only blank lines are trimmed at the start: leading spaces of the
+        # first line can be meaningful (indented code, nested list item).
+        self._current.body = self._editor.toPlainText().lstrip("\n").rstrip() + "\n"
         self._maybe_rename_to_title()
         try:
             self._current.save()
@@ -1283,6 +1339,12 @@ class NotesPanel(QtWidgets.QWidget):
         QtGui.QDesktopServices.openUrl(
             QtCore.QUrl.fromLocalFile(_notes_dir())
         )
+
+    def save_pending(self) -> None:
+        """Save unsaved edits; called when the application closes, so they
+        are kept just as when switching to another note."""
+        if self._dirty:
+            self._save_current()
 
     # ── helpers ──────────────────────────────────────────────────────────
     def _select_path(self, path: str) -> None:

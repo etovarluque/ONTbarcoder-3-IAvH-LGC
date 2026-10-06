@@ -9,7 +9,7 @@ This is a fork / version-3 rewrite of **ONTbarcoder 2.0**
 version 3 rebuilds the interface, ports the pipeline to Python 3 with
 deterministic multiprocessing, and adds a set of analysis tools (FASTA
 Compare, FASTA Tools, FASTQ Inspector, BLAST, Best Sequence, Notes, Parameter
-Batch) plus a non-coding marker mode.
+Sweep) plus a non-coding marker mode.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of differences from the
 original.
@@ -54,7 +54,7 @@ _utilities/              Worker pipeline + tool panels
   batch_sweep.py / batch_sweep_panel.py / best_seq_panel.py /
   blast_panel.py / compare_panel.py / fasta_tools.py /
   fastq_inspector.py / notes_panel.py / shared.py
-  orf_trim_fasta.py      CLI: trim coding barcodes to their ORF
+  orf_trim_fasta.py      ORF trimming (FASTA Tools → Trim to coding ORF; also a CLI)
 _mafftfiles/             Bundled MAFFT (disttbfast) + parameter files
 _profiles/               Saved parameter profiles + BLAST config (git-ignored)
 _notes/                  Markdown notes shown in the Notes panel

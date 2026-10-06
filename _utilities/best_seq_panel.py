@@ -439,7 +439,8 @@ class _PairDropZone(QtWidgets.QFrame):
         self._lbl.setToolTip(
             "Drop every FASTA (.fa/.fas/.fasta) together with its BLAST table\n"
             "(.xlsx/.tsv/.csv). Files are paired by name, so each pair must share\n"
-            "the same base name — e.g. run1.fa + run1.xlsx.\n"
+            "the same base name — e.g. run1.fa + run1.xlsx. A single FASTA and\n"
+            "a single table left without a match are paired anyway.\n"
             "One pair classifies that run; two or more compare them."
         )
 
@@ -532,21 +533,29 @@ class _PairDropZone(QtWidgets.QFrame):
 
     # ── Pairing ───────────────────────────────────────────────────────────
 
-    def pairs(self) -> List[dict]:
-        """Complete FASTA+BLAST pairs, matched by base file name."""
+    def _match(self) -> Dict[str, Optional[str]]:
+        """{fasta: its BLAST table or None}, matched by base file name.  When
+        exactly one FASTA and one table are left unmatched they are paired
+        anyway: the 'BLAST web results' tab writes blastfile-<ts>.tsv, whose
+        name never matches the FASTA that was searched."""
         blast_by_stem = {_stem(b): b for b in self._blasts}
-        out = []
-        for fa in self._fastas:
-            blast = blast_by_stem.get(_stem(fa))
-            if blast:
-                out.append({"fasta": fa, "blast": blast})
-        return out
+        match = {fa: blast_by_stem.get(_stem(fa)) for fa in self._fastas}
+        used = {_stem(b) for b in match.values() if b}
+        free_fa = [fa for fa, bl in match.items() if bl is None]
+        free_bl = [s for s in blast_by_stem if s not in used]
+        if len(free_fa) == 1 and len(free_bl) == 1:
+            match[free_fa[0]] = blast_by_stem[free_bl[0]]
+        return match
+
+    def pairs(self) -> List[dict]:
+        """Complete FASTA+BLAST pairs (see _match)."""
+        return [{"fasta": fa, "blast": bl} for fa, bl in self._match().items() if bl]
 
     def _orphans(self) -> Tuple[List[str], List[str]]:
-        fa_stems = {_stem(f) for f in self._fastas}
-        bl_stems = {_stem(b) for b in self._blasts}
-        return ([f for f in self._fastas if _stem(f) not in bl_stems],
-                [b for b in self._blasts if _stem(b) not in fa_stems])
+        match = self._match()
+        used = {_stem(b) for b in match.values() if b}
+        return ([fa for fa, bl in match.items() if bl is None],
+                [b for b in self._blasts if _stem(b) not in used])
 
     def is_valid(self) -> Tuple[bool, str]:
         """Ready to run? Returns (ok, message shown next to the drop zone)."""
@@ -662,8 +671,7 @@ class _PairDropZone(QtWidgets.QFrame):
 
     def _entries(self) -> List[Tuple[str, Optional[str]]]:
         """Rows to display: every FASTA with its BLAST table (or None)."""
-        blast_by_stem = {_stem(b): b for b in self._blasts}
-        return [(fa, blast_by_stem.get(_stem(fa))) for fa in self._fastas]
+        return list(self._match().items())
 
     def _adjust_height(self):
         n = len(self._entries()) + len(self._orphans()[1])
@@ -1565,6 +1573,11 @@ class _BestSeqWorker(QtCore.QThread):
         fixed_indels=..;Ns=..) map to their host sample and the same metrics."""
         parts = header.split(";")
         sample = sample_id_of(header, self.cfg.get("strip_suffix", ""))
+        # A consensus is '{sample}_all.fa' and its variants '{sample}_var{i}':
+        # group them under one sample even when the suffix field was cleared,
+        # or each would get its own winner.
+        if sample.endswith("_all.fa") and len(sample) > len("_all.fa"):
+            sample = sample[:-len("_all.fa")]
         # ambs stays None when the header has no 'ambs='/'Ns=' field; the
         # caller then counts the ambiguities in the sequence itself.
         info = {"sample": sample, "length": None, "reads": None,

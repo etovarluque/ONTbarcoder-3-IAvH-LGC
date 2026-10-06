@@ -133,7 +133,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
         outer_layout.addWidget(self._splitter, 1)
 
         # ── Title + description ──
-        self._lbl_title = make_label("Parameter Batch (Optional)", size=19, bold=True)
+        self._lbl_title = make_label("Parameter Sweep (Optional)", size=19, bold=True)
         self._lbl_desc = make_label(
             "Optional, not a required step of the workflow. Starts from "
             "whatever is currently set in the Parameters card, and overrides "
@@ -164,14 +164,14 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._layout.addWidget(self._lbl_conv_only)
 
         # ── Config file ──
-        cfg_box = QtWidgets.QGroupBox("Batch configuration")
+        cfg_box = QtWidgets.QGroupBox("Sweep configuration")
         cfg_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
         cl = QtWidgets.QVBoxLayout(cfg_box)
         cl.setSpacing(10)
         cl.setContentsMargins(16, 16, 16, 16)
 
         row = QtWidgets.QHBoxLayout()
-        self._load_btn = QtWidgets.QPushButton("Load batch config…")
+        self._load_btn = QtWidgets.QPushButton("Load sweep config…")
         self._load_btn.setObjectName("secondary_btn")
         self._load_btn.setFixedHeight(self._BTN_H)
         self._load_btn.clicked.connect(self._on_load_clicked)
@@ -179,7 +179,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._lbl_path = QtWidgets.QLabel("No config loaded.")
         self._lbl_path.setStyleSheet(f"color:{TEXT_SEC};")
         row.addWidget(self._lbl_path, 1)
-        self._resume_btn = QtWidgets.QPushButton("Resume batch…")
+        self._resume_btn = QtWidgets.QPushButton("Resume sweep…")
         self._resume_btn.setObjectName("secondary_btn")
         self._resume_btn.setFixedHeight(self._BTN_H)
         self._resume_btn.setEnabled(False)
@@ -235,17 +235,28 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         self._layout.addWidget(cfg_box)
 
+        # ── Additional tools: collapsed by default so the batch itself reads
+        # as the panel's only required input ──
+        tools_title = make_label("Additional tools (optional)", size=17, bold=True)
+        tools_title.setContentsMargins(0, 10, 0, 0)
+        self._layout.addWidget(tools_title)
+        tools_desc = make_label(
+            "Independent of the sweep above — each works on run folders that "
+            "already exist. Click a title to open it.", color=TEXT_SEC)
+        tools_desc.setWordWrap(True)
+        self._layout.addWidget(tools_desc)
+
         # ── Merge existing runs (analyses already run by hand, no sweep) ──
-        merge_box = QtWidgets.QGroupBox("Merge existing runs")
+        merge_box = QtWidgets.QGroupBox()
         merge_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
         ml = QtWidgets.QVBoxLayout(merge_box)
         ml.setSpacing(10)
         ml.setContentsMargins(16, 16, 16, 16)
 
         merge_help = QtWidgets.QLabel(
-            "Compare analyses already run by hand, without a batch: add their "
+            "Compare analyses already run by hand, without a sweep: add their "
             "output folders (button or drag &amp; drop) and merge them into the same "
-            "files a batch produces — <code>unique_consensus_filtered.fasta</code> "
+            "files a sweep produces — <code>unique_consensus_filtered.fasta</code> "
             "and, from the runs that had <b>Detect intra-sample sequence variants</b> "
             "on, <code>unique_secondary_variants.fasta</code>. Adding a folder that "
             "holds several runs (e.g. <code>output/</code>) adds every run inside it."
@@ -284,10 +295,12 @@ class BatchSweepPanel(QtWidgets.QWidget):
         merge_row.addWidget(self._merge_btn)
         ml.addLayout(merge_row)
 
-        self._layout.addWidget(merge_box)
+        self._layout.addWidget(self._tool_section(
+            "Merge existing runs",
+            "Merge runs made by hand into one unique-sequences FASTA.", merge_box))
 
         # ── Compare two runs (per-sample A/B report) ──
-        cmp_box = QtWidgets.QGroupBox("Compare two runs")
+        cmp_box = QtWidgets.QGroupBox()
         cmp_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
         cml = QtWidgets.QVBoxLayout(cmp_box)
         cml.setSpacing(10)
@@ -295,7 +308,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         cmp_help = QtWidgets.QLabel(
             "Per-sample A/B comparison of two analyses of the same dataset — "
-            "e.g. two combinations of a batch, or a run made with an older "
+            "e.g. two combinations of a sweep, or a run made with an older "
             "version: which samples gain, lose or change their QC-compliant "
             "(<code>consensus_no_errors.fa</code>) or filtered "
             "(<code>consensus_filtered.fa</code>) barcode, and whose secondary "
@@ -351,25 +364,29 @@ class BatchSweepPanel(QtWidgets.QWidget):
         cmp_row.addWidget(self._cmp_btn)
         cml.addLayout(cmp_row)
 
-        self._layout.addWidget(cmp_box)
+        self._layout.addWidget(self._tool_section(
+            "Compare two runs",
+            "Per-sample A/B report: barcodes gained, lost or changed.", cmp_box))
         self._cmp_batch_dir = ""
 
         # ── Coverage report (minimal combination set) ──
-        cov_box = QtWidgets.QGroupBox("Coverage report (minimal combination set)")
+        cov_box = QtWidgets.QGroupBox()
         cov_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
         cvl = QtWidgets.QVBoxLayout(cov_box)
         cvl.setSpacing(10)
         cvl.setContentsMargins(16, 16, 16, 16)
 
         cov_help = QtWidgets.QLabel(
-            "After a batch → merge → BLAST → Best Sequence: finds which "
+            "After a sweep → merge → BLAST → Best Sequence: finds which "
             "combinations reproduce each taxonomically-identified best sequence "
             "(as consensus or as secondary variant) and the fewest combinations "
             "that together recover them all. Writes "
             "<code>parameter_batch_coverage_report.xlsx</code> and "
             "<code>minimal_run_set.cfg</code> — a combo-list config with just "
             "those combinations, ready to load for the next dataset — into the "
-            "Best Sequence folder."
+            "Best Sequence folder. Also works on a <b>Merge existing runs</b> "
+            "folder (…_merge): the report then names the minimal set by run "
+            "folder, and no .cfg is written (those runs record no parameters)."
         )
         cov_help.setWordWrap(True)
         cov_help.setTextFormat(QtCore.Qt.RichText)
@@ -377,7 +394,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         self._cov_batch_dir = ""
         self._cov_bestseq_dir = ""
-        for attr, text in (("batch", "Batch folder…"), ("bestseq", "Best Sequence folder…")):
+        for attr, text in (("batch", "Sweep / merge folder…"), ("bestseq", "Best Sequence folder…")):
             row = QtWidgets.QHBoxLayout()
             btn = QtWidgets.QPushButton(text)
             btn.setObjectName("secondary_btn")
@@ -401,7 +418,10 @@ class BatchSweepPanel(QtWidgets.QWidget):
         cov_row.addWidget(self._cov_btn)
         cvl.addLayout(cov_row)
 
-        self._layout.addWidget(cov_box)
+        self._layout.addWidget(self._tool_section(
+            "Coverage report (minimal combination set)",
+            "After BLAST + Best Sequence: the fewest combinations that recover "
+            "every identified sequence.", cov_box))
         self._layout.addStretch()
 
         # ── Progress bars: overall (combinations) + current iteration (%) ──
@@ -493,14 +513,14 @@ class BatchSweepPanel(QtWidgets.QWidget):
         self._stop_now_btn.hide()
         self._stop_now_btn.setToolTip(
             "Aborts the combination currently running right away. Combinations "
-            "already completed are kept and merged; use Resume batch… later to "
+            "already completed are kept and merged; use Resume sweep… later to "
             "run the rest (the aborted one is re-run from scratch).")
         self._stop_now_btn.clicked.connect(self._on_stop_now_clicked)
         fl.addWidget(self._stop_now_btn)
 
         fl.addStretch()
 
-        self._start_btn = QtWidgets.QPushButton("Start batch  →")
+        self._start_btn = QtWidgets.QPushButton("Start sweep  →")
         self._start_btn.setObjectName("primary_btn")
         self._start_btn.setFixedHeight(44)
         self._start_btn.setFixedWidth(220)
@@ -534,13 +554,13 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
     def _on_resume_clicked(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Resume batch — pick the interrupted batch folder",
+            self, "Resume sweep — pick the interrupted batch folder",
             os.path.join(_get_base_dir(), "output"))
         if not path:
             return
         if not os.path.isfile(os.path.join(path, BATCH_STATE_FILE)):
             QtWidgets.QMessageBox.warning(
-                self, "Resume batch",
+                self, "Resume sweep",
                 f"{os.path.basename(path)} is not a resumable batch folder "
                 f"(no {BATCH_STATE_FILE}). Only batches started with this "
                 f"version or later can be resumed.")
@@ -551,7 +571,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
     def _on_load_clicked(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Load batch config", _profiles_dir(),
+            self, "Load sweep config", _profiles_dir(),
             "Config files (*.cfg *.txt *.ini);;All files (*)")
         if path:
             self._load_cfg(path)
@@ -562,7 +582,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
         try:
             combos, mode, sweep = load_batch_config(path)
         except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Invalid batch config", str(e))
+            QtWidgets.QMessageBox.warning(self, "Invalid sweep config", str(e))
             return False
         self._cfg_path = path
         self._cfg_count = len(combos)
@@ -608,11 +628,11 @@ class BatchSweepPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Could not save file", str(e))
 
     def _save_example(self):
-        self._save_template("Create example batch cfg (grid)", "my_batch.cfg",
+        self._save_template("Create example sweep cfg (grid)", "my_batch.cfg",
                              _example_cfg_path(), _EXAMPLE_CFG_FALLBACK)
 
     def _save_example_combos(self):
-        self._save_template("Create example batch cfg (combo list)",
+        self._save_template("Create example sweep cfg (combo list)",
                              "my_batch_combos.cfg",
                              _example_combos_cfg_path(), _EXAMPLE_COMBOS_CFG_FALLBACK)
 
@@ -626,10 +646,10 @@ class BatchSweepPanel(QtWidgets.QWidget):
             return
         if self._cfg_count != shown:
             reply = QtWidgets.QMessageBox.question(
-                self, "Parameter Batch",
+                self, "Parameter Sweep",
                 f"{os.path.basename(self._cfg_path)} changed since it was loaded: "
                 f"it now expands to {self._cfg_count} combination(s) instead of "
-                f"{shown}. Start the batch with the new content?",
+                f"{shown}. Start the sweep with the new content?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if reply != QtWidgets.QMessageBox.Yes:
@@ -640,12 +660,52 @@ class BatchSweepPanel(QtWidgets.QWidget):
         reply = QtWidgets.QMessageBox.question(
             self, "Stop now",
             "Abort the combination currently running? Its partial output is "
-            "discarded; completed combinations are kept, and Resume batch… "
+            "discarded; completed combinations are kept, and Resume sweep… "
             "can run the rest later.",
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             QtWidgets.QMessageBox.No)
         if reply == QtWidgets.QMessageBox.Yes:
             self.stopNowRequested.emit()
+
+    # ── Collapsible tool sections ────────────────────────────────────────
+    def _tool_section(self, title: str, subtitle: str,
+                      body: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        """Card with a clickable '▸ title — subtitle' header that shows or
+        hides *body*; starts collapsed."""
+        card = QtWidgets.QFrame()
+        card.setObjectName("toolSection")
+        card.setStyleSheet(
+            f"QFrame#toolSection {{ background:{WHITE}; border:1px solid {GRAY_LINE};"
+            f" border-radius:8px; }}")
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(4)
+
+        # QPushButton (not QToolButton) so text-align:left is honoured.
+        btn = QtWidgets.QPushButton()
+        btn.setCheckable(True)
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { border:none; background:transparent; text-align:left;"
+            f" color:{TEXT_PRI}; font-size:16px; font-weight:600; padding:6px 0; }}"
+            f"QPushButton:hover {{ color:{BLUE}; }}"
+            "QPushButton:checked { background:transparent; }")
+        sub = make_label(subtitle, size=14, color=TEXT_SEC)
+        sub.setWordWrap(True)
+        sub.setContentsMargins(20, 0, 0, 4)
+        body.setStyleSheet("QGroupBox { border:none; margin-top:0; }")
+
+        def _sync(on):
+            btn.setText(("▾  " if on else "▸  ") + title)
+            body.setVisible(on)
+            sub.setVisible(not on)
+        btn.toggled.connect(_sync)
+        _sync(False)
+
+        lay.addWidget(btn)
+        lay.addWidget(sub)
+        lay.addWidget(body)
+        return card
 
     # ── Compare two runs ─────────────────────────────────────────────────
 
@@ -752,13 +812,15 @@ class BatchSweepPanel(QtWidgets.QWidget):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, title, start)
         if not path:
             return
-        need = ("batch_run_summary.tsv" if which == "batch" else "bestseq-*_identified.fasta")
+        needs = (["batch_run_summary.tsv", "merge_run_summary.tsv"] if which == "batch"
+                 else ["bestseq-*_identified.fasta"])
         import glob
-        if not glob.glob(os.path.join(path, need)):
+        if not any(glob.glob(os.path.join(path, n)) for n in needs):
             QtWidgets.QMessageBox.warning(
                 self, "Coverage report",
-                f"{os.path.basename(path)} has no {need}.\n\n"
-                + ("Pick a finished Parameter Batch folder (…_batch)."
+                f"{os.path.basename(path)} has no {' or '.join(needs)}.\n\n"
+                + ("Pick a finished Parameter Sweep folder (…_batch) or a "
+                   "Merge existing runs folder (…_merge)."
                    if which == "batch" else
                    "Pick a Best Sequence Selection output folder."))
             return
@@ -796,7 +858,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
                 self, "Coverage report",
                 f"{res['n_chosen']} combination(s) recover {res['n_covered']} of "
                 f"{res['n_winners']} identified sequence(s).\n\n"
-                f"Load {os.path.basename(res['cfg'])} now as the batch config?",
+                f"Load {os.path.basename(res['cfg'])} now as the sweep config?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
                 QtWidgets.QMessageBox.No)
             if reply == QtWidgets.QMessageBox.Yes:
@@ -995,10 +1057,10 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         n_runs, n_total = summary.get("n_runs", 0), summary.get("n_total", 0)
         if summary.get("stopped"):
-            lines = [f"\n■ Batch stopped — {n_runs}/{n_total} combination(s) completed. "
-                     f"Use Resume batch… on this folder to run the rest."]
+            lines = [f"\n■ Sweep stopped — {n_runs}/{n_total} combination(s) completed. "
+                     f"Use Resume sweep… on this folder to run the rest."]
         else:
-            lines = [f"\n✓ Batch completed — {n_runs} run(s)."]
+            lines = [f"\n✓ Sweep completed — {n_runs} run(s)."]
         lines += self._summary_lines(summary, "batch_run_summary.tsv")
         self.append_log("\n".join(lines))
 
@@ -1034,4 +1096,4 @@ class BatchSweepPanel(QtWidgets.QWidget):
     def on_error(self, msg: str):
         self.set_running(False)
         self.append_log(f"ERROR: {msg}")
-        QtWidgets.QMessageBox.warning(self, "Parameter Batch", msg)
+        QtWidgets.QMessageBox.warning(self, "Parameter Sweep", msg)

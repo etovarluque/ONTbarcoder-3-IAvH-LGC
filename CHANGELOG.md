@@ -13,7 +13,83 @@ repository):
 | `original/ONTbarcoder2.py`           | Monolithic PyQt5 GUI (~7 000 lines)    |
 | `original/ONTbarcoder_multiprocessing.py` | Worker/pipeline module (~4 200 lines, Python 2) |
 
+Versions follow **MAJOR.MINOR.PATCH** from 3.5.0 on (MAJOR: incompatible
+changes to profiles, `.cfg` files or outputs; MINOR: new features; PATCH:
+fixes and small adjustments). Earlier releases used `X.Yb` tags.
+
 ---
+
+## [3.5.0] — 2026-10-06
+
+### Changed
+- Versioning switched to `MAJOR.MINOR.PATCH`; the version is defined once
+  (`__version__` in `ONTbarcoder3.py`) and used by the top bar, About dialog,
+  HTML run report and Qt application metadata. Release tags are
+  `v<version>` (e.g. `v3.5.0`). This release supersedes 3.5b.
+
+### Added
+- Update check: a few seconds after start-up the latest GitHub release is
+  queried in the background; when newer, a dialog offers to open the download
+  page, skip that version or be reminded later, with a checkbox to disable the
+  start-up check. **About → Check for updates** checks on demand.
+
+### Changed (Parameter Sweep, formerly Parameter Batch)
+- Merge existing runs, Compare two runs and Coverage report are grouped
+  under "Additional tools (optional)" as collapsible sections, closed by
+  default, so the batch configuration reads as the panel's only input.
+- Coverage report: the minimal combination set is now exact (branch and
+  bound seeded by the greedy solution, 15 s limit) instead of greedy, which
+  could return more combinations than needed. The Summary sheet states the
+  coverage of reproducible sequences and whether the set is proven minimal.
+- Coverage report: reads the `_identified.fasta` of the same Best Sequence
+  run as the chosen `bestseq-*.tsv` (shared timestamp) instead of the newest
+  of each, so two runs saved in one folder are never mixed.
+- Coverage report also accepts a **Merge existing runs** folder
+  (`merge_run_summary.tsv`): the minimal set is named by run folder; no
+  `.cfg` is written since those runs record no parameters.
+
+### Changed (Best Sequence)
+- A consensus (`{sample}_all.fa`) and its secondary variants
+  (`{sample}_var{i}`) are grouped as one sample even when *Strip suffix* is
+  cleared, so a sample no longer gets two winners.
+- A single FASTA and a single BLAST table left without a name match are
+  paired automatically (e.g. `blastfile-<ts>.tsv` from BLAST web results).
+- Panel renamed **Parameter Batch → Parameter Sweep** (sidebar, title,
+  buttons, messages). Output names are unchanged (`*_batch` folders,
+  `batch_run_summary.tsv`, `batch_state.json`), so earlier batches can still
+  be resumed, compared and used for coverage reports.
+
+### Changed (FASTA Tools)
+- Append info / Match whole ID: the redundant *Match ID by* choice is gone
+  (*Header up to first space* was identical to separator = space). The ID is
+  always the header text before the chosen separator, `;` by default in
+  both (fits ONTbarcoder headers).
+- New operation **Trim to coding ORF** (genetic code, minimum ORF
+  coverage): the `orf_trim_fasta.py` logic, until now only usable from a
+  command line with the source code, so not from the packaged build. Writes
+  `<name>_orf.fasta`; sequences with a short ORF are kept intact and listed.
+
+### Fixed (pipeline)
+- Demultiplexing CSV: a byte invalid in both UTF-8 and cp1252 (e.g. 0x81)
+  crashed the run with `UnboundLocalError`; it now falls back to latin-1.
+- The Setup panel summary and the per-sample genetic-code check read the
+  CSV as UTF-8 only, so an Excel (cp1252) CSV with accented sample names was
+  accepted by the run but rejected there. All three readers now share
+  `pipeline.read_csv_raw` (UTF-8 → cp1252 → latin-1).
+
+### Fixed (Notes)
+- Unsaved edits are saved when ONTbarcoder closes (they were lost).
+- Notes in a legacy Windows encoding (cp1252) keep their accents instead of
+  having them replaced by `�` and written back on save.
+- A note changed on disk while open (and not edited here) is reloaded, so a
+  later save no longer overwrites the external change.
+- A note starting with a `---` rule is no longer mistaken for frontmatter.
+- Saving keeps the first line's indentation; files are written atomically.
+- Images whose file name has spaces now render in the preview.
+- Search no longer re-lowercases every note on each keystroke.
+- The text-size selector follows the heading level of the line under the
+  cursor; bulleted/numbered lists skip blank lines; a new note clears the
+  search filter so it is not hidden in the list.
 
 ## [3.5b] — 2026-10
 

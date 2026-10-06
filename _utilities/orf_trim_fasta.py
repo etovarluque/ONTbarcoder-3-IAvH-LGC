@@ -74,6 +74,35 @@ def update_len_field(hdr, newlen):
     return hdr
 
 
+def trim_records(recs, gencode, min_coverage=0.95):
+    """Trim each (header, seq) to its coding ORF.  Returns
+    (out_records, counts, warnings): counts has 'trimmed', 'unchanged' and
+    'short_orf'; a sequence whose clean ORF covers < min_coverage is kept
+    intact and reported in warnings.  Empty sequences are dropped.  Shared by
+    the command line below and FASTA Tools → Trim to coding ORF."""
+    counts = {"trimmed": 0, "unchanged": 0, "short_orf": 0}
+    out, warnings_ = [], []
+    for hdr, seq in recs:
+        s = seq.replace("-", "").upper()
+        if not s:
+            continue
+        orf, aalen = orf_trim(s, gencode)
+        if orf != s and aalen * 3 >= len(s) * min_coverage:
+            out.append((update_len_field(hdr, len(orf)), orf))
+            counts["trimmed"] += 1
+        elif orf == s:
+            out.append((hdr, s))
+            counts["unchanged"] += 1
+        else:
+            # ORF too short: don't trim (possible NUMT/unusual length).
+            out.append((hdr, s))
+            counts["short_orf"] += 1
+            warnings_.append(
+                f"{hdr.split(';')[0]}: clean ORF covers only {aalen*3}/{len(s)} bp "
+                f"(<{min_coverage:.0%}); left intact.")
+    return out, counts, warnings_
+
+
 def main():
     ap = argparse.ArgumentParser(description="Trim barcodes to their coding ORF.")
     ap.add_argument("input")
@@ -84,27 +113,11 @@ def main():
                     help="Minimum ORF fraction required to trim (default 0.95).")
     args = ap.parse_args()
 
-    recs = read_fasta(args.input)
-    n_trim = n_keep = n_skip = 0
-    out = []
-    for hdr, seq in recs:
-        s = seq.replace("-", "").upper()
-        if not s:
-            continue
-        orf, aalen = orf_trim(s, args.gencode)
-        if orf != s and aalen * 3 >= len(s) * args.min_coverage:
-            out.append((update_len_field(hdr, len(orf)), orf))
-            n_trim += 1
-        elif orf == s:
-            out.append((hdr, s))
-            n_keep += 1
-        else:
-            # ORF too short: don't trim (possible NUMT/unusual length).
-            out.append((hdr, s))
-            n_skip += 1
-            sys.stderr.write(
-                f"  [warning] {hdr.split(';')[0]}: clean ORF covers only "
-                f"{aalen*3}/{len(s)} bp (<{args.min_coverage:.0%}); left intact.\n")
+    out, counts, warns = trim_records(read_fasta(args.input), args.gencode,
+                                      args.min_coverage)
+    n_trim, n_keep, n_skip = counts["trimmed"], counts["unchanged"], counts["short_orf"]
+    for w in warns:
+        sys.stderr.write(f"  [warning] {w}\n")
 
     with open(args.output, "w", encoding="utf-8") as f:
         for hdr, seq in out:

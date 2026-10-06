@@ -51,19 +51,27 @@ _PHRED_ERR = [10.0 ** (-(q - 33) / 10.0) for q in range(256)]
 _PHRED_ERR_GET = _PHRED_ERR.__getitem__
 
 
+def read_csv_raw(path):
+    """All rows of a CSV as lists of strings.  UTF-8 with or without BOM,
+    falling back to cp1252 (ANSI CSVs saved by Excel) and then latin-1, which
+    decodes any byte, so a stray byte never aborts the read.  Shared by every
+    reader of the demultiplexing file so they all accept the same files."""
+    import csv
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(path, newline="", encoding=enc) as fh:
+                return list(csv.reader(fh))
+        except UnicodeDecodeError:
+            continue
+    return []
+
+
 def read_demfile_rows(path):
     """Rows of the demultiplexing CSV, parsed like the Setup panel does:
     UTF-8 with or without BOM (falls back to cp1252 for ANSI CSVs saved by
     Excel), cells stripped, blank rows / rows without sample name skipped.
     Tags (columns 2-3) are upper-cased to match the reads."""
-    import csv
-    for enc in ("utf-8-sig", "cp1252"):
-        try:
-            with open(path, newline="", encoding=enc) as fh:
-                raw = list(csv.reader(fh))
-            break
-        except UnicodeDecodeError:
-            continue
+    raw = read_csv_raw(path)
     rows = []
     for lineno, row in enumerate(raw, 1):
         cells = [c.strip() for c in row]
