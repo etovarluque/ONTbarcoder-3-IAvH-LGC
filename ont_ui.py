@@ -27,14 +27,14 @@ TOKENS = {
         "ground": "#FAFAFC", "surface": "#FFFFFF", "sidebar": "#F7F7F9", "line": "#E6E6EB",
         "text": "#1C1C28", "text_sec": "#5F6270", "text_hint": "#9A9CA8",
         "accent": "#4F46E5", "accent_fg": "#4338CA", "accent_tint": "#EEF2FF",
-        "hover": "#F0F0F5", "ok": "#10875F", "danger": "#B42318", "danger_bg": "#FEE4E2",
+        "card_border": "#D2D2DC", "hover": "#F0F0F5", "ok": "#10875F", "danger": "#B42318", "danger_bg": "#FEE4E2",
         "tooltip_bg": "#1C1C28", "tooltip_fg": "#FFFFFF", "tooltip_border": "#1C1C28",
     },
     "dark": {
         "ground": "#1E1F26", "surface": "#272833", "sidebar": "#171821", "line": "#3A3D4A",
         "text": "#E6E6EB", "text_sec": "#9A9CA8", "text_hint": "#6E7080",
         "accent": "#4F46E5", "accent_fg": "#A5B4FC", "accent_tint": "#2A2C4A",
-        "hover": "#2F3140", "ok": "#34D399", "danger": "#F87171", "danger_bg": "#3A1E1E",
+        "card_border": "#4A4D5C", "hover": "#2F3140", "ok": "#34D399", "danger": "#F87171", "danger_bg": "#3A1E1E",
         "tooltip_bg": "#3A3D4A", "tooltip_fg": "#E6E6EB", "tooltip_border": "#4A4D5C",
     },
 }
@@ -51,6 +51,9 @@ _EXACT = {
         "#1A1A18": "#1C1C28", "#6B6960": "#5F6270", "#A09D96": "#9A9CA8",
         "#E0DED8": "#E6E6EB", "#EDEDED": "#F0F0F5",
         ("#F5F5F3", _BG): "#FFFFFF",
+        # Success green: soft emerald (same family as the sidebar's done marks)
+        "#3B6D11": "#0E7A55", "#EAF3DE": "#EAF7F1",
+        ("#639922", _BORDER): "#9AD3BC", ("#639922", _BG): "#10875F",
     },
     "dark": {
         ("#185FA5", _BG): "#4F46E5", ("#185FA5", _BORDER): "#6366F1",
@@ -65,9 +68,10 @@ _EXACT = {
         ("#F5F5F3", _BG): "#272833", ("#FFFFFF", _BG): "#272833",
         ("#EDEDED", _BG): "#2F3140",
         # Status colours: readable tints on the dark ground.
-        ("#3B6D11", _FG): "#9BD67A", ("#A32D2D", _FG): "#F08A8A",
+        ("#3B6D11", _FG): "#5FD3A6", ("#A32D2D", _FG): "#F08A8A",
+        ("#639922", _BORDER): "#2F6B58", ("#639922", _BG): "#10875F",
         ("#854F0B", _FG): "#F2B36B",
-        ("#EAF3DE", _BG): "#1E3320", ("#FCEBEB", _BG): "#3A1E1E",
+        ("#EAF3DE", _BG): "#18302B", ("#FCEBEB", _BG): "#3A1E1E",
         ("#FAEEDA", _BG): "#3A2C17",
     },
 }
@@ -403,6 +407,7 @@ QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
     border: 1px solid {t['danger']}; border-radius: 8px; padding: 5px 10px; font-size: 18px;
 }}
 #sidebar_quit:hover {{ background-color: {t['danger_bg']}; }}
+#stat_card {{ border: 1px solid {t['card_border']}; }}
 #topbar {{
     background-color: {t['surface']}; border-bottom: 1px solid {t['line']};
 }}

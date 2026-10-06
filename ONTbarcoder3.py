@@ -3731,11 +3731,22 @@ class PhaseRow(QtWidgets.QFrame):
             self._detail_lbl.setText(f"{pct}%  ({extra})" if extra else f"{pct}%")
 
 
+def _add_card_shadow(widget):
+    """Soft drop shadow that lifts a stat card off the window. Its container
+    keeps a small margin so the shadow is not clipped by the parent."""
+    eff = QtWidgets.QGraphicsDropShadowEffect(widget)
+    eff.setBlurRadius(10)
+    eff.setOffset(0, 2)
+    eff.setColor(QtGui.QColor(0, 0, 0, 30))
+    widget.setGraphicsEffect(eff)
+
+
 class StatCard(QtWidgets.QFrame):
     def __init__(self, label, value="—", color=TEXT_PRI, parent=None):
         super().__init__(parent)
         self.setObjectName("stat_card")
         self._src_label = label
+        _add_card_shadow(self)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
@@ -3858,7 +3869,7 @@ class ProgressPanel(QtWidgets.QWidget):
         # ── Stat cards ──
         stats_container = QtWidgets.QWidget()
         stats_layout = QtWidgets.QHBoxLayout(stats_container)
-        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setContentsMargins(3, 1, 3, 6)
         stats_layout.setSpacing(10)
 
         self.stat_total = StatCard("Total reads", "—")
@@ -3868,6 +3879,7 @@ class ProgressPanel(QtWidgets.QWidget):
         # ── Cycle counter card (new) ──
         self._cycle_card = QtWidgets.QFrame()
         self._cycle_card.setObjectName("stat_card")
+        _add_card_shadow(self._cycle_card)
         _cc_layout = QtWidgets.QVBoxLayout(self._cycle_card)
         _cc_layout.setContentsMargins(12, 10, 12, 10)
         _cc_layout.setSpacing(2)
@@ -3882,6 +3894,7 @@ class ProgressPanel(QtWidgets.QWidget):
         # timer card next to barcodes ok
         self._timer_card = QtWidgets.QFrame()
         self._timer_card.setObjectName("stat_card")
+        _add_card_shadow(self._timer_card)
         _tc_layout = QtWidgets.QVBoxLayout(self._timer_card)
         _tc_layout.setContentsMargins(12, 10, 12, 10)
         _tc_layout.setSpacing(2)
@@ -3894,6 +3907,7 @@ class ProgressPanel(QtWidgets.QWidget):
 
         self._cycle_timer_card = QtWidgets.QFrame()
         self._cycle_timer_card.setObjectName("stat_card")
+        _add_card_shadow(self._cycle_timer_card)
         _ctc_layout = QtWidgets.QVBoxLayout(self._cycle_timer_card)
         _ctc_layout.setContentsMargins(12, 10, 12, 10)
         _ctc_layout.setSpacing(2)
@@ -3907,10 +3921,10 @@ class ProgressPanel(QtWidgets.QWidget):
 
         for card in (self.stat_total, self.stat_dem, self.stat_ok):
             stats_layout.addWidget(card, 8)
-        stats_layout.addStretch(1)
-        stats_layout.addWidget(self._cycle_card, 3)
-        stats_layout.addWidget(self._cycle_timer_card, 3)
-        stats_layout.addWidget(self._timer_card, 3)
+        for card, stretch in ((self._cycle_card, 4), (self._cycle_timer_card, 5),
+                              (self._timer_card, 5)):
+            card.setMinimumWidth(150)
+            stats_layout.addWidget(card, stretch)
         self._layout.addWidget(stats_container)
 
         # ── Phase rows ──
@@ -4308,7 +4322,7 @@ class ResultsPanel(BasePanel):
 
         stats_container = QtWidgets.QWidget()
         stats_layout = QtWidgets.QHBoxLayout(stats_container)
-        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setContentsMargins(3, 1, 3, 6)
         stats_layout.setSpacing(10)
 
         self.stat_total = StatCard("Total barcodes", "—")

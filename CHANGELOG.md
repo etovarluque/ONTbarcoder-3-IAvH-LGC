@@ -35,6 +35,10 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 ### Changed
 - The top bar uses the theme surface instead of a fixed dark band.
 - Custom-painted charts keep a light background in dark mode.
+- Stat cards (Progress, Results) get a 1 px border and a soft shadow so they
+  stand out from the window; the time cards are wider.
+- Success green (loaded files, finished phases, QC counters) is a soft emerald
+  instead of the saturated lime, in both themes.
 
 ---
 
