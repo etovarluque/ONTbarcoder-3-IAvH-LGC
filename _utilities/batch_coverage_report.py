@@ -11,17 +11,21 @@ Given:
 this script:
   1. Re-derives, for every sample with a taxonomic hit, exactly which of the
      N run folders reproduce that winning sequence identically (by direct
-     sequence comparison against each run's consensus_filtered.fa — not by
+     sequence comparison against each run's consensus_filtered.fa AND its
+     secondary_variants.fa — a winner can be a secondary variant — not by
      trusting the ";run<N>" tag in the dedup FASTA, which only records the
      FIRST run that produced a given variant, not every run that did).
   2. Reports per-run coverage (how many identified sequences a single run
      alone would reproduce).
   3. Computes a greedy minimal set of runs that together cover as many of
      the identified sequences as possible.
-  4. Writes a multi-sheet Excel report with all of the above.
+  4. Writes a multi-sheet Excel report with all of the above, plus
+     minimal_run_set.cfg: the minimal set as a "# combos" batch config,
+     ready for "Load batch config..." in the Parameter Batch panel.
 
 No Qt/PyQt import here on purpose: runnable standalone from the command
-line, independent of the GUI.
+line, and used by the "Coverage report" section of the Parameter Batch panel
+(run_coverage_report).
 
 Usage:
     python batch_coverage_report.py --batch-dir <..._batch folder> \
@@ -33,14 +37,17 @@ import argparse
 import csv
 import glob
 import os
+import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 FASTA_NAME_DEFAULT = "consensus_filtered.fa"
+VARIANTS_FASTA_NAME = "secondary_variants.fa"
+CFG_NAME = "minimal_run_set.cfg"
 
 
 # ---------------------------------------------------------------------------
@@ -48,13 +55,14 @@ FASTA_NAME_DEFAULT = "consensus_filtered.fa"
 # ---------------------------------------------------------------------------
 
 def read_fasta(path: str) -> List[Tuple[str, str]]:
-    """Return [(header_without_'>', sequence), ...] in file order."""
+    """Return [(header_without_'>', sequence), ...] in file order.
+    Tolerant of Windows line endings and stray non-UTF-8 bytes."""
     records: List[Tuple[str, str]] = []
     header = None
     seq_parts: List[str] = []
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            line = line.rstrip("\n")
+            line = line.rstrip("\r\n")
             if line.startswith(">"):
                 if header is not None:
                     records.append((header, "".join(seq_parts)))
@@ -68,8 +76,22 @@ def read_fasta(path: str) -> List[Tuple[str, str]]:
 
 
 def sample_of(header: str) -> str:
-    """Sample id: header text before the first ';' (ONTbarcoder convention)."""
+    """Sample label: header text before the first ';' (ONTbarcoder convention)."""
     return header.split(";", 1)[0].strip()
+
+
+_VARIANT_SUFFIX = re.compile(r"_var\d+$")
+
+
+def host_of(header: str) -> str:
+    """Sample a record belongs to, comparable across consensus and variant
+    files: the consensus is '{sample}_all.fa;...' and its secondary variants
+    '{sample}_var{i};...' (whose numbering can differ from run to run)."""
+    s = sample_of(header)
+    s = _VARIANT_SUFFIX.sub("", s)
+    if s.endswith("_all.fa"):
+        s = s[:-len("_all.fa")]
+    return s
 
 
 def parse_params(param_str: str) -> Dict[str, str]:
@@ -88,14 +110,14 @@ def parse_params(param_str: str) -> Dict[str, str]:
 # Input discovery / loading
 # ---------------------------------------------------------------------------
 
-def find_one(pattern: str, description: str) -> str:
+def find_one(pattern: str, description: str, log: Callable[[str], None] = print) -> str:
     matches = [p for p in glob.glob(pattern) if not os.path.basename(p).startswith("~$")]
     if not matches:
         raise FileNotFoundError(f"No {description} found matching: {pattern}")
     matches.sort(key=os.path.getmtime, reverse=True)
     if len(matches) > 1:
-        print(f"  Note: {len(matches)} {description} candidates found, "
-              f"using most recent: {os.path.basename(matches[0])}", file=sys.stderr)
+        log(f"  Note: {len(matches)} {description} candidates found, "
+            f"using most recent: {os.path.basename(matches[0])}")
     return matches[0]
 
 
@@ -120,9 +142,16 @@ def load_runs(batch_dir: str, output_root: str) -> Dict[int, dict]:
 
 
 def load_tax_info(bestseq_tsv: str) -> Dict[str, dict]:
-    with open(bestseq_tsv, encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter="\t")
-        return {row["Sample"]: row for row in reader}
+    """Best Sequence report rows keyed by the sample label of their Header —
+    the exact text of the FASTA record — rather than the Sample column, which
+    differs when Best Sequence was run with 'Remove suffix' (Sample 'DNS-1'
+    vs header 'DNS-1_all.fa;...')."""
+    out: Dict[str, dict] = {}
+    with open(bestseq_tsv, encoding="utf-8", errors="replace") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            key = sample_of(row.get("Header") or "") or row.get("Sample", "")
+            out[key] = row
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -130,34 +159,40 @@ def load_tax_info(bestseq_tsv: str) -> Dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def compute_coverage(
-    winners: Dict[str, str], runs: Dict[int, dict], fasta_name: str
+    winners: Dict[str, Tuple[str, str]], runs: Dict[int, dict], fasta_name: str,
+    log: Callable[[str], None] = print,
 ) -> Tuple[Dict[str, set], Dict[int, int]]:
-    """For each sample in `winners`, find every run whose own consensus FASTA
-    contains that exact sequence for that sample.
+    """For each winner (label -> (host sample, sequence)), find every run that
+    produced that exact sequence for that sample, either as its consensus
+    (`fasta_name`) or as one of its secondary variants (raw or corrected).
 
-    Returns (coverage: sample -> set of run numbers, run_hit_count: run -> count).
+    Returns (coverage: label -> set of run numbers, run_hit_count: run -> count).
     """
     coverage: Dict[str, set] = {s: set() for s in winners}
     run_hit_count: Dict[int, int] = {}
 
     for run_no, info in sorted(runs.items()):
         fa_path = os.path.join(info["folder"], fasta_name)
+        if not os.path.isfile(fa_path):
+            log(f"  Warning: missing {fa_path}")
+            run_hit_count[run_no] = 0
+            continue
+        produced = {(host_of(h), seq.upper()) for h, seq in read_fasta(fa_path)}
+        var_path = os.path.join(info["folder"], VARIANTS_FASTA_NAME)
+        if os.path.isfile(var_path):
+            produced |= {(host_of(h), seq.upper()) for h, seq in read_fasta(var_path)}
         hits = 0
-        if os.path.isfile(fa_path):
-            for header, seq in read_fasta(fa_path):
-                s = sample_of(header)
-                if s in winners and winners[s] == seq:
-                    coverage[s].add(run_no)
-                    hits += 1
-        else:
-            print(f"  Warning: missing {fa_path}", file=sys.stderr)
+        for label, (host, seq) in winners.items():
+            if (host, seq) in produced:
+                coverage[label].add(run_no)
+                hits += 1
         run_hit_count[run_no] = hits
 
     return coverage, run_hit_count
 
 
 def greedy_set_cover(
-    winners: Dict[str, str], coverage: Dict[str, set], runs: Dict[int, dict]
+    winners: Dict[str, Tuple[str, str]], coverage: Dict[str, set], runs: Dict[int, dict]
 ) -> List[Tuple[int, set]]:
     """Greedy minimal set of runs covering as many samples as possible."""
     remaining = set(winners.keys())
@@ -199,7 +234,7 @@ def autofit(ws, widths: List[int]) -> None:
 def build_workbook(
     out_path: str,
     runs: Dict[int, dict],
-    winners: Dict[str, str],
+    winners: Dict[str, Tuple[str, str]],
     tax_info: Dict[str, dict],
     coverage: Dict[str, set],
     run_hit_count: Dict[int, int],
@@ -240,8 +275,9 @@ def build_workbook(
                    round(sum(run_hit_count.values()) / n_runs, 1)])
     if never_covered:
         ws.append([])
-        ws.append(["Samples not found identically in any run folder (check for a later re-run "
-                   "of the conversion folders after the dedup/BLAST steps):"])
+        ws.append(["Samples not found identically in any run folder (consensus or "
+                   "secondary variants) — e.g. run folders deleted or re-run after "
+                   "the merge/BLAST steps:"])
         for s in never_covered:
             ws.append([s])
     autofit(ws, [65, 14, 55, 14])
@@ -303,9 +339,101 @@ def build_workbook(
     wb.save(out_path)
 
 
+def write_combo_cfg(cfg_path: str, runs: Dict[int, dict],
+                    chosen_runs: List[Tuple[int, set]], n_winners: int,
+                    batch_dir: str) -> bool:
+    """Write the minimal set as a "# combos" batch config (one full
+    combination per line, the format of the Parameters column). Returns
+    False when there is nothing to write."""
+    lines = [r for r, _cov in chosen_runs if runs[r]["params_raw"].strip()]
+    if not lines:
+        return False
+    out = [
+        "# combos",
+        "#",
+        f"# Minimal run set from {os.path.basename(os.path.normpath(batch_dir))}",
+        "# (batch_coverage_report): the fewest combinations that together",
+        "# reproduce the taxonomically-identified best sequences.",
+        "# Parameters not listed take their value from the Parameters panel:",
+        "# use the same base settings as the original batch (its",
+        "# batch_state.json records them).",
+        "",
+    ]
+    cum = 0
+    for r, cov in chosen_runs:
+        cum += len(cov)
+        if not runs[r]["params_raw"].strip():
+            continue
+        pct = 100 * cum / n_winners if n_winners else 0
+        out.append(f"# run {r}: +{len(cov)} sequence(s), cumulative {cum}/{n_winners} ({pct:.1f}%)")
+        out.append(runs[r]["params_raw"].strip())
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+    return True
+
+
 # ---------------------------------------------------------------------------
-# CLI
+# Entry points
 # ---------------------------------------------------------------------------
+
+def run_coverage_report(batch_dir: str, bestseq_dir: str,
+                        output_root: Optional[str] = None,
+                        fasta_name: str = FASTA_NAME_DEFAULT,
+                        out_path: Optional[str] = None,
+                        log: Callable[[str], None] = print) -> dict:
+    """Run the whole analysis; progress goes to `log`. Returns
+    {"xlsx", "cfg" ("" if not written), "n_runs", "n_winners", "n_chosen",
+    "n_covered", "n_never"}."""
+    batch_dir = os.path.abspath(batch_dir)
+    bestseq_dir = os.path.abspath(bestseq_dir)
+    output_root = os.path.abspath(output_root) if output_root else os.path.dirname(batch_dir)
+    out_path = out_path or os.path.join(bestseq_dir, "parameter_batch_coverage_report.xlsx")
+
+    log("Loading run combinations...")
+    runs = load_runs(batch_dir, output_root)
+    log(f"  {len(runs)} run combinations loaded")
+
+    log("Locating Best Sequence Selection output...")
+    bestseq_tsv = find_one(os.path.join(bestseq_dir, "bestseq-*.tsv"), "bestseq report .tsv", log)
+    identified_fasta = find_one(os.path.join(bestseq_dir, "bestseq-*_identified.fasta"),
+                                "bestseq _identified.fasta", log)
+
+    tax_info = load_tax_info(bestseq_tsv)
+    winners = {sample_of(h): (host_of(h), seq.upper())
+               for h, seq in read_fasta(identified_fasta)}
+    n_var = sum(1 for label in winners if _VARIANT_SUFFIX.search(label))
+    log(f"  {len(winners)} taxonomically-identified sequences loaded"
+        + (f" ({n_var} of them secondary variants)" if n_var else ""))
+
+    # Discover parameter keys in the order they first appear, so the report
+    # adapts to whichever parameters were actually swept.
+    param_keys: List[str] = []
+    for info in runs.values():
+        for k in info["params"]:
+            if k not in param_keys:
+                param_keys.append(k)
+
+    log("Comparing each run's consensus and secondary variants against the winning sequences...")
+    coverage, run_hit_count = compute_coverage(winners, runs, fasta_name, log)
+
+    log("Computing greedy minimal run set...")
+    chosen_runs = greedy_set_cover(winners, coverage, runs)
+    covered = sum(len(c) for _r, c in chosen_runs)
+    log(f"  {len(chosen_runs)} runs needed to cover {covered}/{len(winners)} sequences")
+
+    log(f"Writing report to {out_path}")
+    build_workbook(out_path, runs, winners, tax_info, coverage, run_hit_count,
+                   chosen_runs, param_keys)
+    cfg_path = os.path.join(os.path.dirname(out_path), CFG_NAME)
+    if write_combo_cfg(cfg_path, runs, chosen_runs, len(winners), batch_dir):
+        log(f"Minimal run set as a batch config: {cfg_path}")
+    else:
+        cfg_path = ""
+    log("Done.")
+    return {"xlsx": out_path, "cfg": cfg_path, "n_runs": len(runs),
+            "n_winners": len(winners), "n_chosen": len(chosen_runs),
+            "n_covered": covered, "n_never": len(winners) - covered}
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -322,46 +450,10 @@ def main() -> None:
     ap.add_argument("--output", default=None,
                      help="Output .xlsx path (default: <bestseq-dir>/parameter_batch_coverage_report.xlsx)")
     args = ap.parse_args()
-
-    batch_dir = os.path.abspath(args.batch_dir)
-    bestseq_dir = os.path.abspath(args.bestseq_dir)
-    output_root = os.path.abspath(args.output_root) if args.output_root else os.path.dirname(batch_dir)
-    out_path = args.output or os.path.join(bestseq_dir, "parameter_batch_coverage_report.xlsx")
-
-    print("Loading run combinations...")
-    runs = load_runs(batch_dir, output_root)
-    print(f"  {len(runs)} run combinations loaded")
-
-    print("Locating Best Sequence Selection output...")
-    bestseq_tsv = find_one(os.path.join(bestseq_dir, "bestseq-*.tsv"), "bestseq report .tsv")
-    identified_fasta = find_one(os.path.join(bestseq_dir, "bestseq-*_identified.fasta"),
-                                 "bestseq _identified.fasta")
-
-    tax_info = load_tax_info(bestseq_tsv)
-    identified = read_fasta(identified_fasta)
-    winners = {sample_of(h): seq for h, seq in identified}
-    print(f"  {len(winners)} taxonomically-identified sequences loaded")
-
-    # Discover parameter keys in the order they first appear, so the report
-    # adapts to whichever parameters were actually swept.
-    param_keys: List[str] = []
-    for info in runs.values():
-        for k in info["params"]:
-            if k not in param_keys:
-                param_keys.append(k)
-
-    print("Comparing each run's consensus FASTA against the winning sequences...")
-    coverage, run_hit_count = compute_coverage(winners, runs, args.fasta_name)
-
-    print("Computing greedy minimal run set...")
-    chosen_runs = greedy_set_cover(winners, coverage, runs)
-    covered = sum(len(c) for _r, c in chosen_runs)
-    print(f"  {len(chosen_runs)} runs needed to cover {covered}/{len(winners)} sequences")
-
-    print(f"Writing report to {out_path}")
-    build_workbook(out_path, runs, winners, tax_info, coverage, run_hit_count,
-                   chosen_runs, param_keys)
-    print("Done.")
+    run_coverage_report(args.batch_dir, args.bestseq_dir, args.output_root,
+                        args.fasta_name, args.output,
+                        log=lambda msg: print(msg, file=sys.stderr if msg.lstrip().startswith(
+                            ("Warning", "Note")) else sys.stdout))
 
 
 if __name__ == "__main__":

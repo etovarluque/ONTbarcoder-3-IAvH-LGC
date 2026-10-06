@@ -1,9 +1,8 @@
 """Standalone A/B comparison of two ONTbarcoder3 run folders, per sample.
 
-Built to evaluate the coarse pre-partition of intra-sample variants
-(resolve_mixed.coarse_partition = true vs false, see
-_profiles/coarse_partition_ab.cfg), but works for any two runs of the same
-dataset (e.g. the current version vs. a run made with an older one).
+For any two runs of the same dataset: two combinations of a Parameter Batch
+(picked by run number from its batch_run_summary.tsv), or two analyses run by
+hand (e.g. the current version vs. a run made with an older one).
 
 For every sample it reports, in each run:
   - whether it produced a QC-compliant barcode (consensus_no_errors.fa) and a
@@ -14,7 +13,9 @@ and classifies the change (barcode gained / lost / changed, mixture newly
 flagged / no longer flagged).
 
 Writes a per-sample TSV (only samples that differ, unless --all) and prints a
-summary. No Qt/PyQt import: runnable from the command line.
+summary. No Qt/PyQt import: runnable from the command line, and used by the
+"Compare two runs" section of the Parameter Batch panel (list_batch_runs /
+compare_runs).
 
 Usage:
     python compare_runs_report.py --batch-dir <..._batch folder> [--runs 1 2]
@@ -51,26 +52,45 @@ def read_barcodes(path: str) -> Dict[str, str]:
     return out
 
 
+def _parse_div(fields: List[str]) -> float:
+    """Divergence fraction from a 'div=X%' field; nan if absent, NA or malformed."""
+    for f in fields:
+        if f.startswith("div="):
+            try:
+                return float(f[4:].rstrip("%")) / 100.0
+            except ValueError:
+                return float("nan")
+    return float("nan")
+
+
 def read_variants(path: str) -> Dict[str, List[float]]:
     """{sample: [divergence fraction or nan, ...]} from secondary_variants.fa
-    (header '>{sample}_var{i};frac=..;len=..;div=X%;translates=..')."""
+    (header '>{sample}_var{i};type=raw|corrected;frac=..;div=X%;...').
+
+    One entry per variant NAME ({sample}_var{i}): a variant is usually written
+    twice (type=raw, then its type=corrected copy), but one whose raw consensus
+    had too many Ns to export appears ONLY as type=corrected — counting raw
+    records alone would miss it. The raw record's divergence is preferred; the
+    corrected one is the fallback."""
     out: Dict[str, List[float]] = {}
     if not os.path.isfile(path):
         return out
+    by_name: Dict[str, float] = {}   # variant name -> divergence (insertion-ordered)
+    has_raw: set = set()
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             if not line.startswith(">"):
                 continue
             fields = line[1:].strip().split(";")
-            # Count each variant once: skip the corrected copy of a raw record.
-            if "type=corrected" in fields:
-                continue
-            sample = fields[0].rsplit("_var", 1)[0]
-            div = float("nan")
-            for f in fields[1:]:
-                if f.startswith("div=") and f[4:].rstrip("%") not in ("", "NA"):
-                    div = float(f[4:].rstrip("%")) / 100.0
-            out.setdefault(sample, []).append(div)
+            name = fields[0]
+            is_raw = "type=corrected" not in fields
+            if name in by_name and (name in has_raw or not is_raw):
+                continue   # keep the first raw record, else the first seen
+            by_name[name] = _parse_div(fields[1:])
+            if is_raw:
+                has_raw.add(name)
+    for name, div in by_name.items():
+        out.setdefault(name.rsplit("_var", 1)[0], []).append(div)
     return out
 
 
@@ -80,25 +100,39 @@ def load_run(folder: str) -> dict:
             "var": read_variants(os.path.join(folder, "secondary_variants.fa"))}
 
 
+def list_batch_runs(batch_dir: str) -> List[Tuple[int, str, str]]:
+    """[(run number, run folder, label), ...] from a batch's
+    batch_run_summary.tsv. The run folders sit next to the batch folder
+    (both in output/). Raises FileNotFoundError / ValueError."""
+    summary = os.path.join(batch_dir, "batch_run_summary.tsv")
+    if not os.path.isfile(summary):
+        raise FileNotFoundError(f"batch_run_summary.tsv not found in {batch_dir}")
+    root = os.path.dirname(os.path.abspath(batch_dir))
+    out = []
+    with open(summary, encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            try:
+                n = int(row["Run"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.append((n, os.path.join(root, "ont-barcoder_" + row.get("Folder", "")),
+                        f"run{n} ({row.get('Parameters', '')})"))
+    if not out:
+        raise ValueError(f"No runs listed in {summary}")
+    return out
+
+
 def runs_from_batch(batch_dir: str, run_a: int, run_b: int
                     ) -> Tuple[str, str, str, str]:
     """(folder_a, label_a, folder_b, label_b) from batch_run_summary.tsv."""
-    summary = os.path.join(batch_dir, "batch_run_summary.tsv")
-    if not os.path.isfile(summary):
-        sys.exit(f"batch_run_summary.tsv not found in {batch_dir}")
-    root = os.path.dirname(os.path.abspath(batch_dir))
-    rows = {}
-    with open(summary, encoding="utf-8") as fh:
-        for row in csv.DictReader(fh, delimiter="\t"):
-            rows[int(row["Run"])] = row
+    try:
+        runs = {n: (folder, label) for n, folder, label in list_batch_runs(batch_dir)}
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
     for r in (run_a, run_b):
-        if r not in rows:
-            sys.exit(f"Run {r} not listed in {summary}")
-    a, b = rows[run_a], rows[run_b]
-    return (os.path.join(root, "ont-barcoder_" + a["Folder"]),
-            f"run{run_a} ({a['Parameters']})",
-            os.path.join(root, "ont-barcoder_" + b["Folder"]),
-            f"run{run_b} ({b['Parameters']})")
+        if r not in runs:
+            sys.exit(f"Run {r} not listed in {batch_dir}")
+    return runs[run_a] + runs[run_b]
 
 
 def classify(sample: str, A: dict, B: dict) -> List[str]:
@@ -156,10 +190,16 @@ def main() -> None:
     for f in (fa, fb):
         if not os.path.isdir(f):
             sys.exit(f"Run folder not found: {f}")
+    print("\n".join(compare_runs(fa, fb, la, lb, args.output or default_out, args.all)))
 
+
+def compare_runs(fa: str, fb: str, la: str, lb: str, out_path: str,
+                 all_samples: bool = False) -> List[str]:
+    """Compare run folders A and B, write the per-sample TSV to `out_path`
+    (only samples that differ unless `all_samples`) and return the summary
+    as text lines."""
     A, B = load_run(fa), load_run(fb)
     samples = sorted(set().union(*(A[k].keys() | B[k].keys() for k in A)))
-    out_path = args.output or default_out
 
     counts: Dict[str, int] = {}
     n_diff = 0
@@ -174,7 +214,7 @@ def main() -> None:
                 counts[c] = counts.get(c, 0) + 1
             if cats:
                 n_diff += 1
-            if not cats and not args.all:
+            if not cats and not all_samples:
                 continue
             fa_s, fb_s = A["filt"].get(s), B["filt"].get(s)
             w.writerow([s, "yes" if s in A["qc"] else "no",
@@ -185,17 +225,18 @@ def main() -> None:
                         _maxdiv(A["var"].get(s, [])), _maxdiv(B["var"].get(s, [])),
                         "; ".join(cats)])
 
-    print(f"A = {la}\n    {fa}\nB = {lb}\n    {fb}\n")
-    print(f"{'':32s}{'A':>8s}{'B':>8s}")
+    lines = [f"A = {la}", f"    {fa}", f"B = {lb}", f"    {fb}", "",
+             f"{'':32s}{'A':>8s}{'B':>8s}"]
     for tag, key in (("QC-compliant barcodes", "qc"), ("Filtered barcodes", "filt")):
-        print(f"{tag:32s}{len(A[key]):8d}{len(B[key]):8d}")
-    print(f"{'Samples with secondary variants':32s}{len(A['var']):8d}{len(B['var']):8d}")
-    print(f"{'Secondary variants (total)':32s}"
-          f"{sum(map(len, A['var'].values())):8d}{sum(map(len, B['var'].values())):8d}")
-    print(f"\nSamples compared: {len(samples)}   with any difference: {n_diff}")
+        lines.append(f"{tag:32s}{len(A[key]):8d}{len(B[key]):8d}")
+    lines.append(f"{'Samples with secondary variants':32s}{len(A['var']):8d}{len(B['var']):8d}")
+    lines.append(f"{'Secondary variants (total)':32s}"
+                 f"{sum(map(len, A['var'].values())):8d}{sum(map(len, B['var'].values())):8d}")
+    lines += ["", f"Samples compared: {len(samples)}   with any difference: {n_diff}"]
     for c in sorted(counts):
-        print(f"  {c:36s}{counts[c]:6d}")
-    print(f"\nPer-sample detail: {out_path}")
+        lines.append(f"  {c:36s}{counts[c]:6d}")
+    lines += ["", f"Per-sample detail: {out_path}"]
+    return lines
 
 
 if __name__ == "__main__":

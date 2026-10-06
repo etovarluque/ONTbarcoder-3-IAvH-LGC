@@ -1051,3 +1051,44 @@ class MultiDropZone(QtWidgets.QFrame):
     @property
     def files(self):
         return self._files.copy()
+
+
+# ── Worker error reporting ─────────────────────────────────────────────────
+# Shared by the BLAST and Best Sequence panels. Worker errors can carry a full
+# traceback: the log slot shows only the first line, the dialog the full text.
+
+def error_summary(msg: str) -> str:
+    """First line of a worker error, for a one-line log slot."""
+    text = (msg or "").strip()
+    first = text.splitlines()[0] if text else "Unknown error"
+    return first if len(first) <= 160 else first[:157] + "…"
+
+
+def show_error_dialog(parent, title: str, msg: str):
+    """Summary as the message, the complete (copyable) text under
+    'Show Details…' when there is more than that one line."""
+    box = QtWidgets.QMessageBox(parent)
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(error_summary(msg))
+    if (msg or "").strip() != error_summary(msg):
+        box.setDetailedText(msg)
+    box.exec_()
+
+
+def parse_number(value) -> Optional[float]:
+    """Number from a spreadsheet cell that may hold it as text: 99.5,
+    "99.5", "99.5%", "99,5" (decimal comma). None when it is not a number."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("\u00a0", "").replace(" ", "")
+    if text.endswith("%"):
+        text = text[:-1]
+    if "," in text and "." not in text:
+        text = text.replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None

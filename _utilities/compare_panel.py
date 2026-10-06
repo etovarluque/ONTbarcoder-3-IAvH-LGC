@@ -115,13 +115,17 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         alias_path    = {inf["alias"]: inf["path"]    for inf in runs_info}
 
         if runs_info:
-            legend_bar = QtWidgets.QWidget()
-            legend_bar.setStyleSheet(
-                f"background-color: #F7F6F2; border-bottom: 1px solid {GRAY_LINE};")
-            lg_layout = QtWidgets.QHBoxLayout(legend_bar)
+            # A grid, not a single row: with dozens of runs (e.g. a Parameter
+            # Batch) one row of chips would push the window wider than the
+            # screen. Past 3 rows the legend scrolls instead of growing.
+            legend_inner = QtWidgets.QWidget()
+            legend_inner.setStyleSheet("background-color: #F7F6F2;")
+            lg_layout = QtWidgets.QGridLayout(legend_inner)
             lg_layout.setContentsMargins(20, 4, 16, 4)
-            lg_layout.setSpacing(10)
-            for inf in runs_info:
+            lg_layout.setHorizontalSpacing(10)
+            lg_layout.setVerticalSpacing(4)
+            n_cols = 8
+            for k, inf in enumerate(runs_info):
                 chip = QtWidgets.QLabel(
                     f"<b>{inf['alias']}</b> · {inf.get('label', '')}"
                     if inf.get("label") else f"<b>{inf['alias']}</b>")
@@ -130,8 +134,20 @@ class _CompareResultsWindow(QtWidgets.QDialog):
                 chip.setStyleSheet(
                     "background-color:#E6EEF8; color:#123F6E; border-radius:7px;"
                     " padding:2px 9px; font-size:11px;")
-                lg_layout.addWidget(chip)
-            lg_layout.addStretch()
+                lg_layout.addWidget(chip, k // n_cols, k % n_cols,
+                                    QtCore.Qt.AlignLeft)
+            lg_layout.setColumnStretch(n_cols, 1)
+
+            legend_bar = QtWidgets.QScrollArea()
+            legend_bar.setWidget(legend_inner)
+            legend_bar.setWidgetResizable(True)
+            legend_bar.setFrameShape(QtWidgets.QFrame.NoFrame)
+            legend_bar.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            legend_bar.setStyleSheet(
+                f"QScrollArea {{ background-color: #F7F6F2; "
+                f"border-bottom: 1px solid {GRAY_LINE}; }}")
+            n_rows = -(-len(runs_info) // n_cols)
+            legend_bar.setFixedHeight(min(n_rows, 3) * 26 + 10)
             layout.addWidget(legend_bar)
 
         # ── Tabla ─────────────────────────────────────────────────────────────
@@ -849,7 +865,7 @@ class ComparePanel(QtWidgets.QWidget):
         self._comp_bar.show()
         self._comp_bar.setValue(n)
 
-    @QtCore.pyqtSlot(list, list, list)
+    @QtCore.pyqtSlot(list)
     def show_write_errors(self, errors: list):
         """Output files that could not be written (e.g. summary.xlsx open in Excel)."""
         QtWidgets.QMessageBox.warning(
@@ -859,6 +875,7 @@ class ComparePanel(QtWidgets.QWidget):
             + "\n\nIf a file is open in another program (e.g. Excel), "
               "close it and run the comparison again.")
 
+    @QtCore.pyqtSlot(list, list, list)
     def show_results(self, rows, headers, runs_info=None):
         self._comp_bar.hide()
         self._comp_bar.setValue(0)
@@ -886,6 +903,13 @@ class ComparePanel(QtWidgets.QWidget):
         if n_no_ref:
             summary += f" &nbsp;|&nbsp; ❓ {_tr(ctx, 'No reference')}: {n_no_ref}"
 
+        dups = [f"{inf['alias']} ({inf['ndups']})" for inf in (runs_info or [])
+                if inf.get("ndups")]
+        if dups:
+            summary += (f"<br>⚠ {_tr(ctx, 'Repeated IDs merged (best quality kept)')}: "
+                        + ", ".join(dups)
+                        + f" — {_tr(ctx, 'check the ID extraction pattern')}")
+
         outdir_shown = self._outdir_edit.text()
         if outdir_shown:
             summary += f"<br>📁 {_tr(ctx, 'Output in')}: <i>{outdir_shown}</i>"
@@ -905,6 +929,17 @@ class ComparePanel(QtWidgets.QWidget):
             rows, headers, outdir_shown, runs_info, self)
         self._results_win.show()
         self._view_btn.show()
+
+    @QtCore.pyqtSlot(str)
+    def on_compare_error(self, msg: str):
+        """A comparison worker failed: stop the busy bar, re-enable Compare
+        and show the full error instead of leaving the panel spinning."""
+        self._comp_bar.hide()
+        self._comp_bar.setRange(0, 100)
+        self._comp_bar.setValue(0)
+        self._result_lbl.setText(f"Comparison failed: {error_summary(msg)}")
+        self._compare_btn_ref.setEnabled(len(self._drop.files) >= 2)
+        show_error_dialog(self, "Compare error", msg)
 
     def _open_results_win(self):
         if self._results_win is not None:
@@ -1390,19 +1425,25 @@ def _group_note(groups: List[List[str]],
     return membership, ", ".join(dist_parts)
 
 
-def _parse_fasta_file(path: str, cfg=None) -> Dict[str, Tuple[str, int, int, int, int]]:
+def _parse_fasta_file(path: str, cfg=None) -> Tuple[Dict[str, Tuple[str, int, int, int, int]], int]:
     """
-    Reads a FASTA file and returns dict[sample_id] = (seq, length, cov, ambs, gaps).
+    Reads a FASTA file and returns (dict[sample_id] = (seq, length, cov, ambs, gaps),
+    number of repeated IDs).
     ``cfg`` is the extraction config (see _split_extract_cfg / _parse_fasta_header).
     If there are duplicates in the same file, keep the one with the best quality
-    (less both → fewer gaps → greater coverage).
+    (less both → fewer gaps → greater coverage); how many were merged is
+    returned so the caller can warn — an over-broad ID pattern collapses
+    different samples into one ID this way.
+    An unreadable file raises (it must not pass for an empty one, which would
+    report every sample as absent from it).
     """
     result: Dict[str, Tuple[str, int, int, int, int]] = {}
+    n_dups = 0
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             lines = fh.readlines()
-    except Exception:
-        return result
+    except OSError as exc:
+        raise OSError(f"Could not read {os.path.basename(path)}: {exc}") from exc
 
     i = 0
     while i < len(lines):
@@ -1422,13 +1463,14 @@ def _parse_fasta_file(path: str, cfg=None) -> Dict[str, Tuple[str, int, int, int
             if sid not in result:
                 result[sid] = cand
             else:
+                n_dups += 1
                 old = result[sid]
                 if (ambs, gaps, -cov) < (old[3], old[4], -old[2]):
                     result[sid] = cand
             i = j
         else:
             i += 1
-    return result
+    return result, n_dups
 
 
 # ---------------------------------------------------------------------------
@@ -1476,6 +1518,24 @@ def _compare_sequences(seq1: str, seq2: str) -> Tuple[str, int, int, bool]:
     best_amb   = rc_amb   if use_rc else d_amb
     best_noamb = rc_noamb if use_rc else d_noamb
     return 'different', best_amb, best_noamb, use_rc
+
+
+_IDENTICAL_RESULT = ('identical', 0, 0, False)
+
+
+def _compare_cached(seq1: str, seq2: str, cache: dict) -> Tuple[str, int, int, bool]:
+    """_compare_sequences with two shortcuts that leave the result unchanged:
+    equal strings are 'identical' without aligning, and each unordered pair of
+    distinct sequences is aligned once (the distances are symmetric). With
+    many runs most files carry the same sequence for an ID, so an N-run
+    all-vs-all costs a handful of alignments instead of N*(N-1)/2."""
+    if seq1 == seq2:
+        return _IDENTICAL_RESULT
+    key = (seq1, seq2) if seq1 <= seq2 else (seq2, seq1)
+    res = cache.get(key)
+    if res is None:
+        res = cache[key] = _compare_sequences(*key)
+    return res
 
 
 def _iupac_compatible_simple(seq1: str, seq2: str) -> bool:
@@ -1682,7 +1742,8 @@ def _write_outputs(
         # ── Legend sheet: alias → file ──────────────────────────────────
         if runs_info:
             ws2 = wb.add_worksheet("Runs")
-            leg_headers = ["Alias", "Label", "Role", "File", "Sequences", "Path"]
+            leg_headers = ["Alias", "Label", "Role", "File", "Sequences",
+                           "Repeated_IDs", "Path"]
             ws2.set_row(0, 22)
             for j, h in enumerate(leg_headers):
                 ws2.write(0, j, h, fmt_hdr)
@@ -1692,7 +1753,8 @@ def _write_outputs(
             })
             leg_rows = [
                 [inf["alias"], inf.get("label", ""), inf.get("role", ""),
-                 os.path.basename(inf["path"]), inf.get("nseqs", ""), inf["path"]]
+                 os.path.basename(inf["path"]), inf.get("nseqs", ""),
+                 inf.get("ndups", 0) or "", inf["path"]]
                 for inf in runs_info
             ]
             for i, vals in enumerate(leg_rows, 1):
@@ -1802,18 +1864,50 @@ def _write_outputs(
 
 
 # ---------------------------------------------------------------------------
+# Worker base: error reporting and throttled progress
+# ---------------------------------------------------------------------------
+
+class _CompareWorkerBase(QtCore.QThread):
+    notifyProgress = QtCore.pyqtSignal(int)
+    taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
+    writeErrors    = QtCore.pyqtSignal(list)               # output files not written
+    taskError      = QtCore.pyqtSignal(str)                # full error text
+
+    _stop = False
+
+    def stop(self):
+        """Cooperative stop, checked once per ID: the run ends without
+        writing outputs or emitting taskFinished (used when the app closes)."""
+        self._stop = True
+
+    def run(self):
+        # Any exception escaping a QThread.run() just ends the thread: without
+        # this the panel would wait forever with its busy bar spinning.
+        self._last_pct = -1
+        try:
+            self._run()
+        except Exception as e:
+            import traceback
+            self.taskError.emit(f"{e}\n{traceback.format_exc()}")
+
+    def _progress(self, done: int, total: int):
+        """notifyProgress only when the integer percentage changes."""
+        pct = int(done * 100 / total) if total else 100
+        if pct != self._last_pct:
+            self._last_pct = pct
+            self.notifyProgress.emit(pct)
+
+
+# ---------------------------------------------------------------------------
 # Worker: everyone vs everyone
 # ---------------------------------------------------------------------------
 
-class _CompareWorker(QtCore.QThread):
+class _CompareWorker(_CompareWorkerBase):
     """
     Compare N files with each other (all possible pairs).
     For each ID determines the global state (worst among all peers)
     and details the result by pair in the Note column.
     """
-    notifyProgress = QtCore.pyqtSignal(int)
-    taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
-    writeErrors    = QtCore.pyqtSignal(list)               # output files not written
 
     def __init__(self, file_list: List[str], outdir: str, extract_cfg=None,
                  parent=None):
@@ -1822,7 +1916,7 @@ class _CompareWorker(QtCore.QThread):
         self.outdir      = outdir
         self.extract_cfg = extract_cfg
 
-    def run(self):
+    def _run(self):
         file_list = self.file_list
         basenames = _make_unique_labels(file_list)
 
@@ -1833,10 +1927,12 @@ class _CompareWorker(QtCore.QThread):
 
         # Parse files
         seqs: Dict[str, Dict[str, Tuple]] = {}
+        ndups: Dict[str, int] = {}
         for fname, bn in zip(file_list, basenames):
-            seqs[bn] = _parse_fasta_file(fname, self.extract_cfg)
+            seqs[bn], ndups[bn] = _parse_fasta_file(fname, self.extract_cfg)
         for inf in runs_info:
             inf["nseqs"] = len(seqs.get(inf["basename"], {}))
+            inf["ndups"] = ndups.get(inf["basename"], 0)
 
         pairs = list(itertools.combinations(basenames, 2))
         all_ids = sorted({sid for d in seqs.values() for sid in d})
@@ -1847,6 +1943,8 @@ class _CompareWorker(QtCore.QThread):
         priority = {"different": 0, "compatible": 1, "identical": 2}
 
         for prog_i, sid in enumerate(all_ids):
+            if self._stop:
+                return
             present_in  = [bn for bn in basenames if sid in seqs.get(bn, {})]
             absent_from = [bn for bn in basenames if sid not in seqs.get(bn, {})]
 
@@ -1877,18 +1975,18 @@ class _CompareWorker(QtCore.QThread):
                 row["_unique_bn"] = only_bn
                 row["_best_bn"]   = only_bn
                 rows.append(row)
-                self.notifyProgress.emit(int((prog_i + 1) / total * 100))
+                self._progress(prog_i + 1, total)
                 continue
 
             # Compare all pairs where the ID is present
             pair_results: Dict[Tuple[str, str], Tuple[str, int, int, bool]] = {}
+            align_cache: dict = {}   # per ID: each distinct pair aligned once
             for bn1, bn2 in pairs:
                 if sid not in seqs.get(bn1, {}) or sid not in seqs.get(bn2, {}):
                     continue
                 s1 = seqs[bn1][sid][0]
                 s2 = seqs[bn2][sid][0]
-                estado_par, d_amb, d_noamb, rc_used = _compare_sequences(s1, s2)
-                pair_results[(bn1, bn2)] = (estado_par, d_amb, d_noamb, rc_used)
+                pair_results[(bn1, bn2)] = _compare_cached(s1, s2, align_cache)
 
             # Length column: show when any pair has different lengths
             lens = {bn: len(seqs[bn][sid][0]) for bn in present_in}
@@ -1971,7 +2069,7 @@ class _CompareWorker(QtCore.QThread):
 
             row["Note"] = " || ".join(detail_parts)
             rows.append(row)
-            self.notifyProgress.emit(int((prog_i + 1) / total * 100))
+            self._progress(prog_i + 1, total)
 
         # Headers — include IUPAC_pos and Length only when present in data
         has_iupac  = any(row.get("IUPAC_pos", "") for row in rows)
@@ -2003,7 +2101,7 @@ class _CompareWorker(QtCore.QThread):
 # Worker: N files vs reference
 # ---------------------------------------------------------------------------
 
-class _PairCompareWorker(QtCore.QThread):
+class _PairCompareWorker(_CompareWorkerBase):
     """
     Compares N files against a reference file chosen by the user.
     For each ID present in the reference determines its status in each of
@@ -2011,10 +2109,6 @@ class _PairCompareWorker(QtCore.QThread):
     Without reference /Only in reference).
     Includes reverse complement detection and alignment with edlib.
     """
-    notifyProgress = QtCore.pyqtSignal(int)
-    taskFinished   = QtCore.pyqtSignal(list, list, list)   # rows, headers, runs_info
-    writeErrors    = QtCore.pyqtSignal(list)               # output files not written
-
     def __init__(self, file_list: List[str], ref_path: str,
                  outdir: str, extract_cfg=None, parent=None):
         super().__init__(parent)
@@ -2023,7 +2117,7 @@ class _PairCompareWorker(QtCore.QThread):
         self.outdir      = outdir
         self.extract_cfg = extract_cfg
 
-    def run(self):
+    def _run(self):
         file_list = self.file_list
         all_bns   = _make_unique_labels(file_list)
 
@@ -2043,10 +2137,12 @@ class _PairCompareWorker(QtCore.QThread):
 
         # Parse files
         seqs: Dict[str, Dict[str, Tuple]] = {}
+        ndups: Dict[str, int] = {}
         for fname, bn in zip(file_list, all_bns):
-            seqs[bn] = _parse_fasta_file(fname, self.extract_cfg)
+            seqs[bn], ndups[bn] = _parse_fasta_file(fname, self.extract_cfg)
         for inf in runs_info:
             inf["nseqs"] = len(seqs.get(inf["basename"], {}))
+            inf["ndups"] = ndups.get(inf["basename"], 0)
 
         ref_seqs = seqs.get(ref_bn, {})
         all_ids  = sorted(
@@ -2060,6 +2156,8 @@ class _PairCompareWorker(QtCore.QThread):
         priority = {"different": 0, "compatible": 1, "identical": 2}
 
         for prog_i, sid in enumerate(all_ids):
+            if self._stop:
+                return
             row: dict = {"ID": sid}
 
             # Reference info
@@ -2100,7 +2198,7 @@ class _PairCompareWorker(QtCore.QThread):
                 row["Diff_bases"] = ""
                 row["Note"]       = "Not found in any compared file"
                 rows.append(row)
-                self.notifyProgress.emit(int((prog_i + 1) / total * 100))
+                self._progress(prog_i + 1, total)
                 continue
 
             # ── No reference ──────────────────────────────────────────────
@@ -2112,7 +2210,7 @@ class _PairCompareWorker(QtCore.QThread):
                 row["Note"]       = "Only in " + _compress_aliases(
                     [alias_of[b] for b in present_bns], run_order)
                 rows.append(row)
-                self.notifyProgress.emit(int((prog_i + 1) / total * 100))
+                self._progress(prog_i + 1, total)
                 continue
 
             # ── General case: compare each file vs reference ───────────
@@ -2124,6 +2222,7 @@ class _PairCompareWorker(QtCore.QThread):
             max_dist    = 0
             max_d_noamb = 0
 
+            align_cache: dict = {}   # per ID: each distinct sequence aligned once
             for bn in comp_bns:
                 if sid not in seqs.get(bn, {}):
                     estados_por_bn[bn] = "Absent"
@@ -2134,8 +2233,8 @@ class _PairCompareWorker(QtCore.QThread):
                     continue
 
                 comp_seq = seqs[bn][sid][0]
-                estado_raw, d_amb, d_noamb, rc_used = _compare_sequences(
-                    ref_seq, comp_seq)
+                estado_raw, d_amb, d_noamb, rc_used = _compare_cached(
+                    ref_seq, comp_seq, align_cache)
 
                 estados_por_bn[bn] = estado_raw
                 dists_por_bn[bn]   = d_amb
@@ -2231,7 +2330,7 @@ class _PairCompareWorker(QtCore.QThread):
 
             row["Note"] = " || ".join(detail_parts)
             rows.append(row)
-            self.notifyProgress.emit(int((prog_i + 1) / total * 100))
+            self._progress(prog_i + 1, total)
 
         # Headers — include IUPAC_pos and Length only when present in data
         has_iupac  = any(row.get("IUPAC_pos", "") for row in rows)

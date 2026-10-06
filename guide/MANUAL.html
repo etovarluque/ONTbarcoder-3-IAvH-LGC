@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.4b — User Manual</title>
+<title>ONTbarcoder 3.5b — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -113,7 +113,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.4b — User Manual</span>
+    <span class="ver">v3.5b — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -1000,6 +1000,14 @@ open in Excel), a warning lists the affected files; close them and run the compa
 again.</p>
 <p>Load the files first: the <b>Sample ID extraction</b> settings sit below the file area
 and preview the ID extracted from a real header of the loaded files.</p>
+<p>An output folder picked with <b>Change…</b> is used as is; only without one does the panel
+ask where to save. If the ID extraction maps two records of the same file to one ID, the one
+with the best quality is kept and the summary line warns (<i>Repeated IDs merged</i>, with
+the count per file; also in the <code>Repeated_IDs</code> column of the <b>Runs</b> sheet) —
+usually a sign that the extraction pattern is too broad. A file that cannot be read stops
+the comparison with an explicit message instead of passing for an empty one. Each distinct
+pair of sequences is aligned only once per ID, so comparing dozens of runs that mostly agree
+(e.g. a Parameter Batch) stays fast.</p>
 
 <h4>Reading the summary with many files</h4>
 <p>With more than two or three files, a full file path in every column header — and every
@@ -1016,7 +1024,8 @@ keeps the ID short by giving each file a one-letter <b>alias</b> instead:</p>
       distinctive fragment of the file name, its role (<code>run</code> /
       <code>reference</code>), the file name, and the sequence count — the legend for
       every alias used in the report. The on-screen results window shows the same mapping
-      as a row of chips above the table.</li>
+      as chips above the table (a grid that scrolls past three rows when there are many
+      runs).</li>
   <li>In all-vs-all mode, files that carry the exact same sequence for a specimen are
       collapsed into a <b>variant group</b>, numbered <code>1</code>, <code>2</code>,
       <code>3</code>… — deliberately numbers, never letters, so a group label is never
@@ -1113,18 +1122,42 @@ processing</b> to treat them as a single dataset, or process each file individua
           <code>_duplicate_groups.xlsx</code> grouping IDs by shared sequence.</td></tr>
   <tr><td><b>Extract by pattern (grep)</b></td><td>Keep sequences whose headers match a
       pattern; the pattern can be typed directly, loaded from a file (one pattern per
-      line), and optionally treated as a regex.</td></tr>
+      line), and optionally treated as a regex. By default a pattern is searched as text
+      anywhere in the header, so <code>DNS-1</code> also selects <code>DNS-10</code>,
+      <code>DNS-11</code>…; for a list of IDs turn on <b>Match whole ID</b> (switched on
+      automatically when patterns are loaded from a file), which compares each pattern
+      with the sequence ID taken as described below.</td></tr>
   <tr><td><b>Filter sequences by header fields</b></td>
       <td>Split headers by a separator and add one or more field-based criteria (by
           field index, using <code>=</code>, <code>!=</code>, <code>&gt;</code>,
           <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>contains</code>
           or <code>not contains</code>) to keep only matching records.</td></tr>
   <tr><td><b>Append info to headers from .xlsx</b></td>
-      <td>Enrich headers with metadata from a spreadsheet (keyed by ID).</td></tr>
+      <td>Enrich headers with metadata from a spreadsheet (<code>.xlsx</code>): column 1 =
+          sequence ID, columns 2+ = fields appended to the header with the chosen
+          separator. The ID is taken from each header as described below.</td></tr>
   <tr><td><b>Reformat sequence lines</b></td><td>Rewrap sequence lines (e.g. single-line
       vs. wrapped FASTA).</td></tr>
   <tr><td><b>Sort sequences</b></td><td>Reorder records by a chosen field.</td></tr>
 </table>
+
+<h4>Matching sequence IDs (Append info · Match whole ID)</h4>
+<p>Both operations need the ID of each sequence. <b>Match ID by</b> says how it is taken
+from the header:</p>
+<ul>
+  <li><b>Header up to first space</b> (default) — e.g. <code>&gt;DNS-1 some text</code> →
+      <code>DNS-1</code>. Works for any FASTA whose ID is the first word.</li>
+  <li><b>Text before first separator</b> — <code>;</code>, <code>|</code>, space or a custom
+      one, for headers made of fields.</li>
+  <li><b>Remove suffix</b> (optional) — removed from the end of the ID.</li>
+</ul>
+<p>For ONTbarcoder's own headers, <code>&gt;DNS-1_all.fa;758;807;ambs=0</code> becomes
+<code>DNS-1</code> with <i>Text before first <code>;</code></i> plus suffix
+<code>_all.fa</code>. A live preview under the setting shows the ID taken from the first
+header and how many sequences of the loaded files match the spreadsheet (Append) or the
+pattern list (grep), so a wrong rule shows up before running. In Append, IDs and cell values
+are normalized (spaces, dots and commas → <code>_</code>, accents removed), and the log lists
+a few IDs that were not found.</p>
 
 <h2 id="util-fastq">12. Utility — FASTQ Inspector</h2>
 <p>Drag one or several FASTQ files, or a whole folder, to get a full descriptive quality
@@ -1148,8 +1181,15 @@ mean / median / min / max length, N50, length distribution buckets (&lt;500, 500
 &gt;1000 bp), mean quality, the fraction of reads at Q≥10/15/20 and the fraction of
 <b>bases</b> carried by those reads (the usable yield an equivalent quality filter would
 keep), mean and standard deviation of GC%, and histograms for length, quality and GC.
-Large uncompressed files are processed in parallel across CPU cores; gzip files are
-streamed sequentially.</p>
+Several files are read in parallel across CPU cores (one file per process; a large
+uncompressed file is also split into byte ranges), which matters for an ONT
+<code>fastq_pass/</code> made of hundreds of small <code>.fastq.gz</code>; a single file or a
+small input is read in one thread.</p>
+<p><b>Truncated or damaged files.</b> A <code>.fastq.gz</code> that ends early — typically
+one MinKNOW is still writing — no longer stops the analysis: the reads before the damage are
+used, the other files are analysed normally, and the status line turns amber naming the
+file(s) (hover for the full list). Files that disappeared between selection and analysis are
+skipped the same way, and the file count and size cards show what was actually read.</p>
 <div class="note">
 <b>How the per-read Q is computed</b>
 Each read's quality is <code>−10·log10(mean error probability)</code> of its bases — the ONT
@@ -1259,8 +1299,12 @@ plain "no response".</p>
 <h4>Waiting for results</h4>
 <p>A BLAST job is a queued search, not a request that fails after N retries: how long it takes
 depends on NCBI's load and on whether your IP is in the slow queue. The panel waits up to
-<b>45 minutes per search</b>, polling every 10&nbsp;s at first and backing off to 60&nbsp;s
-for long jobs (NCBI asks for no more than one poll per minute per search). If the budget runs
+<b>45 minutes per search</b>, checking its status once per minute (the NCBI minimum per
+search) and backing off to every 2&nbsp;minutes for long jobs; any two requests to the BLAST
+server are at least 10&nbsp;s apart, as NCBI's URL API guidelines ask. Only the search status
+is downloaded while waiting, not the full result page. A short batch therefore takes at least
+about a minute. <b>Stop</b> takes effect within about 30&nbsp;s even in the middle of a network
+request. If the budget runs
 out, the log reports the <b>RID</b> so the search can still be retrieved by hand at
 <code>blast.ncbi.nlm.nih.gov</code> &mdash; it is usually still running there &mdash; and the
 sequences of that batch go to <code>missing_seqs_&lt;ts&gt;.fa</code>.</p>
@@ -1482,7 +1526,10 @@ DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
 <code>Subject_accession.ver</code>, and <code>Subject_Order</code> /
 <code>Subject_Family</code> / <code>Subject_Genus</code> / <code>Subject_organism</code>.
 Five hits per sequence is the usual input, but fewer is fine — and a sequence with no hits
-at all is still handled.</p>
+at all is still handled. The <code>Subject_*</code> columns exist only when BLAST was run with
+<b>Fetch organism + taxonomy</b>; a table without them is rejected with that explanation,
+since every hit would otherwise count as a taxonomic mismatch. Numbers saved as text by
+Excel (<code>99.5%</code>, <code>99,5</code>) are read as numbers.</p>
 
 <h3>14.2 How the best sequence is chosen</h3>
 <p>Sequences are grouped by <b>sample ID</b>: the text before the first <code>;</code> in
@@ -1513,6 +1560,15 @@ only when there is more than one candidate to compare.</p>
 <p>Because the rank bonuses are 100 points apart and the default bit-score weight is 100,
 <b>taxonomic concordance always outranks raw alignment score</b>: a shorter sequence whose
 best hit is the right genus beats a longer one whose best hit is an unrelated family.</p>
+<p><b>Species level</b> is granted only when both the expected and the hit organism name an
+actual species: genus + epithet, compared on those two words (authors ignored), after
+dropping the qualifiers <code>cf.</code>, <code>aff.</code> and <code>nr.</code>. Open
+nomenclature never counts as a species match — <code>Palicourea sp.</code> vs
+<code>Palicourea sp. ABC123</code>, <code>Palicourea cf. acuminata</code> vs
+<code>Palicourea cf. guianensis</code>, or a bare genus — those fall through to the genus
+comparison. <code>Palicourea cf. guianensis</code> vs <code>Palicourea guianensis</code> is a
+species match. The same rule computes <code>Tax_level_match</code> in BLAST (§13) and the
+BOLD Formatter (§15).</p>
 
 <h3>14.3 Settings</h3>
 <p>The panel exposes only the two settings that depend on your data:</p>
@@ -1714,9 +1770,18 @@ Formatter</b> in the sidebar, just below <b>Best Sequence</b>.</p>
 <h4>15.1 Input</h4>
 <p>Drag in (or browse to) a BOLD "Barcode ID" workbook exactly as downloaded from BOLD: a
 title row, a header row containing at least a <code>Query ID</code> and an <code>ID%</code>
-column, followed by hit rows. Hits do not need to already be sorted or grouped — the tool
-groups every row by <code>Query ID</code> and sorts each group by <code>ID%</code>
-descending itself, flagging in the log any group it had to re-sort.</p>
+column, followed by hit rows. The header row is found among the first five rows, so a sheet
+saved without the title row works too. Hits do not need to already be sorted or grouped — the
+tool groups every row by <code>Query ID</code> and sorts each group by <code>ID%</code>
+descending itself, flagging in the log any group it had to re-sort. <code>ID%</code> and
+<code>Indels</code> stored as text (<code>"99.5"</code>, <code>"99.5%"</code>,
+<code>"99,5"</code>) are converted to numbers, so they sort and filter correctly.</p>
+<p><b>Rows without Query ID.</b> Before formatting, the file is checked for hit rows whose
+<code>Query ID</code> cell is empty — left as they are, they would all be pooled into one fake
+query. If there are any, a dialog says how many and where (Excel row numbers) and offers to
+<b>Rename</b> them — each block of consecutive such rows becomes its own query,
+<code>No_query_ID_01</code>, <code>No_query_ID_02</code>… — or to <b>Remove</b> them. The
+choice is recorded in the log.</p>
 
 <h4>15.2 Options</h4>
 <table>
@@ -1819,8 +1884,10 @@ parameters only needs 3 lines, not a copy of every setting:</p>
 <pre>consfreqfixed                    = 0.30, 0.35, 0.40, 0.45, 0.50
 resolve_mixed.min_secondary_frac = 20, 15, 10
 resolve_mixed.tolerance          = 10, 9, 8, 7, 6, 5</pre>
-<p>Click <b>Create example cfg (grid)</b> in the panel to write out
-<code>_profiles/ontbarcoder_batch.cfg</code> — a fully commented template listing
+<p>Click <b>Create example cfg (grid)</b> in the panel to save a copy of
+<code>_profiles/ontbarcoder_batch.cfg</code> (the save dialog opens in <code>_profiles/</code>
+as <code>my_batch.cfg</code>, so the shipped template is never overwritten; <b>Load batch
+config…</b> opens there too) — a fully commented template listing
 <i>every</i> sweepable parameter with its default, valid range and an example value
 list, ready to uncomment and edit. Percent fields (<i>Min. secondary variant
 fraction</i>, <i>Variant tolerance</i>) are written on the same 0–100 scale as their
@@ -1892,8 +1959,13 @@ coverage analysis (§17.6) singled out from a previous grid sweep.</p>
       2a's own coverage levels — independently of the overall <code>i/N</code> bar, so a
       run with several coverage levels no longer advances unevenly (fast through small
       levels, slow through the first, most expensive one) or looks stuck at 100&nbsp;% a
-      level early.</li>
+      level early. The overall bar also shows the elapsed time and, once a combination has
+      finished, an estimate of the time left (<i>ETA</i>). The bars stay pinned above the
+      log, which can be made taller by dragging the divider above it.</li>
 </ol>
+<p>The <code>.cfg</code> is read again when <b>Start batch</b> is pressed; if it was edited
+since loading and now expands to a different number of combinations, the panel asks before
+starting.</p>
 
 <h4>17.3b Phase 1 reuse across combinations</h4>
 <p>Only 7 parameters affect what Phase 1 (demultiplexing) actually does:
@@ -1972,30 +2044,58 @@ sample when a sample carries more than one candidate, exactly the case a batch w
 variants produces.</p>
 
 <h4>17.5 Stopping a batch</h4>
-<p>Stopping is handled the same way no matter how it happens — every path still writes
-the deduplicated FASTA from whatever combinations completed:</p>
+<p>Stopping is handled the same way no matter how it happens — every path still writes the
+summary and the deduplicated FASTA from whatever combinations completed:</p>
 <ul>
-  <li>The panel's own <b>Stop</b> button lets the combination currently running finish
-      cleanly, then stops before starting the next one.</li>
-  <li>Stopping from the Analysis panel's own Stop button, resetting the analysis, or
-      closing the app mid-batch all hard-abort the running combination instead — none
-      of them leave the batch stuck waiting on one that was just killed.</li>
+  <li><b>Stop</b> lets the combination currently running finish cleanly, then stops before
+      starting the next one.</li>
+  <li><b>Stop now</b> (after a confirmation) aborts the combination currently running right
+      away.</li>
+  <li>Stopping from the Analysis panel's own Stop button, resetting the analysis, or closing
+      the app mid-batch also abort the running combination — none of them leave the batch
+      stuck waiting on one that was just killed.</li>
 </ul>
+<p>A combination cut off mid-run is left out of <code>batch_run_summary.tsv</code> and of the
+merge (it would otherwise count as a run in <code>N_runs_total</code>), and the log says so.
+The last log line reads <i>Batch stopped — N/M combination(s) completed</i> rather than
+<i>Batch completed</i>.</p>
+
+<h4>17.5b Resuming an interrupted batch</h4>
+<p>Every batch folder keeps what is needed to pick it up again: a copy of its
+<code>.cfg</code> (<code>batch_config.cfg</code>), the dataset and the Parameters-panel values
+it was started with (<code>batch_state.json</code>), and <code>batch_progress.tsv</code>,
+which gains one line as <i>each</i> combination completes — so it survives Stop, closing the
+app, a crash or a power cut. With the same dataset loaded, click <b>Resume batch…</b> (next
+to <b>Load batch config…</b>) and pick the <code>ont-barcoder_*_batch</code> folder:</p>
+<ul>
+  <li>only the combinations not yet completed are run; one that was cut off mid-run is run
+      again from scratch;</li>
+  <li>the saved <code>.cfg</code> and parameters are used, not whatever the Parameters panel
+      holds now;</li>
+  <li>when it finishes, the summary and merged FASTA in that same folder cover the old and new
+      runs together, in combination order.</li>
+</ul>
+<p>A different dataset loaded than the one recorded asks for confirmation first; a
+<code>.cfg</code> that no longer expands to the same number of combinations is refused; a
+completed run whose folder was deleted is simply run again. Batches started before version
+3.5b have no saved state and cannot be resumed.</p>
 
 <h4>17.6 Coverage report — which combinations were actually needed</h4>
 <p>After BLAST and Best Sequence (<a href="#util-blast">§13</a>, <a href="#util-best">§14</a>)
 have turned the batch's merged FASTA into a taxonomically-identified best-sequence set, a
 natural question is whether the sweep was worth it: does any single combination already
 reproduce every identified sequence, or were several combinations each needed to contribute
-their own share? <code>_utilities/batch_coverage_report.py</code> answers this directly from
-the batch and Best Sequence output folders, with no GUI panel of its own — run it from a
-command line:</p>
+their own share? The <b>Coverage report (minimal combination set)</b> box of the Parameter
+Batch panel answers this: pick the batch folder and the Best Sequence output folder, then
+click <b>Create coverage report</b>. The same analysis runs from a command line:</p>
 <pre>python _utilities/batch_coverage_report.py \
     --batch-dir "output/ont-barcoder_&lt;timestamp&gt;_batch" \
     --bestseq-dir "output/ont-barcoder_&lt;timestamp&gt;_bestseq"</pre>
 <p>It re-derives, by direct sequence comparison against every run folder's own
-<code>consensus_filtered.fa</code>, exactly which run combinations reproduce each
-taxonomically-identified sample's winning sequence — rather than trusting the
+<code>consensus_filtered.fa</code> <i>and</i> <code>secondary_variants.fa</code> (a winner can
+be a secondary variant, whose <code>_var</code> number may differ from run to run), exactly
+which run combinations reproduce each taxonomically-identified sample's winning sequence —
+rather than trusting the
 <code>;run&lt;N&gt;</code> tag in <code>unique_consensus_filtered.fasta</code>, which only
 records the <i>first</i> run that produced a given variant, not every run that did. It then
 computes a greedy minimal set of combinations that together cover as many identified
@@ -2015,11 +2115,34 @@ default, into the <code>_bestseq</code> folder) with four sheets:</p>
   <li><b>All_runs_coverage</b> — every combination in the sweep with its parameters and how
       many identified sequences it reproduces on its own, for context.</li>
 </ul>
+<p>Next to the workbook it writes <code>minimal_run_set.cfg</code>: the minimal set as a
+<code># combos</code> config (§17.1b), one combination per line with its contribution as a
+comment. The panel offers to load it right away as the batch config, so the next dataset can
+be run with just those combinations. Parameters not listed in it take their value from the
+Parameters panel — use the same base settings as the original batch (recorded in its
+<code>batch_state.json</code>).</p>
 <p>Useful flags: <code>--fasta-name</code> to compare a different per-run FASTA than
 <code>consensus_filtered.fa</code>; <code>--output-root</code> if the run folders were moved
 out from under <code>output/</code>; <code>--output</code> to pick the report's path. Both
 <code>--batch-dir</code> and <code>--bestseq-dir</code> auto-detect the most recent matching
 files inside the folders given, so exact filenames/timestamps don't need to be typed out.</p>
+
+<h4>17.7 Compare two runs</h4>
+<p>A per-sample A/B report of two analyses of the same dataset — two combinations of a batch,
+or a run made with another version or by hand. The <b>Compare two runs</b> box of the panel:
+<b>Load batch…</b> lists that batch's combinations (<code>run1 (…parameters…)</code>, …) and
+<b>Add run folder…</b> adds any other analysis folder; choose <b>Run A</b> and <b>Run B</b> and
+click <b>Compare runs</b>. For every sample it reports whether each run produced a
+QC-compliant (<code>consensus_no_errors.fa</code>) and a filtered
+(<code>consensus_filtered.fa</code>) barcode and whether the sequence is the same, plus the
+number of secondary variants and their highest divergence, and classifies the change
+(<i>barcode only in A/B</i>, <i>barcode differs</i>, <i>variants only in A/B</i>,
+<i>variant count differs</i>). The summary goes to the panel log and the per-sample detail to
+<code>compare_runs_&lt;A&gt;_vs_&lt;B&gt;.tsv</code> — in the batch folder, or in run A's
+folder (<i>List every sample</i> includes the unchanged ones). Unlike
+<a href="#util-compare">FASTA Compare</a> (§10), which aligns the sequences of one file per
+run, this looks at the whole result of each analysis. Same logic as the command-line
+<code>_utilities/compare_runs_report.py</code>.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="performance">18. Performance &amp; threads</h2>
@@ -2108,7 +2231,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.4b — User Manual · Generated for the research community ·
+ONTbarcoder 3.5b — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 

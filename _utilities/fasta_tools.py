@@ -10,10 +10,40 @@ from .shared import *
 from .shared import _get_base_dir, _tr
 
 
+# Excel caps a worksheet at 1,048,576 rows (one is the header).
+_XLSX_MAX_DATA_ROWS = 1048575
+
+
+def extract_id(header: str, rule: Optional[dict] = None) -> str:
+    """Sequence ID of a FASTA header (without '>') under an ID rule:
+
+      id_mode "token"  (default) - the header up to the first whitespace
+      id_mode "before"           - the text before the first `id_sep`
+                                   (";", "|", " " or any custom string)
+      id_suffix                  - removed from the end of the ID if present
+                                   (e.g. "_all.fa" for ONTbarcoder consensus)
+
+    Shared by "Append info" and the exact-ID mode of "Extract by pattern", and
+    by their live previews, so what the preview shows is what the run does."""
+    rule = rule or {}
+    header = header.strip()
+    if rule.get("id_mode") == "before" and rule.get("id_sep"):
+        sep = rule["id_sep"]
+        sid = (header.split()[0] if header.split() else "") if sep == " " \
+            else header.split(sep, 1)[0].strip()
+    else:
+        sid = header.split()[0] if header.split() else ""
+    suffix = rule.get("id_suffix", "")
+    if suffix and sid.endswith(suffix) and len(sid) > len(suffix):
+        sid = sid[:-len(suffix)]
+    return sid
+
+
 class _FastaToolsWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(str)
     log_line = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal(list)
+    # Not named "finished": that would shadow QThread's own finished() signal.
+    done     = QtCore.pyqtSignal(list)
     error    = QtCore.pyqtSignal(str)
 
     def __init__(self, files: list, operation: str, params: dict, out_dir: str, parent=None):
@@ -183,6 +213,10 @@ class _FastaToolsWorker(QtCore.QThread):
             ws_g.set_column(0, 1, 8)
             ws_g.set_column(2, 2, 50)
 
+            if len(identical) > _XLSX_MAX_DATA_ROWS:
+                self.log_line.emit(
+                    f"  ⚠ {len(identical)} IDs exceed Excel's row limit: the 'IDs' sheet "
+                    f"keeps the first {_XLSX_MAX_DATA_ROWS}; the FASTA has them all.")
             id_row = 1
             for g_idx, (seq_key, ids) in enumerate(seq_to_ids.items(), start=1):
                 ws_g.write(g_idx, 0, g_idx, nf)
@@ -215,21 +249,32 @@ class _FastaToolsWorker(QtCore.QThread):
         pattern_str  = self._params.get("pattern", "")
         pattern_file = self._params.get("pattern_file", "")
         use_regex    = self._params.get("use_regex", False)
+        exact_rule   = self._params.get("exact_id")   # ID rule dict, or None
 
         patterns = []
-        if pattern_file and os.path.isfile(pattern_file):
+        if pattern_file:
+            if not os.path.isfile(pattern_file):
+                raise ValueError(f"Pattern file not found: {pattern_file}")
             with open(pattern_file, encoding="utf-8", errors="replace") as f:
                 patterns = [ln.strip() for ln in f if ln.strip()]
+            if not patterns:
+                raise ValueError(f"Pattern file is empty: {os.path.basename(pattern_file)}")
         elif pattern_str:
             patterns = [pattern_str]
 
         if not patterns:
             raise ValueError("No pattern specified for grep operation.")
 
-        mode_str = "regex" if use_regex else "plain text"
+        mode_str = ("exact ID" if exact_rule is not None else
+                    "regex" if use_regex else "plain text")
         pat_summary = patterns[0] if len(patterns) == 1 else f"{len(patterns)} patterns from file"
 
-        if use_regex:
+        if exact_rule is not None:
+            # Whole-ID match: "DNS-1" selects DNS-1 only, never DNS-10/DNS-11.
+            wanted = set(patterns)
+            def matches(hdr):
+                return extract_id(hdr, exact_rule) in wanted
+        elif use_regex:
             compiled = [re.compile(p) for p in patterns]
             def matches(hdr):
                 return any(rx.search(hdr) for rx in compiled)
@@ -259,24 +304,12 @@ class _FastaToolsWorker(QtCore.QThread):
         import openpyxl
         excel_path = self._params.get("excel_file", "")
         separator  = self._params.get("separator", "|")
+        id_rule    = self._params.get("id_rule") or {}
 
         if not excel_path or not os.path.isfile(excel_path):
             raise ValueError("No valid Excel file specified.")
 
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
-        ws = wb.active
-        lookup: dict = {}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or row[0] is None:
-                continue
-            row_id = self._normalize_field(self._cell_to_str(row[0]))
-            fields = [
-                nv for v in row[1:]
-                if v is not None and self._cell_to_str(v).strip()
-                for nv in (self._normalize_field(self._cell_to_str(v)),)
-                if any(c.isalnum() for c in nv)
-            ]
-            lookup[row_id] = fields
+        lookup = self.read_excel_lookup(excel_path)
 
         excel_name = os.path.basename(excel_path)
         n_excel_ids = len(lookup)
@@ -288,9 +321,10 @@ class _FastaToolsWorker(QtCore.QThread):
             updated_list = []
             n_updated = 0
             n_not_found = 0
+            not_found_ex = []
             for hdr, seq in records:
-                tokens = hdr.split()
-                seq_id = self._normalize_field(tokens[0]) if tokens else ""
+                raw_id = extract_id(hdr, id_rule)
+                seq_id = self._normalize_field(raw_id) if raw_id else ""
                 fields = lookup.get(seq_id, []) if seq_id else []
                 if fields:
                     new_hdr = hdr + separator + separator.join(fields)
@@ -298,6 +332,8 @@ class _FastaToolsWorker(QtCore.QThread):
                 else:
                     new_hdr = hdr
                     n_not_found += 1
+                    if len(not_found_ex) < 3:
+                        not_found_ex.append(raw_id or "(empty)")
                 updated_list.append((new_hdr, seq))
             out_path = os.path.join(self._out_dir, f"{stem}_append.fasta")
             self._write_fasta(updated_list, out_path)
@@ -305,11 +341,41 @@ class _FastaToolsWorker(QtCore.QThread):
                 f"{display_name}\n"
                 f"  Excel file          :  {excel_name}  ({n_excel_ids} IDs)\n"
                 f"  Total sequences in  :  {len(records)}\n"
+                f"  ID rule             :  {describe_id_rule(id_rule)}\n"
                 f"  IDs updated         :  {n_updated}\n"
-                f"  IDs not in Excel    :  {n_not_found}\n"
+                f"  IDs not in Excel    :  {n_not_found}"
+                + (f"  (e.g. {', '.join(not_found_ex)})" if not_found_ex else "")
+                + "\n"
             )
             outputs.append(out_path)
         return outputs
+
+    @classmethod
+    def read_excel_lookup(cls, excel_path: str) -> dict:
+        """{normalized ID: [normalized fields]} from column 1 / columns 2+ of
+        the first sheet. Read-only mode: only cell values are needed, and it
+        streams large sheets instead of loading them whole."""
+        import openpyxl
+        if not excel_path.lower().endswith(".xlsx"):
+            raise ValueError("Only .xlsx files are supported (save the sheet as "
+                             "Excel Workbook .xlsx).")
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            lookup: dict = {}
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or row[0] is None:
+                    continue
+                row_id = cls._normalize_field(cls._cell_to_str(row[0]))
+                lookup[row_id] = [
+                    nv for v in row[1:]
+                    if v is not None and cls._cell_to_str(v).strip()
+                    for nv in (cls._normalize_field(cls._cell_to_str(v)),)
+                    if any(c.isalnum() for c in nv)
+                ]
+            return lookup
+        finally:
+            wb.close()
 
     def _run_reformat(self):
         mode      = self._params.get("mode", "linearize")
@@ -620,6 +686,10 @@ class _FastaToolsWorker(QtCore.QThread):
                 ws_s.write(r, 0, k, cf)
                 ws_s.write(r, 1, v, nf)
 
+            if n_seq > _XLSX_MAX_DATA_ROWS:
+                self.log_line.emit(
+                    f"  ⚠ {n_seq} sequences exceed Excel's row limit: the 'Sequences' "
+                    f"sheet keeps the first {_XLSX_MAX_DATA_ROWS} (Summary covers all).")
             ws_q = wb.add_worksheet("Sequences")
             cols = ["ID", "Length", "Ambiguous", "Ambiguous (%)", "N",
                     "GC (%)", "A (%)", "C (%)", "G (%)", "T (%)",
@@ -717,9 +787,14 @@ class _FastaToolsWorker(QtCore.QThread):
             else:
                 raise ValueError(f"Unknown operation: {self._operation}")
             if not self._stop:
-                self.finished.emit(outputs)
+                self.done.emit(outputs)
         except Exception as exc:
-            self.error.emit(str(exc))
+            import traceback
+            # ValueError = a message written for the user; anything else is
+            # unexpected and carries the traceback for the details dialog.
+            msg = str(exc) if isinstance(exc, ValueError) else \
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            self.error.emit(msg)
 
 
 class _DragDropLineEdit(QtWidgets.QLineEdit):
@@ -767,6 +842,100 @@ class _DragDropLineEdit(QtWidgets.QLineEdit):
                 event.acceptProposedAction()
                 return
         event.ignore()
+
+
+def describe_id_rule(rule: Optional[dict]) -> str:
+    rule = rule or {}
+    if rule.get("id_mode") == "before" and rule.get("id_sep"):
+        sep = "space" if rule["id_sep"] == " " else f'"{rule["id_sep"]}"'
+        text = f"text before first {sep}"
+    else:
+        text = "header up to first space"
+    if rule.get("id_suffix"):
+        text += f', minus suffix "{rule["id_suffix"]}"'
+    return text
+
+
+class _IdRuleWidget(QtWidgets.QWidget):
+    """How the sequence ID is taken from each FASTA header, plus a live
+    preview line the panel fills in. Used by Append info and exact-ID grep."""
+    changed = QtCore.pyqtSignal()
+
+    _SEPS = [(";", '";"  semicolon'), ("|", '"|"  pipe'), (" ", "space"), ("", "custom…")]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(make_label("Match ID by:", color=TEXT_SEC))
+        self._mode = QtWidgets.QComboBox()
+        self._mode.addItem("Header up to first space", "token")
+        self._mode.addItem("Text before first separator", "before")
+        row.addWidget(self._mode)
+        self._sep = QtWidgets.QComboBox()
+        for value, label in self._SEPS:
+            self._sep.addItem(label, value)
+        row.addWidget(self._sep)
+        self._custom = QtWidgets.QLineEdit()
+        self._custom.setPlaceholderText("separator")
+        self._custom.setFixedWidth(90)
+        row.addWidget(self._custom)
+        row.addSpacing(12)
+        row.addWidget(make_label("Remove suffix:", color=TEXT_SEC))
+        self._suffix = QtWidgets.QLineEdit()
+        self._suffix.setPlaceholderText("optional, e.g. _all.fa")
+        self._suffix.setFixedWidth(170)
+        row.addWidget(self._suffix)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self._preview = QtWidgets.QLabel("")
+        self._preview.setTextFormat(QtCore.Qt.RichText)
+        self._preview.setWordWrap(True)
+        lay.addWidget(self._preview)
+
+        for sig in (self._mode.currentIndexChanged, self._sep.currentIndexChanged):
+            sig.connect(self._on_changed)
+        for edit in (self._custom, self._suffix):
+            edit.textChanged.connect(self._on_changed)
+        self._sync()
+
+    def _sync(self):
+        before = self._mode.currentData() == "before"
+        self._sep.setVisible(before)
+        self._custom.setVisible(before and self._sep.currentData() == "")
+
+    def _on_changed(self, *_):
+        self._sync()
+        self.changed.emit()
+
+    def rule(self) -> dict:
+        sep = self._sep.currentData()
+        if sep == "":
+            sep = self._custom.text()
+        return {"id_mode": self._mode.currentData(), "id_sep": sep,
+                "id_suffix": self._suffix.text().strip()}
+
+    def reset(self):
+        for w in (self._mode, self._sep, self._custom, self._suffix):
+            w.blockSignals(True)
+        self._mode.setCurrentIndex(0)
+        self._sep.setCurrentIndex(0)
+        self._custom.clear()
+        self._suffix.clear()
+        for w in (self._mode, self._sep, self._custom, self._suffix):
+            w.blockSignals(False)
+        self._sync()
+        self._preview.setText("")
+
+    def set_preview(self, html: str, ok: Optional[bool] = None):
+        color = TEXT_SEC if ok is None else (GREEN if ok else RED)
+        self._preview.setStyleSheet(f"color:{color}; font-size:14px;")
+        self._preview.setText(html)
 
 
 class FastaToolsPanel(QtWidgets.QWidget):
@@ -953,6 +1122,21 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         self._grep_regex_chk = QtWidgets.QCheckBox("Use regex (regular expression)")
         gl.addWidget(self._grep_regex_chk)
+        self._grep_exact_chk = QtWidgets.QCheckBox(
+            "Match whole ID (exact, not substring) — for lists of IDs")
+        self._grep_exact_chk.setToolTip(
+            "Each pattern must equal the sequence ID, so 'DNS-1' selects DNS-1\n"
+            "only, not DNS-10 or DNS-11. Turned on automatically when patterns\n"
+            "are loaded from a file.")
+        gl.addWidget(self._grep_exact_chk)
+        self._grep_id_rule = _IdRuleWidget()
+        self._grep_id_rule.hide()
+        gl.addWidget(self._grep_id_rule)
+        self._grep_exact_chk.toggled.connect(self._on_grep_exact_toggled)
+        self._grep_regex_chk.toggled.connect(self._on_grep_exact_toggled)
+        self._grep_id_rule.changed.connect(self._update_grep_preview)
+        self._grep_pattern_edit.textChanged.connect(self._update_grep_preview)
+        self._grep_file_edit.textChanged.connect(self._update_grep_preview)
         self._grep_widget.hide()
         ops_layout.addWidget(self._grep_widget)
 
@@ -1048,8 +1232,11 @@ class FastaToolsPanel(QtWidgets.QWidget):
         al.setSpacing(8)
 
         note = make_label(
-            "Excel format: column 1 = sequence ID (same as FASTA header, without '>'), "
-            "columns 2+ = fields to append. Cell values are normalized: "
+            "Excel format (.xlsx): column 1 = sequence ID, columns 2+ = fields to "
+            "append. By default the ID is the FASTA header up to its first space "
+            "(without '>'); use 'Match ID by' for headers with fields, e.g. "
+            "ONTbarcoder's 'DNS-1_all.fa;758;807' → text before ';' minus "
+            "suffix '_all.fa' = DNS-1. IDs and cell values are normalized: "
             "leading/trailing spaces removed, spaces/dots/commas → '_', accents removed.",
             color=TEXT_SEC, size=15,
         )
@@ -1059,7 +1246,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         excel_row = QtWidgets.QHBoxLayout()
         excel_row.setSpacing(8)
         excel_row.addWidget(make_label("Excel file:", color=TEXT_SEC))
-        self._excel_edit = _DragDropLineEdit(accepted_extensions=[".xlsx", ".xls"])
+        self._excel_edit = _DragDropLineEdit(accepted_extensions=[".xlsx"])
         self._excel_edit.setReadOnly(True)
         self._excel_edit.setPlaceholderText("No file selected… (or drag & drop)")
         excel_row.addWidget(self._excel_edit, 1)
@@ -1078,6 +1265,11 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._excel_btn.clicked.connect(self._browse_excel)
         excel_row.addWidget(self._excel_btn)
         al.addLayout(excel_row)
+
+        self._append_id_rule = _IdRuleWidget()
+        self._append_id_rule.changed.connect(self._update_append_preview)
+        self._excel_edit.textChanged.connect(self._update_append_preview)
+        al.addWidget(self._append_id_rule)
 
         sep_row = QtWidgets.QHBoxLayout()
         sep_row.setSpacing(12)
@@ -1283,6 +1475,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
         # Workers stopped by Clear that were still busy: referenced here so
         # Python does not destroy a running QThread (which aborts the app).
         self._retired_workers: list = []
+        self._hdr_cache: dict = {}     # path -> (stamp, headers) for ID previews
+        self._excel_cache: dict = {}   # path -> (stamp, lookup) for ID previews
         self._files: list = []
         self._last_outputs: list = []
 
@@ -1328,6 +1522,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._status_lbl.setStyleSheet("")
         self._update_sort_preview()
         self._update_ff_preview()
+        self._update_append_preview()
+        self._update_grep_preview()
 
     def _on_operation_changed(self, _btn):
         self._stats_widget.setVisible(self._radio_stats.isChecked())
@@ -1547,6 +1743,117 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._grep_pattern_row.setVisible(not use_file)
         self._grep_file_row.setVisible(use_file)
         self._grep_file_note.setVisible(use_file)
+        # A pattern file is almost always a list of IDs: match them whole.
+        if use_file and not self._grep_regex_chk.isChecked():
+            self._grep_exact_chk.setChecked(True)
+        self._update_grep_preview()
+
+    # ── ID previews (Append info / exact-ID grep) ─────────────────────────
+    _PREVIEW_MAX_HEADERS = 20000   # per file; enough for a representative count
+
+    @staticmethod
+    def _stamp(path):
+        try:
+            return (os.path.getmtime(path), os.path.getsize(path))
+        except OSError:
+            return None
+
+    def _headers(self) -> tuple:
+        """(headers of the loaded FASTA files, truncated?) for the previews."""
+        import gzip
+        out, truncated = [], False
+        for path in self._files:
+            stamp = self._stamp(path)
+            hit = self._hdr_cache.get(path)
+            if not hit or hit[0] != stamp:
+                hdrs, more = [], False
+                try:
+                    opener = gzip.open if path.lower().endswith(".gz") else open
+                    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if line.startswith(">"):
+                                if len(hdrs) >= self._PREVIEW_MAX_HEADERS:
+                                    more = True
+                                    break
+                                hdrs.append(line[1:].rstrip("\r\n"))
+                except OSError:
+                    pass
+                hit = (stamp, hdrs, more)
+                self._hdr_cache[path] = hit
+            out.extend(hit[1])
+            truncated |= hit[2]
+        return out, truncated
+
+    def _count_line(self, headers, truncated, n_found, what) -> str:
+        scope = f"{len(headers)}" + ("+ (first headers only)" if truncated else "")
+        return f"{n_found}/{scope} sequence(s) {what}"
+
+    def _update_append_preview(self, *_):
+        if not hasattr(self, "_append_id_rule"):
+            return
+        w = self._append_id_rule
+        headers, truncated = self._headers()
+        if not headers:
+            w.set_preview("Load a FASTA file to preview the ID taken from each header.")
+            return
+        rule = w.rule()
+        first = extract_id(headers[0], rule)
+        head = (f"First header → ID: <b>{first or '(empty)'}</b>")
+        path = self._excel_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            w.set_preview(head + " · select the Excel file to check matches")
+            return
+        stamp = self._stamp(path)
+        hit = self._excel_cache.get(path)
+        if not hit or hit[0] != stamp:
+            try:
+                hit = (stamp, _FastaToolsWorker.read_excel_lookup(path))
+            except Exception as e:
+                w.set_preview(head + f" · cannot read the Excel file: {e}", False)
+                return
+            self._excel_cache[path] = hit
+        lookup = hit[1]
+        norm = _FastaToolsWorker._normalize_field
+        n = sum(1 for h in headers if norm(extract_id(h, rule)) in lookup)
+        w.set_preview(head + " · " + self._count_line(headers, truncated, n,
+                                                      "found in the Excel"), n > 0)
+
+    def _grep_patterns_preview(self) -> list:
+        if self._grep_use_file_chk.isChecked():
+            path = self._grep_file_edit.text().strip()
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    return [ln.strip() for ln in fh if ln.strip()]
+            except OSError:
+                return []
+        text = self._grep_pattern_edit.text().strip()
+        return [text] if text else []
+
+    def _update_grep_preview(self, *_):
+        if not hasattr(self, "_grep_id_rule") or not self._grep_exact_chk.isChecked():
+            return
+        w = self._grep_id_rule
+        headers, truncated = self._headers()
+        if not headers:
+            w.set_preview("Load a FASTA file to preview the ID taken from each header.")
+            return
+        rule = w.rule()
+        head = f"First header → ID: <b>{extract_id(headers[0], rule) or '(empty)'}</b>"
+        wanted = set(self._grep_patterns_preview())
+        if not wanted:
+            w.set_preview(head + " · enter a pattern or load a pattern file")
+            return
+        n = sum(1 for h in headers if extract_id(h, rule) in wanted)
+        w.set_preview(head + " · " + self._count_line(headers, truncated, n,
+                                                      "match the list"), n > 0)
+
+    def _on_grep_exact_toggled(self, *_):
+        regex = self._grep_regex_chk.isChecked()
+        # Exact ID and regex are alternative ways of matching.
+        self._grep_exact_chk.setEnabled(not regex)
+        exact = self._grep_exact_chk.isChecked() and not regex
+        self._grep_id_rule.setVisible(exact)
+        self._update_grep_preview()
 
     def _browse_grep_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1557,7 +1864,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
     def _browse_excel(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Excel file", "", "Excel files (*.xlsx *.xls)"
+            self, "Select Excel file", "", "Excel workbook (*.xlsx)"
         )
         if path:
             self._excel_edit.setText(path)
@@ -1567,7 +1874,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             for sig, slot in (
                 (self._worker.progress, self._on_progress),
                 (self._worker.log_line, self._on_log_line),
-                (self._worker.finished, self._on_finished),
+                (self._worker.done,     self._on_finished),
                 (self._worker.error,    self._on_error),
             ):
                 try:
@@ -1605,12 +1912,18 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._grep_pattern_edit.clear()
         self._grep_file_edit.clear()
         self._grep_regex_chk.setChecked(False)
+        self._grep_exact_chk.setChecked(False)
+        self._grep_id_rule.reset()
+        self._grep_id_rule.hide()
         self._grep_pattern_row.show()
         self._grep_file_row.hide()
         self._grep_file_note.hide()
 
         self._excel_edit.clear()
         self._sep_pipe.setChecked(True)
+        self._append_id_rule.reset()
+        self._hdr_cache.clear()
+        self._excel_cache.clear()
 
         self._rf_radio_linearize.setChecked(True)
         self._wrap_cols_spin.setValue(80)
@@ -1672,6 +1985,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
                 params["pattern_file"] = self._grep_file_edit.text().strip()
             else:
                 params["pattern"] = self._grep_pattern_edit.text().strip()
+            if self._grep_exact_chk.isChecked() and not params["use_regex"]:
+                params["exact_id"] = self._grep_id_rule.rule()
         elif operation == "filter_fields":
             if self._ff_sep_semi.isChecked():
                 params["separator"] = ";"
@@ -1719,6 +2034,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         elif operation == "append":
             params["excel_file"] = self._excel_edit.text().strip()
             params["separator"]  = "|" if self._sep_pipe.isChecked() else ";"
+            params["id_rule"]    = self._append_id_rule.rule()
         elif operation == "reformat":
             params["mode"]      = "wrap" if self._rf_radio_wrap.isChecked() else "linearize"
             params["wrap_cols"] = self._wrap_cols_spin.value()
@@ -1765,7 +2081,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._worker = _FastaToolsWorker(self._files, operation, params, out_dir)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_line.connect(self._on_log_line)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.done.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -1862,8 +2178,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._progress_bar.hide()
         self._set_run_enabled(True)
         self._status_lbl.setStyleSheet(f"color:{RED};")
-        self._status_lbl.setText(f"Error: {msg}")
+        self._status_lbl.setText(f"Error: {error_summary(msg)}")
         self._log_edit.appendPlainText(f"ERROR: {msg}")
+        show_error_dialog(self, "FASTA Tools error", msg)
 
     def _open_output_folder(self):
         if not self._last_outputs:

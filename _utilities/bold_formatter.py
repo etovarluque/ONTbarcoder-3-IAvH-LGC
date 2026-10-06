@@ -24,7 +24,8 @@ class _BoldFormatWorker(QtCore.QThread):
 
     progress = QtCore.pyqtSignal(str)   # short status shown in the label
     log_line = QtCore.pyqtSignal(str)   # detailed per-file result appended to the log
-    finished = QtCore.pyqtSignal(list)
+    # Not named "finished": that would shadow QThread's own finished() signal.
+    done     = QtCore.pyqtSignal(list)
     error    = QtCore.pyqtSignal(str)
 
     # --- Palette taken from the BLAST results workbook -----------------------
@@ -36,6 +37,11 @@ class _BoldFormatWorker(QtCore.QThread):
     QUERY_COL_NAME   = "Query ID"
     IDPCT_COL_NAME   = "ID%"
     HITRANK_COL_NAME = "Hit rank"
+    # Columns stored as numbers even when the export holds them as text
+    NUMERIC_HEADERS  = ("ID%", "Indels")
+    # Name given to each block of consecutive hit rows without a Query ID
+    BLANK_QUERY_FMT  = "No_query_ID_{:02d}"
+    HEADER_SEARCH_ROWS = 5   # the header row is looked for in the first rows
 
     # Semantic column groups by header name -> ("header_rgb", "band_rgb").
     _BLUE   = ("FF1A365D", "FFE8F1FB")
@@ -90,8 +96,10 @@ class _BoldFormatWorker(QtCore.QThread):
     }
 
     def __init__(self, files: list, max_hits: Optional[int], out_dir: str,
-                 ref_path: str = "", strip_suffix: str = "", parent=None):
+                 ref_path: str = "", strip_suffix: str = "",
+                 blank_mode: str = "rename", parent=None):
         super().__init__(parent)
+        self._blank_mode = blank_mode   # rows without Query ID: "rename" | "drop"
         self._files    = files
         self._max_hits = max_hits   # None = keep all hits
         self._out_dir  = out_dir
@@ -105,35 +113,102 @@ class _BoldFormatWorker(QtCore.QThread):
     # ── core logic ──────────────────────────────────────────────────────────
 
     @classmethod
-    def _read_bold(cls, path):
-        """Return (headers, groups, q_idx, id_idx).
+    def _load_rows(cls, path):
+        """Return (headers, [(excel_row_number, row_values), ...]).
 
-        The input has a title in row 1, headers in row 2 and data from row 3 on.
-        Rows keep their original relative order (already sorted by ID% desc).
-        """
+        BOLD's export has a title in row 1 and the headers in row 2, but the
+        header row is located by its 'Query ID' cell among the first rows, so
+        a sheet saved without the title row still works. Read-only streaming:
+        large exports are read row by row instead of cell by cell."""
         from openpyxl import load_workbook
 
-        wb = load_workbook(path)
-        ws = wb.active
-        max_col = ws.max_column
-
-        headers = [ws.cell(row=2, column=c).value for c in range(1, max_col + 1)]
-        if cls.QUERY_COL_NAME not in headers:
-            raise ValueError(f"no '{cls.QUERY_COL_NAME}' column found")
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            rows = list(wb.active.iter_rows(values_only=True))
+        finally:
+            wb.close()
+        h_i = next((i for i, r in enumerate(rows[:cls.HEADER_SEARCH_ROWS])
+                    if any(str(v).strip() == cls.QUERY_COL_NAME
+                           for v in r if v is not None)), None)
+        if h_i is None:
+            raise ValueError(f"no '{cls.QUERY_COL_NAME}' column found in the first "
+                             f"{cls.HEADER_SEARCH_ROWS} rows")
+        headers = [str(v).strip() if v is not None else None for v in rows[h_i]]
+        while headers and headers[-1] is None:
+            headers.pop()                    # trailing empty columns
         if cls.IDPCT_COL_NAME not in headers:
             raise ValueError(f"no '{cls.IDPCT_COL_NAME}' column found")
+        width = len(headers)
+        data = []
+        for i, r in enumerate(rows[h_i + 1:], start=h_i + 2):
+            row = (list(r) + [None] * width)[:width]
+            if all(v is None or (isinstance(v, str) and not v.strip()) for v in row):
+                continue                     # fully blank row
+            data.append((i, row))
+        return headers, data
 
+    @staticmethod
+    def _blank(v) -> bool:
+        return v is None or (isinstance(v, str) and not v.strip())
+
+    @classmethod
+    def scan_blank_queries(cls, path):
+        """(rows, blocks, first Excel row numbers) of hit rows with no Query ID.
+        Used by the panel to ask the user what to do before formatting."""
+        headers, data = cls._load_rows(path)
+        q_idx = headers.index(cls.QUERY_COL_NAME)
+        rows, blocks, prev, examples = 0, 0, False, []
+        for excel_row, row in data:
+            blank = cls._blank(row[q_idx])
+            if blank:
+                rows += 1
+                if not prev:
+                    blocks += 1
+                if len(examples) < 8:
+                    examples.append(excel_row)
+            prev = blank
+        return rows, blocks, examples
+
+    @classmethod
+    def _read_bold(cls, path, blank_mode: str = "rename"):
+        """Return (headers, groups, q_idx, id_idx, blank_info).
+
+        Rows keep their original relative order (already sorted by ID% desc).
+        ID% / Indels held as text ("99.5", "99.5%") become numbers. Hit rows
+        without a Query ID are never pooled under one empty key (that would
+        build a fake query out of unrelated hits): with blank_mode "rename"
+        each block of consecutive such rows becomes its own query
+        No_query_ID_01, 02...; with "drop" they are left out.
+        blank_info = (rows, blocks) affected.
+        """
+        headers, data = cls._load_rows(path)
         q_idx = headers.index(cls.QUERY_COL_NAME)
         id_idx = headers.index(cls.IDPCT_COL_NAME)
+        num_idx = [headers.index(h) for h in cls.NUMERIC_HEADERS if h in headers]
 
         groups = OrderedDict()
-        for r in range(3, ws.max_row + 1):
-            row = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-            if row[q_idx] is None and all(v is None for v in row):
-                continue  # skip fully blank rows
-            groups.setdefault(row[q_idx], []).append(row)
+        n_blank = n_blocks = 0
+        prev_blank = False
+        for _excel_row, row in data:
+            for i in num_idx:
+                if isinstance(row[i], str):
+                    v = parse_number(row[i])
+                    if v is not None:
+                        row[i] = int(v) if v.is_integer() and "." not in row[i] else v
+            query = row[q_idx]
+            if cls._blank(query):
+                n_blank += 1
+                if not prev_blank:
+                    n_blocks += 1
+                prev_blank = True
+                if blank_mode == "drop":
+                    continue
+                query = row[q_idx] = cls.BLANK_QUERY_FMT.format(n_blocks)
+            else:
+                prev_blank = False
+            groups.setdefault(query, []).append(row)
 
-        return headers, groups, q_idx, id_idx
+        return headers, groups, q_idx, id_idx, (n_blank, n_blocks)
 
     @classmethod
     def _build(cls, headers, groups, q_idx, id_idx, max_hits):
@@ -148,8 +223,8 @@ class _BoldFormatWorker(QtCore.QThread):
 
         for gi, (query, rows) in enumerate(groups.items(), start=1):
             def id_key(row):
-                v = row[id_idx]
-                return v if isinstance(v, (int, float)) else float("-inf")
+                v = parse_number(row[id_idx])
+                return v if v is not None else float("-inf")
 
             vals = [id_key(r) for r in rows]
             if any(a < b for a, b in zip(vals, vals[1:])):
@@ -231,6 +306,8 @@ class _BoldFormatWorker(QtCore.QThread):
             band_fills[name] = PatternFill("solid", fgColor=brgb)
 
         center = Alignment(horizontal="center", vertical="center")
+        font_bold = Font(bold=True, size=cls.FONT_SIZE)
+        font_norm = Font(bold=False, size=cls.FONT_SIZE)
 
         # Header row.
         for c, name in enumerate(out_headers, start=1):
@@ -249,7 +326,7 @@ class _BoldFormatWorker(QtCore.QThread):
             banded = (gi % 2 == 1)  # odd groups colored, even groups white
             for c, name in enumerate(out_headers, start=1):
                 cell = ws.cell(row=r, column=c, value=values[c - 1])
-                cell.font = Font(bold=is_first, size=cls.FONT_SIZE)
+                cell.font = font_bold if is_first else font_norm
                 if banded:
                     cell.fill = band_fills[name]
                 cell.border = border_sep if (is_first and gi > 1) else border_thin
@@ -283,7 +360,8 @@ class _BoldFormatWorker(QtCore.QThread):
                 name = os.path.basename(path)
                 self.progress.emit(f"Formatting {name}…  ({i}/{total})")
                 try:
-                    headers, groups, q_idx, id_idx = self._read_bold(path)
+                    headers, groups, q_idx, id_idx, (n_blank, n_blocks) = \
+                        self._read_bold(path, self._blank_mode)
                     out_headers, records, reordered = self._build(
                         headers, groups, q_idx, id_idx, self._max_hits)
                     tax_info = None
@@ -315,6 +393,12 @@ class _BoldFormatWorker(QtCore.QThread):
                             self.log_line.emit(
                                 "  ⚠ Tax_level_match skipped: the BOLD table lacks "
                                 "Order/Family/Genus/Species columns")
+                    if n_blank:
+                        what = ("renamed No_query_ID_01…" + self.BLANK_QUERY_FMT.format(n_blocks)
+                                if self._blank_mode == "rename" else "removed")
+                        self.log_line.emit(
+                            f"  ⚠ {n_blank} hit row(s) without Query ID in {n_blocks} "
+                            f"block(s): {what}")
                     if reordered:
                         self.log_line.emit(
                             f"  ⚠ {len(reordered)} group(s) were not sorted by "
@@ -329,9 +413,10 @@ class _BoldFormatWorker(QtCore.QThread):
                     "No files were formatted. Make sure the input is a BOLD "
                     "Barcode-ID export (title row, header row, then hits).")
                 return
-            self.finished.emit(outputs)
+            self.done.emit(outputs)
         except Exception as exc:  # pragma: no cover - defensive
-            self.error.emit(str(exc))
+            import traceback
+            self.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
 
 class BoldFormatterPanel(QtWidgets.QWidget):
@@ -521,7 +606,7 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._worker = None
         if w is None:
             return
-        for sig in (w.progress, w.log_line, w.finished, w.error):
+        for sig in (w.progress, w.log_line, w.done, w.error):
             try:
                 sig.disconnect()
             except (TypeError, RuntimeError):
@@ -571,6 +656,10 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         if not self._ref_group.validate_or_warn(self):
             return
 
+        blank_mode = self._ask_blank_queries(path)
+        if blank_mode is None:
+            return
+
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_name = f"ont-barcoder_{ts}_bold_format"
         auto_dir = os.path.join(_get_base_dir(), "output", folder_name)
@@ -592,12 +681,47 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._retire_worker()
         self._worker = _BoldFormatWorker(
             [path], max_hits, out_dir,
-            self._ref_group.path, self._ref_group.suffix)
+            self._ref_group.path, self._ref_group.suffix, blank_mode)
         self._worker.progress.connect(self._on_progress)
         self._worker.log_line.connect(self._on_log_line)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.done.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
+    def _ask_blank_queries(self, path: str) -> Optional[str]:
+        """Hit rows without a Query ID: tell the user and let them choose to
+        rename each block (No_query_ID_##) or remove the rows. Returns
+        "rename" / "drop", or None to cancel. A file that cannot be scanned
+        is left for the worker to report."""
+        try:
+            rows, blocks, examples = _BoldFormatWorker.scan_blank_queries(path)
+        except Exception:
+            return "rename"
+        if not rows:
+            return "rename"
+        shown = ", ".join(map(str, examples)) + ("…" if rows > len(examples) else "")
+        box = QtWidgets.QMessageBox(self)
+        box.setIcon(QtWidgets.QMessageBox.Warning)
+        box.setWindowTitle("Rows without Query ID")
+        box.setText(
+            f"{rows} hit row(s) have no Query ID (Excel row(s) {shown}), "
+            f"in {blocks} block(s) of consecutive rows.")
+        box.setInformativeText(
+            "Left as they are they would all be pooled into one fake query.\n\n"
+            "• Rename: each block becomes its own query — No_query_ID_01, "
+            "No_query_ID_02…\n"
+            "• Remove: those rows are left out of the formatted file.")
+        rename_btn = box.addButton("Rename (No_query_ID_##)", QtWidgets.QMessageBox.AcceptRole)
+        drop_btn = box.addButton("Remove rows", QtWidgets.QMessageBox.DestructiveRole)
+        box.addButton(QtWidgets.QMessageBox.Cancel)
+        box.setDefaultButton(rename_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is rename_btn:
+            return "rename"
+        if clicked is drop_btn:
+            return "drop"
+        return None
 
     def _ask_output_dir(self, auto_dir: str, folder_name: str) -> Optional[str]:
         dlg = QtWidgets.QDialog(self)
@@ -692,8 +816,10 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._progress_bar.hide()
         self._set_run_enabled(True)
         self._status_lbl.setStyleSheet(f"color:{RED};")
-        self._status_lbl.setText(f"Error: {msg}")
+        self._status_lbl.setText(f"Error: {error_summary(msg)}")
         self._log_edit.appendPlainText(f"ERROR: {msg}")
+        if "\n" in msg:
+            show_error_dialog(self, "BOLD Formatter error", msg)
 
     def _open_output_folder(self):
         if not self._last_outputs:

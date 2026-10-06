@@ -229,7 +229,9 @@ from _utilities.bold_formatter import BoldFormatterPanel
 from _utilities.notes_panel import NotesPanel
 from _utilities.batch_sweep_panel import BatchSweepPanel
 from _utilities.batch_sweep import (load_batch_config, swept_keys, apply_overrides,
-                                     combo_label, merge_runs, phase1_key)
+                                     combo_label, merge_runs, phase1_key,
+                                     BATCH_CFG_FILE, write_batch_state, read_batch_state,
+                                     append_batch_progress, read_batch_progress)
 # ── i18n ──────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import xml.etree.ElementTree as _ET
@@ -997,7 +999,7 @@ class AboutDialog(QtWidgets.QDialog):
 
         layout.addSpacing(4)
 
-        ver_lbl = make_label("Version 3.4b", size=16, color=TEXT_SEC)
+        ver_lbl = make_label("Version 3.5b", size=16, color=TEXT_SEC)
         ver_lbl.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(ver_lbl)
 
@@ -1129,7 +1131,7 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
-        badge = QtWidgets.QLabel("v3.4b")
+        badge = QtWidgets.QLabel("v3.5b")
         badge.setObjectName("topbar_badge")
 
         layout.addWidget(logo)
@@ -5305,6 +5307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_stop_requested = False
         self._batch_queue = []
         self._batch_index = 0
+        self._batch_done = set()
         self._batch_base_params = {}
         self._batch_run_folders = []
         self._batch_outdir = ""
@@ -5464,6 +5467,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_blast.sendToBestSeq.connect(self._open_in_best_seq)
         self._panel_batch_sweep.sweepRequested.connect(self._start_batch_sweep)
         self._panel_batch_sweep.stopRequested.connect(self._stop_batch_sweep)
+        self._panel_batch_sweep.resumeRequested.connect(self._resume_batch_sweep)
+        self._panel_batch_sweep.stopNowRequested.connect(self._stop_batch_now)
         self._panel_results.resetRequested.connect(self._on_reset_analysis)
         self._topbar.languageChanged.connect(self._on_language_changed)
         self._topbar.aboutRequested.connect(self._show_about)
@@ -5565,19 +5570,42 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        # Stop the BLAST / comparison workers too if they are still running, so
-        # they are not destroyed mid-run.
-        for attr in ("blast_worker", "comp_worker", "best_seq_worker"):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    if w.isRunning():
-                        if hasattr(w, "stop"):
-                            w.stop()
-                        w.quit()
-                        w.wait(500)
-                except Exception:
-                    pass
+        # Stop the BLAST / comparison / Best Sequence workers too. All of them
+        # stop cooperatively: signal them all, then share one short wait. A
+        # QThread destroyed while still running makes Qt abort the process,
+        # so one that has not finished by then (e.g. a BLAST worker inside a
+        # socket call) is handed to C++ ownership and never deleted — the
+        # process exit ends it instead.
+        workers = [getattr(self, a, None) for a in
+                   ("blast_worker", "blast_file_worker", "comp_worker", "best_seq_worker")]
+        workers += self.__dict__.get("_retired_blast_workers", [])
+        for _panel_attr in ("_panel_fasta_tools", "_panel_fastq_inspector",
+                            "_panel_bold_formatter"):
+            _pnl = getattr(self, _panel_attr, None)
+            if _pnl is not None:
+                workers.append(getattr(_pnl, "_worker", None))
+                workers += list(getattr(_pnl, "_retired_workers", []))
+        running = []
+        for w in workers:
+            try:
+                if w is not None and w.isRunning():
+                    if hasattr(w, "stop"):
+                        w.stop()
+                    running.append(w)
+            except Exception:
+                pass
+        deadline = time.monotonic() + 3.0
+        for w in running:
+            try:
+                w.wait(max(0, int((deadline - time.monotonic()) * 1000)))
+                if w.isRunning():
+                    try:
+                        from PyQt5 import sip
+                    except ImportError:
+                        import sip
+                    sip.transferto(w, None)
+            except Exception:
+                pass
 
         _cfg = QtCore.QSettings(UI_SETTINGS_ORG, UI_SETTINGS_APP)
         _cfg.setValue("geometry", self.saveGeometry())
@@ -6065,19 +6093,41 @@ class MainWindow(QtWidgets.QMainWindow):
     # pipeline's own QThread workers, dispatched through the existing Qt event
     # loop.
 
-    def _start_batch_sweep(self, cfg_path: str):
+    def _batch_can_start(self) -> bool:
         if self._analysis_active or self._batch_running:
             self._panel_batch_sweep.on_error(
                 "An analysis is already running. Wait for it to finish before "
                 "starting a parameter sweep.")
-            return
+            return False
         if not self._fastq or not self._demfile:
             self._panel_batch_sweep.on_error(
                 "Load a dataset first (Input files panel) before starting a sweep.")
-            return
+            return False
         if self._is_live():
             self._panel_batch_sweep.on_error(
                 "Parameter Batch only supports Conventional mode, not Real-Time.")
+            return False
+        return True
+
+    def _batch_gencodes_ok(self, base_params: dict) -> bool:
+        if base_params.get("non_coi", False):
+            return True
+        gc = self._scan_demfile_gencodes()
+        if gc["invalid"]:
+            self._panel_batch_sweep.on_error(
+                "The CSV assigns invalid NCBI genetic code table(s). Fix the "
+                "last column of the CSV before running a sweep.")
+            return False
+        if gc["has_any"] and gc["missing"]:
+            self._panel_batch_sweep.on_error(
+                "Some samples in the CSV are missing a per-sample genetic "
+                "code. Add it to every row, or remove it from all rows, "
+                "before running a sweep.")
+            return False
+        return True
+
+    def _start_batch_sweep(self, cfg_path: str):
+        if not self._batch_can_start():
             return
 
         try:
@@ -6088,20 +6138,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg_swept_keys = swept_keys(combos)
 
         base_params = self._panel_params.get_params()
-
-        if not base_params.get("non_coi", False):
-            gc = self._scan_demfile_gencodes()
-            if gc["invalid"]:
-                self._panel_batch_sweep.on_error(
-                    "The CSV assigns invalid NCBI genetic code table(s). Fix the "
-                    "last column of the CSV before running a sweep.")
-                return
-            if gc["has_any"] and gc["missing"]:
-                self._panel_batch_sweep.on_error(
-                    "Some samples in the CSV are missing a per-sample genetic "
-                    "code. Add it to every row, or remove it from all rows, "
-                    "before running a sweep.")
-                return
+        if not self._batch_gencodes_ok(base_params):
+            return
 
         # Sweeping the intra-sample variant knobs with detection switched off
         # would make every combination identical, so it is turned on for the
@@ -6143,13 +6181,98 @@ class MainWindow(QtWidgets.QMainWindow):
         except OSError:
             pass
 
+        # Everything _resume_batch_sweep() needs to pick this batch up again:
+        # the .cfg as it is NOW (the original may be edited/moved later), the
+        # dataset it ran on and the Parameters-panel values in effect.
+        try:
+            shutil.copy2(cfg_path, os.path.join(self._batch_outdir, BATCH_CFG_FILE))
+            write_batch_state(self._batch_outdir, {
+                "version": 1,
+                "fastq": self._fastq,
+                "demfile": self._demfile,
+                "n_combos": len(combos),
+                "forced_resolve": _forced_resolve,
+                "base_params": base_params,
+            })
+            notes = []
+        except (OSError, TypeError, ValueError) as e:
+            notes = [f"Warning: could not save resume state ({e}) — this batch "
+                     f"will not be resumable if interrupted."]
+
+        self._launch_batch(combos, base_params, {}, _forced_resolve, notes=notes)
+
+    def _resume_batch_sweep(self, batch_dir: str):
+        """Re-run only the combinations of an interrupted batch that never
+        completed (per batch_progress.tsv), with the .cfg and base parameters
+        it was started with, then merge old + new runs into the same folder."""
+        if not self._batch_can_start():
+            return
+        try:
+            state = read_batch_state(batch_dir)
+            combos, _cfg_mode, _sweep = load_batch_config(
+                os.path.join(batch_dir, BATCH_CFG_FILE))
+            base_params = state["base_params"]
+        except Exception as e:
+            self._panel_batch_sweep.on_error(f"Cannot resume this batch: {e}")
+            return
+        if len(combos) != state.get("n_combos"):
+            self._panel_batch_sweep.on_error(
+                f"Cannot resume this batch: {BATCH_CFG_FILE} now expands to "
+                f"{len(combos)} combination(s), but the batch was started with "
+                f"{state.get('n_combos')}.")
+            return
+
+        def _same(a, b):
+            return bool(a) and bool(b) and \
+                os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+        if not (_same(state.get("fastq"), self._fastq)
+                and _same(state.get("demfile"), self._demfile)):
+            reply = QtWidgets.QMessageBox.question(
+                self, "Resume batch",
+                "The dataset currently loaded is not the one this batch was "
+                "started with:\n\n"
+                f"Batch:   {state.get('fastq')}\n         {state.get('demfile')}\n"
+                f"Loaded:  {self._fastq}\n         {self._demfile}\n\n"
+                "Mixing runs from different datasets in one merge is usually a "
+                "mistake. Resume anyway with the loaded dataset?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        if not self._batch_gencodes_ok(base_params):
+            return
+
+        done = read_batch_progress(batch_dir)
+        self._batch_outdir = batch_dir
+        try:
+            with open(os.path.join(batch_dir, "sweep_config.log"), "a", encoding="utf-8") as fh:
+                fh.write(f"\nResumed {datetime.datetime.now()} — "
+                         f"{len(done)}/{len(combos)} combination(s) already completed\n")
+        except OSError:
+            pass
+        self._launch_batch(combos, base_params, done,
+                           bool(state.get("forced_resolve")), resumed=True)
+
+    def _launch_batch(self, combos, base_params, done, forced_resolve,
+                      resumed=False, notes=()):
+        """Shared tail of _start_batch_sweep/_resume_batch_sweep. `done` maps
+        combo index -> completed-run record (read_batch_progress); those
+        combinations are skipped and their folders go straight into the merge."""
         self._batch_base_params = base_params
         self._batch_queue = combos
         self._batch_index = 0
+        self._batch_done = set(done)
         self._batch_run_folders = []
-        self._batch_run_meta = {}   # folder tag -> {"label": combo_label, "n_filt": int|None}
+        self._batch_run_meta = {}   # folder tag -> {"label", "n_filt": int|None, "index", "variants"}
+        for idx in sorted(done):
+            rec = done[idx]
+            self._batch_run_folders.append((rec["outpath"], rec["tag"]))
+            self._batch_run_meta[rec["tag"]] = {"label": rec["label"], "n_filt": rec["n_filt"],
+                                                "index": idx, "variants": rec["variants"]}
         self._batch_current_tag = None
         self._batch_stop_requested = False
+        self._batch_stop_now = False
         self._batch_running = True
         # Phase-1 output of the last combination that actually ran demultiplexing,
         # reused by the next combination when its phase1_key() matches (see
@@ -6161,9 +6284,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.analysisFinished.connect(self._on_batch_combo_finished)
         self._panel_progress.overallProgressChanged.connect(self._on_batch_run_progress)
         self._panel_batch_sweep.set_running(True)
-        self._panel_batch_sweep.append_log(
-            f"Starting sweep: {len(combos)} combination(s) -> {self._batch_outdir}")
-        if _forced_resolve:
+        if resumed:
+            self._panel_batch_sweep.append_log(
+                f"Resuming sweep: {len(done)}/{len(combos)} combination(s) already "
+                f"completed, {len(combos) - len(done)} to run -> {self._batch_outdir}")
+        else:
+            self._panel_batch_sweep.append_log(
+                f"Starting sweep: {len(combos)} combination(s) -> {self._batch_outdir}")
+        for note in notes:
+            self._panel_batch_sweep.append_log(f"  {note}")
+        if forced_resolve:
             self._panel_batch_sweep.append_log(
                 "  Note: 'Detect intra-sample sequence variants' was turned ON "
                 "for this batch (the .cfg sweeps resolve_mixed.* keys), even "
@@ -6171,6 +6301,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_next_batch_combo()
 
     def _run_next_batch_combo(self):
+        # Combinations already completed before a resume are not re-run.
+        while (self._batch_index < len(self._batch_queue)
+               and self._batch_index in self._batch_done):
+            self._batch_index += 1
         if self._batch_stop_requested or self._batch_index >= len(self._batch_queue):
             self._finish_batch_sweep()
             return
@@ -6233,7 +6367,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_start = time.time()
         tag = folder_name[len("ont-barcoder_"):]
         self._batch_run_folders.append((outpath, tag))
-        self._batch_run_meta[tag] = {"label": combo_label(combo), "n_filt": None}
+        self._batch_run_meta[tag] = {"label": combo_label(combo), "n_filt": None,
+                                     "index": self._batch_index}
         self._batch_current_tag = tag
 
         self._batch_current_phase1_key = phase1_key(params)
@@ -6283,9 +6418,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._batch_run_meta[self._batch_current_tag]["n_filt"] = n_filt
             # Whether this run had 'Detect intra-sample sequence variants' on:
             # only those runs feed unique_secondary_variants.fasta.
-            self._batch_run_meta[self._batch_current_tag]["variants"] = bool(
+            meta = self._batch_run_meta[self._batch_current_tag]
+            meta["variants"] = bool(
                 (getattr(self, "_params", {}) or {})
                 .get("resolve_mixed", {}).get("enabled", False))
+            # Persisted right away (not at the end of the batch) so a crash or
+            # power cut still leaves a record _resume_batch_sweep() can use.
+            try:
+                append_batch_progress(self._batch_outdir, meta["index"],
+                                      self._batch_current_tag, self._outpath,
+                                      meta["label"], n_filt, meta["variants"])
+            except OSError as e:
+                self._panel_batch_sweep.append_log(
+                    f"    Warning: could not record progress for resume: {e}")
 
         # Snapshot this combination's Phase 1 output so the next combination can
         # reuse it if its phase1_key() matches (see _run_next_batch_combo).
@@ -6309,6 +6454,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._batch_stop_requested = True
         self._panel_batch_sweep.append_log(
             "Stop requested — finishing the current combination, then stopping.")
+
+    def _stop_batch_now(self):
+        """Abort the running combination right away (vs _stop_batch_sweep,
+        which lets it finish). Safe because the batch is resumable: the
+        aborted combination never reaches batch_progress.tsv and is re-run
+        on resume."""
+        if not self._batch_running:
+            return
+        self._batch_stop_now = True
+        if self._analysis_active:
+            self._stop_analysis()   # ends in _abort_batch_sweep()
+        else:
+            self._abort_batch_sweep("Stop now — finishing the batch with the "
+                                    "combinations completed so far.")
 
     def _abort_batch_sweep(self, reason: str):
         """End a batch interrupted from OUTSIDE the Parameter Batch panel
@@ -6335,11 +6494,25 @@ class MainWindow(QtWidgets.QMainWindow):
         except TypeError:
             pass
         self._batch_running = False
-        self._panel_batch_sweep.set_progress(
-            self._batch_index, len(self._batch_queue), finished=True)
 
+        # A combination cut off mid-run (Stop now / Analysis Stop / Reset /
+        # app close) never got its n_filt: leave it out of the summary and the
+        # merge, or it inflates N_runs_total in the dedup reports. Resume re-runs it.
+        incomplete = [t for _f, t in self._batch_run_folders
+                      if self._batch_run_meta.get(t, {}).get("n_filt") is None]
+        if incomplete:
+            self._batch_run_folders = [(f, t) for f, t in self._batch_run_folders
+                                       if t not in incomplete]
+            self._panel_batch_sweep.append_log(
+                f"  Left out of the merge (did not finish): {', '.join(incomplete)}")
+        # Grid order, so runs carried over from before a resume sit with the rest.
+        self._batch_run_folders.sort(
+            key=lambda ft: self._batch_run_meta.get(ft[1], {}).get("index", 0))
         n_runs = len(self._batch_run_folders)
-        summary = {"outdir": self._batch_outdir, "n_runs": n_runs}
+        n_total = len(self._batch_queue)
+        self._panel_batch_sweep.set_progress(n_runs, n_total, finished=True)
+        summary = {"outdir": self._batch_outdir, "n_runs": n_runs,
+                   "n_total": n_total, "stopped": n_runs < n_total}
         if n_runs:
             # Per-run breakdown: parameters + consensus_filtered.fa sequence count,
             # one row per analysis — clearer than digging through the log.
@@ -9646,7 +9819,7 @@ class MainWindow(QtWidgets.QMainWindow):
 </nav>
 
 <header class="hero">
-  <div class="hero-eyebrow">ONTbarcoder v3.4b · Analysis report</div>
+  <div class="hero-eyebrow">ONTbarcoder v3.5b · Analysis report</div>
   <h1>Run <span>{run_name}</span></h1>
   <div class="hero-meta">
     <span>📅 <strong>{ts_now}</strong></span>
@@ -9751,7 +9924,7 @@ class MainWindow(QtWidgets.QMainWindow):
         {samples_section}
 
 <footer>
-  <span>ONTbarcoder v3.4b — generated {ts_now}</span>
+  <span>ONTbarcoder v3.5b — generated {ts_now}</span>
   <span>{outpath}</span>
 </footer>
 
@@ -11101,21 +11274,33 @@ class MainWindow(QtWidgets.QMainWindow):
             self._panel_progress.append_log(
                 f"  Warning writing consensus_*.fa: {e}", "warn")
 
+    def _retire_worker(self, w):
+        """Stop a BLAST / Best Sequence QThread without ever terminate()-ing it: killing a
+        Python thread mid-call can leave a lock held or hang the interpreter.
+        The stop flag is checked between requests and every socket call is
+        capped at _BlastWorker._SOCK_TIMEOUT, so a worker still inside one
+        unwinds on its own shortly after; until then it is kept referenced
+        (so the QThread object is not destroyed while running) and has at
+        most that one request left — it cannot double the NCBI request rate."""
+        try:
+            if not w.isRunning():
+                return
+            w.stop()
+            if w.wait(3000):
+                return
+        except Exception:
+            return
+        retired = self.__dict__.setdefault("_retired_blast_workers", [])
+        retired.append(w)
+        w.finished.connect(lambda w=w: retired.remove(w) if w in retired else None)
+
     def _stop_blast_worker(self):
-        """Fully stop the BLAST QThread (if any) so it releases its NCBI
-        connections. A lingering worker keeps its own rate limiter, so a new run
-        started alongside it would double the request rate and trigger 429s."""
+        """Stop the BLAST QThread (if any) so it releases its NCBI connections
+        before a new run starts. See _retire_worker."""
         w = getattr(self, "blast_worker", None)
         if w is None:
             return
-        try:
-            if w.isRunning():
-                w.stop()                 # sets the cooperative stop flag
-                if not w.wait(8000):     # let blocking urlopen calls unwind
-                    w.terminate()        # last resort if still stuck
-                    w.wait(2000)
-        except Exception:
-            pass
+        self._retire_worker(w)
         self.blast_worker = None
 
     def _stop_blast_file_worker(self):
@@ -11123,14 +11308,7 @@ class MainWindow(QtWidgets.QMainWindow):
         w = getattr(self, "blast_file_worker", None)
         if w is None:
             return
-        try:
-            if w.isRunning():
-                w.stop()
-                if not w.wait(8000):
-                    w.terminate()
-                    w.wait(2000)
-        except Exception:
-            pass
+        self._retire_worker(w)
         self.blast_file_worker = None
 
     def _on_reset_analysis(self):
@@ -11411,9 +11589,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 "  Analysis stopped before generating results.", "warn")
             self._panel_progress._stop_timer()
 
-        self._abort_batch_sweep(
-            "Current combination was stopped from the Analysis panel — "
-            "finishing the batch with the combinations completed so far.")
+        if getattr(self, "_batch_stop_now", False):
+            reason = ("Stop now — current combination aborted; finishing the "
+                      "batch with the combinations completed so far.")
+        else:
+            reason = ("Current combination was stopped from the Analysis panel — "
+                      "finishing the batch with the combinations completed so far.")
+        self._abort_batch_sweep(reason)
 
     def _min_cov(self) -> int:
         """Minimum read coverage of the current run (default 5)."""
@@ -11689,75 +11871,80 @@ class MainWindow(QtWidgets.QMainWindow):
         program_dir = _get_base_dir()
         default_outpath = os.path.join(program_dir, "output", folder_name)
 
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle(_tr("MainWindow", "Output folder"))
-        dlg.setMinimumWidth(480)
-        dlg.setStyleSheet(f"""
-            QDialog {{ background-color: {GRAY_CARD}; }}
-            QLabel {{ color: {TEXT_PRI}; background-color: transparent; }}
-            QRadioButton {{
-                color: {TEXT_PRI}; background-color: transparent;
-                font-size: 15px; padding: 6px 0;
-            }}
-            QRadioButton::indicator {{ width: 16px; height: 16px; }}
-            QPushButton {{
-                border-radius: 8px; padding: 8px 20px;
-                font-size: 15px; font-weight: 500;
-            }}
-            #dlg_ok_btn {{ background-color: {BLUE}; color: white; border: none; }}
-            #dlg_ok_btn:hover {{ background-color: #0C4A82; }}
-            #dlg_cancel_btn {{
-                background-color: transparent; color: {BLUE};
-                border: 1px solid {BLUE};
-            }}
-            #dlg_cancel_btn:hover {{ background-color: {BLUE_LIGHT}; }}
-        """)
-
-        vlay = QtWidgets.QVBoxLayout(dlg)
-        vlay.setSpacing(16)
-        vlay.setContentsMargins(24, 24, 24, 20)
-
-        title_lbl = QtWidgets.QLabel("Where to save the results?")
-        title_lbl.setStyleSheet(f"font-size:17px; font-weight:700; color:{TEXT_PRI};")
-        vlay.addWidget(title_lbl)
-
-        radio_default = QtWidgets.QRadioButton(
-            f"Automatic folder (recommended)\n  …/output/{folder_name}"
-        )
-        radio_default.setChecked(True)
-        radio_custom = QtWidgets.QRadioButton("Select folder manually")
-        vlay.addWidget(radio_default)
-        vlay.addWidget(radio_custom)
-        vlay.addSpacing(8)
-
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.addStretch()
-        btn_cancel = QtWidgets.QPushButton("Cancel")
-        btn_cancel.setObjectName("dlg_cancel_btn")
-        btn_cancel.setFixedHeight(38)
-        btn_ok = QtWidgets.QPushButton("Continue")
-        btn_ok.setObjectName("dlg_ok_btn")
-        btn_ok.setFixedHeight(38)
-        btn_ok.setDefault(True)
-        btn_cancel.clicked.connect(dlg.reject)
-        btn_ok.clicked.connect(dlg.accept)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addSpacing(8)
-        btn_row.addWidget(btn_ok)
-        vlay.addLayout(btn_row)
-
-        if dlg.exec_() != QtWidgets.QDialog.Accepted:
-            return
-
-        if radio_default.isChecked():
-            outdir = default_outpath
+        # A folder chosen with "Change…" in the panel is used as is; only
+        # without one is the user asked where to save.
+        if custom_outdir and os.path.isdir(custom_outdir):
+            outdir = os.path.join(custom_outdir, folder_name)
         else:
-            parent_dir = QtWidgets.QFileDialog.getExistingDirectory(
-                self, _tr("MainWindow", "Select the output folder")
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle(_tr("MainWindow", "Output folder"))
+            dlg.setMinimumWidth(480)
+            dlg.setStyleSheet(f"""
+                QDialog {{ background-color: {GRAY_CARD}; }}
+                QLabel {{ color: {TEXT_PRI}; background-color: transparent; }}
+                QRadioButton {{
+                    color: {TEXT_PRI}; background-color: transparent;
+                    font-size: 15px; padding: 6px 0;
+                }}
+                QRadioButton::indicator {{ width: 16px; height: 16px; }}
+                QPushButton {{
+                    border-radius: 8px; padding: 8px 20px;
+                    font-size: 15px; font-weight: 500;
+                }}
+                #dlg_ok_btn {{ background-color: {BLUE}; color: white; border: none; }}
+                #dlg_ok_btn:hover {{ background-color: #0C4A82; }}
+                #dlg_cancel_btn {{
+                    background-color: transparent; color: {BLUE};
+                    border: 1px solid {BLUE};
+                }}
+                #dlg_cancel_btn:hover {{ background-color: {BLUE_LIGHT}; }}
+            """)
+
+            vlay = QtWidgets.QVBoxLayout(dlg)
+            vlay.setSpacing(16)
+            vlay.setContentsMargins(24, 24, 24, 20)
+
+            title_lbl = QtWidgets.QLabel("Where to save the results?")
+            title_lbl.setStyleSheet(f"font-size:17px; font-weight:700; color:{TEXT_PRI};")
+            vlay.addWidget(title_lbl)
+
+            radio_default = QtWidgets.QRadioButton(
+                f"Automatic folder (recommended)\n  …/output/{folder_name}"
             )
-            if not parent_dir:
+            radio_default.setChecked(True)
+            radio_custom = QtWidgets.QRadioButton("Select folder manually")
+            vlay.addWidget(radio_default)
+            vlay.addWidget(radio_custom)
+            vlay.addSpacing(8)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            btn_row.addStretch()
+            btn_cancel = QtWidgets.QPushButton("Cancel")
+            btn_cancel.setObjectName("dlg_cancel_btn")
+            btn_cancel.setFixedHeight(38)
+            btn_ok = QtWidgets.QPushButton("Continue")
+            btn_ok.setObjectName("dlg_ok_btn")
+            btn_ok.setFixedHeight(38)
+            btn_ok.setDefault(True)
+            btn_cancel.clicked.connect(dlg.reject)
+            btn_ok.clicked.connect(dlg.accept)
+            btn_row.addWidget(btn_cancel)
+            btn_row.addSpacing(8)
+            btn_row.addWidget(btn_ok)
+            vlay.addLayout(btn_row)
+
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
                 return
-            outdir = os.path.join(parent_dir, folder_name)
+
+            if radio_default.isChecked():
+                outdir = default_outpath
+            else:
+                parent_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                    self, _tr("MainWindow", "Select the output folder")
+                )
+                if not parent_dir:
+                    return
+                outdir = os.path.join(parent_dir, folder_name)
 
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -11781,6 +11968,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.comp_worker.notifyProgress.connect(self._panel_compare.update_progress)
         self.comp_worker.writeErrors.connect(self._panel_compare.show_write_errors)
         self.comp_worker.taskFinished.connect(self._panel_compare.show_results)
+        self.comp_worker.taskError.connect(self._panel_compare.on_compare_error)
         self.comp_worker.start()
 
     @QtCore.pyqtSlot(list, dict)
@@ -12127,13 +12315,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.best_seq_worker.taskError.disconnect()
             except RuntimeError:
                 pass
-            try:
-                if self.best_seq_worker.isRunning():
-                    self.best_seq_worker.stop()
-                    self.best_seq_worker.quit()
-                    self.best_seq_worker.wait(3000)
-            except RuntimeError:
-                pass
+            # Never drop a still-running QThread (Qt aborts the app when one is
+            # destroyed mid-run, e.g. while writing a large reference xlsx).
+            self._retire_worker(self.best_seq_worker)
             self.best_seq_worker = None
 
         self.best_seq_worker = _BestSeqWorker(pairs, cfg)
@@ -12209,7 +12393,7 @@ def main():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(STYLESHEET)
         app.setApplicationName("ONTbarcoder")
-        app.setApplicationVersion("3.4b")
+        app.setApplicationVersion("3.5b")
 
         icon = QtGui.QIcon()
         for icon_name in ("icon.ico",):

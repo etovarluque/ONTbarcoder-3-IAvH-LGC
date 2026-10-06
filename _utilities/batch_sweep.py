@@ -11,6 +11,7 @@ No Qt/PyQt import here on purpose: this module is orchestrated by the GUI
 from __future__ import annotations
 import os
 import copy
+import json
 import itertools
 from typing import Dict, List, Tuple
 
@@ -485,3 +486,67 @@ def count_fasta_records(path: str) -> int:
             return sum(1 for line in fh if line.startswith(">"))
     except OSError:
         return 0
+
+
+# ── Resumable batches ──────────────────────────────────────────────────────
+# A batch folder carries everything needed to pick it up again after an
+# interruption (Stop, app close, crash, power cut):
+#   batch_config.cfg   - copy of the .cfg it was started with
+#   batch_state.json   - dataset paths, combination count and the base
+#                        Parameters-panel values the overrides apply on top of
+#   batch_progress.tsv - one line appended as EACH combination completes, so
+#                        it survives a crash that never reaches the summary
+BATCH_CFG_FILE = "batch_config.cfg"
+BATCH_STATE_FILE = "batch_state.json"
+BATCH_PROGRESS_FILE = "batch_progress.tsv"
+_PROGRESS_COLS = ("Index", "Folder", "Outpath", "Parameters",
+                  "N_consensus_filtered", "Variants")
+
+
+def write_batch_state(batch_dir: str, state: dict) -> None:
+    with open(os.path.join(batch_dir, BATCH_STATE_FILE), "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2)
+
+
+def read_batch_state(batch_dir: str) -> dict:
+    with open(os.path.join(batch_dir, BATCH_STATE_FILE), encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def append_batch_progress(batch_dir: str, index: int, tag: str, outpath: str,
+                          label: str, n_filt: int, variants: bool) -> None:
+    """Record one completed combination (0-based `index` into the combo list)."""
+    path = os.path.join(batch_dir, BATCH_PROGRESS_FILE)
+    new = not os.path.isfile(path)
+    with open(path, "a", encoding="utf-8") as fh:
+        if new:
+            fh.write("\t".join(_PROGRESS_COLS) + "\n")
+        row = (index, tag, outpath, label, n_filt, int(bool(variants)))
+        fh.write("\t".join(str(v) for v in row) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def read_batch_progress(batch_dir: str) -> Dict[int, dict]:
+    """{index: {tag, outpath, label, n_filt, variants}} for every completed
+    combination whose output folder still exists. A later line for the same
+    index wins (can't normally happen, but keeps a hand-edited file sane)."""
+    done: Dict[int, dict] = {}
+    path = os.path.join(batch_dir, BATCH_PROGRESS_FILE)
+    if not os.path.isfile(path):
+        return done
+    with open(path, encoding="utf-8") as fh:
+        next(fh, None)
+        for line in fh:
+            parts = line.rstrip("\r\n").split("\t")
+            if len(parts) < 6:
+                continue   # truncated last line from a crash mid-write
+            try:
+                idx, n_filt = int(parts[0]), int(parts[4])
+            except ValueError:
+                continue
+            if not os.path.isdir(parts[2]):
+                continue
+            done[idx] = {"tag": parts[1], "outpath": parts[2], "label": parts[3],
+                         "n_filt": n_filt, "variants": parts[5] == "1"}
+    return done

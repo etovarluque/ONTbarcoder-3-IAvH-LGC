@@ -1700,7 +1700,8 @@ class BlastPanel(QtWidgets.QWidget):
 
     def on_error(self, msg: str):
         self.set_running(False)
-        self.update_status("result", f"ERROR       │ {msg[:80]}")
+        self.update_status("result", f"ERROR       │ {error_summary(msg)}")
+        show_error_dialog(self, "BLAST error", msg)
         self._blast_btn.setEnabled(bool(self._drop.files))
         if self._drop.files:
             self._blast_btn.setStyleSheet(
@@ -2024,7 +2025,8 @@ class BlastPanel(QtWidgets.QWidget):
 
     def on_file_error(self, msg: str):
         self.set_file_running(False)
-        self.update_file_status("result", f"ERROR       │ {msg[:80]}")
+        self.update_file_status("result", f"ERROR       │ {error_summary(msg)}")
+        show_error_dialog(self, "BLAST web results error", msg)
         self._file_run_locked = True
         self._file_run_btn.setEnabled(False)
         self._file_run_btn.setStyleSheet(
@@ -2060,13 +2062,18 @@ class _BlastWorker(QtCore.QThread):
     # A BLAST job is not a request that "fails after N retries": it is a queued
     # search that takes as long as it takes. A batch of 50 sequences against
     # core_nt routinely needs 10-40 min on the public queue, so the wait is a
-    # time budget, not a poll count. Polling itself follows the NCBI URL API
-    # policy: never more often than every 10 s for a single RID.
+    # time budget, not a poll count. Polling follows the NCBI BLAST URL API
+    # guidelines (blast.ncbi.nlm.nih.gov/doc/blast-help/developerinfo.html):
+    # "Do not poll for any single RID more often than once a minute" and
+    # "Do not contact the server more often than once every 10 seconds".
     _POLL_BUDGET  = 2700  # max seconds to wait for one RID before giving up
-    _POLL_MIN     = 10    # polling interval while the job still looks quick
-    _POLL_MAX     = 60    # interval cap once the job is clearly a long one
-    _POLL_FAST_S  = 180   # keep the short interval for this long before backing off
-    _SOCK_TIMEOUT = 15   # max seconds blocked in a single urlopen call
+    _POLL_MIN     = 60    # polling interval while the job still looks quick
+    _POLL_MAX     = 120   # interval cap once the job is clearly a long one
+    _POLL_FAST_S  = 300   # keep the short interval for this long before backing off
+    _BLAST_GAP    = 10.0  # min seconds between ANY two Blast.cgi requests
+    # Max seconds blocked in one socket operation (connect, or one read — not
+    # the whole download). Bounds how long Stop can take to unwind a request.
+    _SOCK_TIMEOUT = 30
     _TAX_RETRIES  = 2    # extra retry rounds for "Not_found_in_Taxonomy" results
     _NCBI_RATE    = 9.0  # max HTTP requests/second (NCBI allows 10 with API key)
     # If NCBI outright rejects a batch (no RID, or Status=FAILED — typically its
@@ -2110,6 +2117,10 @@ class _BlastWorker(QtCore.QThread):
         # we stay within NCBI's 10 req/s limit (using 9 for safety margin).
         self._rl_lock     = threading.Lock()
         self._rl_next     = 0.0   # monotonic time of next allowed request
+        # Blast.cgi has its own, much stricter limit (_BLAST_GAP).
+        self._blast_rl_lock = threading.Lock()
+        self._blast_rl_next = 0.0
+        self._last_pct = -1       # last integer % emitted by _emit_progress
 
         # Usage monitor — accessed from multiple threads via _usage_lock
         self._usage_lock       = threading.Lock()
@@ -2120,8 +2131,16 @@ class _BlastWorker(QtCore.QThread):
     def stop(self):
         self._stop = True
 
-    def _rate_acquire(self):
-        """Block until the next NCBI request slot is available."""
+    def _rate_acquire(self, url: str = ""):
+        """Block until the next NCBI request slot is available: one Blast.cgi
+        request every _BLAST_GAP s, E-utilities at _NCBI_RATE per second."""
+        if url.startswith(self._BLAST_URL):
+            with self._blast_rl_lock:
+                wait = self._blast_rl_next - time.monotonic()
+                if wait > 0:
+                    self._interruptible_sleep(wait)
+                self._blast_rl_next = time.monotonic() + self._BLAST_GAP
+            return
         interval = 1.0 / self._NCBI_RATE
         with self._rl_lock:
             now  = time.monotonic()
@@ -2129,6 +2148,16 @@ class _BlastWorker(QtCore.QThread):
             if wait > 0:
                 time.sleep(wait)
             self._rl_next = time.monotonic() + interval
+
+    def _emit_progress(self, current: int, total: int):
+        """progressUpdated, but only when the integer percentage changes (or
+        at 100%): every emit rebuilds the whole log widget in the GUI thread."""
+        if total <= 0:
+            return
+        pct = int(current * 100 / total)
+        if pct != self._last_pct or current >= total:
+            self._last_pct = pct
+            self.progressUpdated.emit(current, total)
 
     # ── HTTP helpers ──────────────────────────────────────────────────────
 
@@ -2153,10 +2182,13 @@ class _BlastWorker(QtCore.QThread):
         params = self._eutils_params(url, params)
         if params:
             url = url + "?" + urllib.parse.urlencode(params)
+        if url.startswith(self._BLAST_URL) and "tool=" not in url:
+            url += ("&" if "?" in url else "?") + f"tool={self._NCBI_TOOL}"
+        timeout = min(timeout, self._SOCK_TIMEOUT)
         for attempt in range(self._MAX_RETRY):
             if self._stop:
                 return ""
-            self._rate_acquire()
+            self._rate_acquire(url)
             if self._stop:
                 return ""
             try:
@@ -2198,13 +2230,14 @@ class _BlastWorker(QtCore.QThread):
         given, also logs that reason itself once retries are exhausted.
         """
         import urllib.request, urllib.error
-        if "eutils.ncbi" in url and "tool=" not in data:
+        if ("eutils.ncbi" in url or url.startswith(self._BLAST_URL)) and "tool=" not in data:
             data = f"{data}&tool={self._NCBI_TOOL}"
+        timeout = min(timeout, self._SOCK_TIMEOUT)
         reason = ""
         for attempt in range(self._MAX_RETRY):
             if self._stop:
                 return "", "stopped"
-            self._rate_acquire()
+            self._rate_acquire(url)
             if self._stop:
                 return "", "stopped"
             try:
@@ -2393,7 +2426,10 @@ class _BlastWorker(QtCore.QThread):
         quickly, a long one is not polled needlessly. Returns (ready, reason) —
         reason is "" on success, otherwise NCBI's own wording when available.
         """
-        url = f"{self._BLAST_URL}?CMD=Get&RID={rid}"
+        # SearchInfo returns just the status block; a bare CMD=Get returns the
+        # full HTML result page once READY (MBs for a 100-sequence batch),
+        # which would then be downloaded again as tabular.
+        url = f"{self._BLAST_URL}?CMD=Get&FORMAT_OBJECT=SearchInfo&RID={rid}"
         polls    = 0
         interval = self._POLL_MIN
         t0       = time.monotonic()
@@ -2427,11 +2463,10 @@ class _BlastWorker(QtCore.QThread):
             # WAITING, or an empty/unrecognised reply: both mean "not yet".
             _progress("" if "Status=WAITING" in resp else " (no status in reply)")
             self._interruptible_sleep(interval)
-            # A healthy NCBI queue answers a 50-sequence batch in well under a
-            # minute, so hold the short interval for the first _POLL_FAST_S:
-            # that keeps normal runs as responsive as they have always been.
-            # Only once the job is clearly long does the interval grow, so a
-            # 45 min wait costs ~50 polls instead of ~270.
+            # Once a minute (the NCBI minimum per RID) for the first
+            # _POLL_FAST_S; only once the job is clearly long does the
+            # interval grow towards _POLL_MAX, so a 45 min wait costs ~30
+            # polls.
             if time.monotonic() - t0 > self._POLL_FAST_S:
                 interval = min(interval + 5, self._POLL_MAX)
 
@@ -2788,6 +2823,48 @@ class _BlastWorker(QtCore.QThread):
                 pass
         return cache
 
+    def _preload_caches(self, output_dir: str):
+        """Load the .dbx caches of output_dir and of its SIBLING folders (other
+        BLAST runs saved next to it). Deliberately not a recursive walk: the
+        parent is usually output/, full of analysis runs with thousands of
+        files, and for a hand-picked folder it can be a whole drive."""
+        parent = os.path.dirname(output_dir)
+        try:
+            dirs = [e.path for e in os.scandir(parent) if e.is_dir()]
+        except OSError:
+            dirs = []
+        if output_dir not in dirs:
+            dirs.append(output_dir)
+        for d in dirs:
+            for name, db in (("taxadb.dbx", self._taxadb), ("accdb.dbx", self._accdb)):
+                path = os.path.join(d, name)
+                if os.path.isfile(path):
+                    db.update(self._load_cache(path))
+        # Snapshot keys already on disk — only new ones will be appended
+        self._saved_tax_keys = set(self._taxadb.keys())
+        self._saved_acc_keys = set(self._accdb.keys())
+
+    def _retry_unresolved_taxonomy(self, unique_orgs: List[str], prefix: str = ""):
+        """Re-fetch only what failed TRANSIENTLY (network/stop) — never an
+        organism NCBI already confirmed has no lineage, which re-asking cannot
+        change and which the .dbx caches carry from run to run."""
+        for attempt in range(1, self._TAX_RETRIES + 1):
+            if self._stop:
+                return
+            retry_orgs = [o for o in unique_orgs
+                          if o in self._tax_unconfirmed or o not in self._taxadb]
+            if not retry_orgs:
+                return
+            with self._cache_lock:
+                for org in retry_orgs:
+                    self._taxadb.pop(org, None)
+            self.statusUpdated.emit(
+                "taxonomy",
+                f"Taxonomy    │ {prefix}Retry {attempt}/{self._TAX_RETRIES}: "
+                f"{len(retry_orgs)} not resolved (network)…"
+            )
+            self._fetch_taxonomy_batch(retry_orgs)
+
     def _append_cache(self, new_entries: dict, path: str):
         """Append only new key-value pairs to the cache file (no full rewrite)."""
         if not new_entries:
@@ -2905,20 +2982,7 @@ class _BlastWorker(QtCore.QThread):
         accdb_path  = os.path.join(output_dir, "accdb.dbx")
         fetch_tax = cfg.get("fetch_taxonomy", True)
         if fetch_tax:
-            # Pre-load any .dbx files from sibling blast result folders
-            parent = os.path.dirname(output_dir)
-            for root_dir, _dirs, fnames in os.walk(parent):
-                if "taxadb.dbx" in fnames:
-                    self._taxadb.update(
-                        self._load_cache(os.path.join(root_dir, "taxadb.dbx"))
-                    )
-                if "accdb.dbx" in fnames:
-                    self._accdb.update(
-                        self._load_cache(os.path.join(root_dir, "accdb.dbx"))
-                    )
-            # Snapshot keys already on disk — only new ones will be appended
-            self._saved_tax_keys = set(self._taxadb.keys())
-            self._saved_acc_keys = set(self._accdb.keys())
+            self._preload_caches(output_dir)
 
         # ── Merge & normalize FASTA ──
         raw   = self._merge_fasta_files(self.files)
@@ -3022,7 +3086,7 @@ class _BlastWorker(QtCore.QThread):
             blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
             if self._stop:
                 break
-            self.progressUpdated.emit(batch_base + 400, total_expected)
+            self._emit_progress(batch_base + 400, total_expected)
             if not used_pairs:
                 continue  # every split down to the floor was rejected; already logged
 
@@ -3050,7 +3114,7 @@ class _BlastWorker(QtCore.QThread):
                     "organism",
                     f"Organism ID │ [{batch_label}] {n_org_found}/{n_unique_accs} resolved  ✓"
                 )
-                self.progressUpdated.emit(batch_base + 600, total_expected)
+                self._emit_progress(batch_base + 600, total_expected)
 
                 organisms: List[str] = [
                     (self._accdb.get(acc, "") if acc else "") for acc in accessions
@@ -3067,25 +3131,8 @@ class _BlastWorker(QtCore.QThread):
                 if self._stop:
                     break
 
-                # ── Retry not-found organisms (batch) ─────────────────────
-                for attempt in range(1, self._TAX_RETRIES + 1):
-                    if self._stop:
-                        break
-                    retry_orgs = [
-                        org for org in unique_orgs
-                        if self._taxadb.get(org) == "Not_found_in_Taxonomy"
-                    ]
-                    if not retry_orgs:
-                        break
-                    n_retry = len(retry_orgs)
-                    with self._cache_lock:
-                        for org in retry_orgs:
-                            del self._taxadb[org]
-                    self.statusUpdated.emit(
-                        "taxonomy",
-                        f"Taxonomy    │ [{batch_label}] Retry {attempt}/{self._TAX_RETRIES}: {n_retry} not-found…"
-                    )
-                    self._fetch_taxonomy_batch(retry_orgs)
+                # ── Retry organisms whose lookup failed transiently ───────
+                self._retry_unresolved_taxonomy(unique_orgs, f"[{batch_label}] ")
 
                 n_tax_found = sum(
                     1 for o in unique_orgs
@@ -3095,7 +3142,7 @@ class _BlastWorker(QtCore.QThread):
                     "taxonomy",
                     f"Taxonomy    │ [{batch_label}] {n_tax_found}/{n_unique_orgs} resolved  ✓"
                 )
-                self.progressUpdated.emit(batch_base + 800, total_expected)
+                self._emit_progress(batch_base + 800, total_expected)
 
                 taxonomies: List[str] = [
                     (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
@@ -3133,7 +3180,7 @@ class _BlastWorker(QtCore.QThread):
                     with open(tsv_path, "a", encoding="utf-8") as tsv_fh:
                         for row_idx, r in enumerate(batch_rows_out, 1):
                             tsv_fh.write(r + "\n")
-                            self.progressUpdated.emit(
+                            self._emit_progress(
                                 batch_base + row_phase_start + int(row_phase_range * row_idx / n_batch_rows),
                                 total_expected
                             )
@@ -3415,16 +3462,7 @@ class _BlastFileWorker(_BlastWorker):
         accdb_path  = os.path.join(output_dir, "accdb.dbx")
         fetch_tax = cfg.get("fetch_taxonomy", True)
         if fetch_tax:
-            parent = os.path.dirname(output_dir)
-            for root_dir, _dirs, fnames in os.walk(parent):
-                if "taxadb.dbx" in fnames:
-                    self._taxadb.update(
-                        self._load_cache(os.path.join(root_dir, "taxadb.dbx")))
-                if "accdb.dbx" in fnames:
-                    self._accdb.update(
-                        self._load_cache(os.path.join(root_dir, "accdb.dbx")))
-            self._saved_tax_keys = set(self._taxadb.keys())
-            self._saved_acc_keys = set(self._accdb.keys())
+            self._preload_caches(output_dir)
 
         # ── Parse every result file ──
         self.statusUpdated.emit(
@@ -3469,7 +3507,7 @@ class _BlastFileWorker(_BlastWorker):
         headings = "Hit_rank\t" + headings
 
         total_expected = 1000
-        self.progressUpdated.emit(50, total_expected)
+        self._emit_progress(50, total_expected)
 
         if fetch_tax and not self._stop:
             accessions = [
@@ -3482,7 +3520,7 @@ class _BlastFileWorker(_BlastWorker):
             n_org_found = sum(1 for a in unique_accs if a in self._accdb)
             self.statusUpdated.emit(
                 "organism", f"Organism ID │ {n_org_found}/{len(unique_accs)} resolved  ✓")
-            self.progressUpdated.emit(400, total_expected)
+            self._emit_progress(400, total_expected)
 
             organisms = [(self._accdb.get(acc, "") if acc else "") for acc in accessions]
 
@@ -3492,24 +3530,7 @@ class _BlastFileWorker(_BlastWorker):
                     "taxonomy", f"Taxonomy    │ Fetching {len(unique_orgs)} organisms…")
                 self._fetch_taxonomy_batch(unique_orgs)
 
-                for attempt in range(1, self._TAX_RETRIES + 1):
-                    if self._stop:
-                        break
-                    retry_orgs = [
-                        org for org in unique_orgs
-                        if self._taxadb.get(org) == "Not_found_in_Taxonomy"
-                    ]
-                    if not retry_orgs:
-                        break
-                    with self._cache_lock:
-                        for org in retry_orgs:
-                            del self._taxadb[org]
-                    self.statusUpdated.emit(
-                        "taxonomy",
-                        f"Taxonomy    │ Retry {attempt}/{self._TAX_RETRIES}: "
-                        f"{len(retry_orgs)} not-found…"
-                    )
-                    self._fetch_taxonomy_batch(retry_orgs)
+                self._retry_unresolved_taxonomy(unique_orgs)
 
                 n_tax_found = sum(
                     1 for o in unique_orgs
@@ -3517,7 +3538,7 @@ class _BlastFileWorker(_BlastWorker):
                 )
                 self.statusUpdated.emit(
                     "taxonomy", f"Taxonomy    │ {n_tax_found}/{len(unique_orgs)} resolved  ✓")
-                self.progressUpdated.emit(800, total_expected)
+                self._emit_progress(800, total_expected)
 
                 with self._cache_lock:
                     new_tax = {k: self._taxadb[k] for k in self._taxadb
@@ -3561,7 +3582,7 @@ class _BlastFileWorker(_BlastWorker):
             )
             return
 
-        self.progressUpdated.emit(900, total_expected)
+        self._emit_progress(900, total_expected)
 
         # ── Query taxonomy from a reference file, plus Tax_level_match ──
         # Both are added in the same read/rewrite pass over the file.
@@ -3585,7 +3606,7 @@ class _BlastFileWorker(_BlastWorker):
         xlsx_path = ""
         if ranked_rows and not self._stop:
             xlsx_path = self._tsv_to_xlsx(tsv_path)
-        self.progressUpdated.emit(total_expected, total_expected)
+        self._emit_progress(total_expected, total_expected)
 
         extra_msgs = [m for m in (ref_msg, tax_match_msg) if m]
         if self._stop:

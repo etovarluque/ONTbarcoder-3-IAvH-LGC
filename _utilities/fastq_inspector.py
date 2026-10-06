@@ -333,6 +333,9 @@ def _fq_sync_record(fh_bin) -> bool:
 # quality filter computes it (pipeline._PHRED_ERR), so the numbers shown here
 # predict what that filter keeps. The arithmetic mean of the Phred values
 # overestimates quality because a few bad bases barely move it.
+import gzip
+import zlib
+
 _PHRED_ERR = [10.0 ** (-(q - 33) / 10.0) for q in range(256)]
 _PHRED_ERR_GET = _PHRED_ERR.__getitem__
 
@@ -416,7 +419,7 @@ class _FqAcc:
         self.q_scores = array("f")
         self.gc_pcts = array("f")
         self.total_bases = 0
-        self.q_sum = self.gc_sum = 0.0
+        self.q_sum = self.gc_sum = self.gc_sq_sum = 0.0
         self.len_lt500 = self.len_500_1k = self.len_gt1k = 0
         self.q_cnt_10 = self.q_cnt_15 = self.q_cnt_20 = 0
         # Bases carried by reads at or above each Q: the usable yield after a
@@ -434,6 +437,7 @@ class _FqAcc:
         self.total_bases += L
         self.q_sum += q
         self.gc_sum += gc
+        self.gc_sq_sum += gc * gc
         if L < 500:
             self.len_lt500 += 1
         elif L <= 1000:
@@ -450,7 +454,7 @@ class _FqAcc:
             self.q_cnt_20 += 1
             self.bases_q20 += L
 
-    _COUNTERS = ("total_bases", "q_sum", "gc_sum", "len_lt500", "len_500_1k",
+    _COUNTERS = ("total_bases", "q_sum", "gc_sum", "gc_sq_sum", "len_lt500", "len_500_1k",
                  "len_gt1k", "q_cnt_10", "q_cnt_15", "q_cnt_20",
                  "bases_q10", "bases_q15", "bases_q20")
 
@@ -463,6 +467,12 @@ class _FqAcc:
         d = {k: getattr(self, k) for k in self._COUNTERS}
         d.update(lengths=self.lengths, q_scores=self.q_scores, gc_pcts=self.gc_pcts)
         return d
+
+    @staticmethod
+    def dict_snapshot(d: dict) -> tuple:
+        """snapshot() of a to_dict() result (a task's partial accumulator)."""
+        return (len(d["lengths"]), d["total_bases"], d["q_sum"],
+                d["q_cnt_10"], d["bases_q10"])
 
     def merge(self, d: dict):
         self.lengths.extend(d["lengths"])
@@ -504,9 +514,78 @@ def _fq_chunk_task(path: str, start: int, end: int) -> dict:
                 qual = fh_bin.readline().rstrip(b"\r\n")
                 if seq:
                     acc.add(seq, qual)
-    except Exception:
-        pass   # partial result still aggregated
+    except Exception as exc:
+        # The reads read so far are kept, but the gap must be reported:
+        # silently missing part of a file would make every statistic wrong.
+        d = acc.to_dict()
+        d["warning"] = (f"{os.path.basename(path)}: part of the file could not be "
+                        f"read ({type(exc).__name__}: {exc}) — statistics are incomplete")
+        return d
     return acc.to_dict()
+
+
+# Errors of a damaged / still-being-written gzip stream: the reads decoded
+# before the damage are valid and are kept.
+_TRUNCATED_ERRORS = (EOFError, zlib.error, getattr(gzip, "BadGzipFile", OSError))
+
+
+def _read_fastq_file(path: str, acc: "_FqAcc", on_record=None, should_stop=None):
+    """Read every record of one FASTQ / FASTQ.gz into `acc`. Returns a warning
+    string when the file is truncated or damaged (reads before that point are
+    kept), else "". `on_record(n, raw_pos)` is called every 5000 reads and
+    `should_stop()` is polled there (in-thread use); both are optional so the
+    same reader serves the process-pool task."""
+    is_gz = path.lower().endswith(".gz")
+    # Binary mode so quality bytes map straight onto the error table.
+    # For gzip, a 4 MB BufferedReader feeds decompression in large chunks.
+    raw = open(path, "rb", buffering=4 * 1024 * 1024)
+    fh = gzip.GzipFile(fileobj=raw) if is_gz else raw
+    n_local = 0
+    try:
+        it = iter(fh)
+        for header in it:
+            # Skip malformed / mid-record lines so this path matches the
+            # chunked one (_fq_chunk_task), which also resyncs on non-'@' headers.
+            if not header.startswith(b"@"):
+                continue
+            try:
+                seq = next(it).rstrip(b"\r\n")
+                next(it)                           # '+' line
+                qual = next(it).rstrip(b"\r\n")
+            except StopIteration:
+                break
+            if not seq:
+                continue
+            acc.add(seq, qual)
+            n_local += 1
+            if n_local % 5000 == 0:
+                if should_stop is not None and should_stop():
+                    return ""
+                if on_record is not None:
+                    on_record(n_local, raw.tell())
+    except _TRUNCATED_ERRORS as exc:
+        return (f"{os.path.basename(path)}: truncated or damaged ({exc}) — "
+                f"the {n_local:,} reads before that point were used")
+    finally:
+        fh.close()
+        if is_gz:
+            raw.close()
+    return ""
+
+
+def _fq_file_task(path: str) -> dict:
+    """One whole file in a worker process (many small files in parallel).
+    Defined at module level so ProcessPoolExecutor can pickle it on Windows."""
+    acc = _FqAcc()
+    try:
+        warning = _read_fastq_file(path, acc)
+    except Exception as exc:
+        warning = (f"{os.path.basename(path)}: could not be read "
+                   f"({type(exc).__name__}: {exc}) — statistics are incomplete")
+    d = acc.to_dict()
+    if warning:
+        d["warning"] = warning
+    return d
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -515,13 +594,17 @@ def _fq_chunk_task(path: str, start: int, end: int) -> dict:
 
 class _FastqInspectorWorker(QtCore.QThread):
     progress = QtCore.pyqtSignal(int, int)   # reads processed, % of input bytes read
-    finished = QtCore.pyqtSignal(dict)
+    # Not named "finished": that would shadow QThread's own finished() signal.
+    done     = QtCore.pyqtSignal(dict)
     error    = QtCore.pyqtSignal(str)
 
     _SCATTER_MAX = 10_000
 
-    # ── minimum file size to justify spawning worker processes ──────────────
+    # ── minimum file size to justify splitting ONE file across processes ──
     _PARALLEL_THRESHOLD = 50 * 1024 * 1024   # 50 MB uncompressed
+    # ── minimum input to justify a process pool across files ──────────────
+    # (each process imports this module once: ~0.5 s on Windows)
+    _POOL_MIN_BYTES = 16 * 1024 * 1024
 
     def __init__(self, paths, groups: Optional[Dict[str, str]] = None, parent=None):
         super().__init__(parent)
@@ -532,84 +615,83 @@ class _FastqInspectorWorker(QtCore.QThread):
     def stop(self):
         self._stop = True
 
+    @staticmethod
+    def _n_procs() -> int:
+        return max(1, min((os.cpu_count() or 2) - 1, 12))
+
     def run(self):
         try:
-            acc = _FqAcc()
-            sizes = [os.path.getsize(p) for p in self._paths]
-            self._total_bytes = max(sum(sizes), 1)
-            done = 0
+            self._warnings: List[str] = []
+            # A file can vanish between selection and analysis (MinKNOW moves
+            # files): skip it, say so, and report only what was analyzed.
+            paths, sizes = [], []
+            for p in self._paths:
+                try:
+                    sizes.append(os.path.getsize(p))
+                    paths.append(p)
+                except OSError:
+                    self._warnings.append(f"{os.path.basename(p)}: no longer exists — skipped")
+            self._n_files, self._n_bytes = len(paths), sum(sizes)
+            self._total_bytes = max(self._n_bytes, 1)
             # group -> [files, reads, bases, q_sum, reads_q10, bases_q10]
             self._group_stats: Dict[str, list] = {}
-            for path, size in zip(self._paths, sizes):
-                if self._stop:
-                    return
-                before = acc.snapshot()
-                # Gzip streams cannot be split; only parallelize plain FASTQ files
-                # large enough to amortize process-spawn overhead (~200 ms on Windows).
-                if not path.lower().endswith(".gz") and size >= self._PARALLEL_THRESHOLD:
-                    self._run_parallel(path, size, acc, done)
-                else:
-                    self._run_sequential(path, acc, done)
-                done += size
-                g = self._group_stats.setdefault(
-                    self._groups.get(path, os.path.basename(path)), [0, 0, 0, 0.0, 0, 0])
-                g[0] += 1
-                for i, (b, a) in enumerate(zip(before, acc.snapshot()), start=1):
-                    g[i] += a - b
+            acc = _FqAcc()
+            if not paths:
+                raise ValueError("None of the selected FASTQ files exists any more.")
+
+            if len(paths) > 1 and self._n_bytes >= self._POOL_MIN_BYTES and self._n_procs() > 1:
+                self._run_pool(paths, sizes, acc)
+            else:
+                done = 0
+                for path, size in zip(paths, sizes):
+                    if self._stop:
+                        return
+                    before = acc.snapshot()
+                    if not path.lower().endswith(".gz") and size >= self._PARALLEL_THRESHOLD:
+                        self._run_chunked(path, size, acc, done)
+                    else:
+                        self._run_sequential(path, acc, done)
+                    done += size
+                    self._add_group(path, before, acc.snapshot())
             if self._stop:
                 return
             self._compute_and_emit(acc)
-        except Exception as exc:
+        except ValueError as exc:
             self.error.emit(str(exc))
+        except Exception as exc:
+            import traceback
+            self.error.emit(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
+
+    def _add_group(self, path: str, before: tuple, after: tuple, new_file: bool = True):
+        g = self._group_stats.setdefault(
+            self._groups.get(path, os.path.basename(path)), [0, 0, 0, 0.0, 0, 0])
+        if new_file:
+            g[0] += 1
+        for i, (b, a) in enumerate(zip(before, after), start=1):
+            g[i] += a - b
 
     def _emit_progress(self, acc: _FqAcc, bytes_done: int):
         pct = min(100, int(bytes_done * 100 / self._total_bytes))
         self.progress.emit(len(acc.lengths), pct)
 
     def _run_sequential(self, path: str, acc: _FqAcc, done_before: int):
-        """Read all records of one file in this thread (gzip and small plain FASTQ).
-        Progress is measured on the bytes read from disk — for gzip that is the
-        compressed position, so the percentage is meaningful for .gz too."""
-        import gzip
-        is_gz = path.lower().endswith(".gz")
-        # Binary mode so quality bytes map straight onto the error table.
-        # For gzip, a 4 MB BufferedReader feeds decompression in large chunks.
-        raw = open(path, "rb", buffering=4 * 1024 * 1024)
-        fh = gzip.GzipFile(fileobj=raw) if is_gz else raw
-        try:
-            it = iter(fh)
-            n_local = 0
-            for header in it:
-                if self._stop:
-                    return
-                # Skip malformed / mid-record lines so this path matches the parallel
-                # one (_fq_chunk_task), which also resyncs on non-'@' headers.
-                if not header.startswith(b"@"):
-                    continue
-                try:
-                    seq = next(it).rstrip(b"\r\n")
-                    next(it)                           # '+' line
-                    qual = next(it).rstrip(b"\r\n")
-                except StopIteration:
-                    break
-                if not seq:
-                    continue
-                acc.add(seq, qual)
-                n_local += 1
-                if n_local % 5000 == 0:
-                    self._emit_progress(acc, done_before + raw.tell())
-        finally:
-            fh.close()
-            if is_gz:
-                raw.close()
+        """Read all records of one file in this thread. Progress is measured on
+        the bytes read from disk — for gzip that is the compressed position, so
+        the percentage is meaningful for .gz too."""
+        warning = _read_fastq_file(
+            path, acc,
+            on_record=lambda _n, pos: self._emit_progress(acc, done_before + pos),
+            should_stop=lambda: self._stop)
+        if warning:
+            self._warnings.append(warning)
         self._emit_progress(acc, done_before + os.path.getsize(path))
 
-    def _run_parallel(self, path: str, file_size: int, acc: _FqAcc, done_before: int):
-        """Split an uncompressed FASTQ file into chunks processed in parallel with
-        ProcessPoolExecutor (one Python process per chunk, bypassing the GIL)."""
+    def _run_chunked(self, path: str, file_size: int, acc: _FqAcc, done_before: int):
+        """Split ONE large uncompressed FASTQ into byte ranges processed in
+        parallel (one Python process per chunk, bypassing the GIL)."""
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        n_workers = min(os.cpu_count() or 1, 8)
+        n_workers = min(self._n_procs(), 8)
         chunk = file_size // n_workers
         # Byte ranges — end=0 means "read until EOF"
         boundaries = [(i * chunk, (i + 1) * chunk if i < n_workers - 1 else 0)
@@ -621,8 +703,46 @@ class _FastqInspectorWorker(QtCore.QThread):
                 if self._stop:
                     pool.shutdown(wait=False, cancel_futures=True)
                     return
-                acc.merge(future.result())
+                d = future.result()
+                if d.get("warning"):
+                    self._warnings.append(d["warning"])
+                acc.merge(d)
                 self._emit_progress(acc, done_before + file_size * k // n_workers)
+
+    def _run_pool(self, paths: List[str], sizes: List[int], acc: _FqAcc):
+        """Many files: one task per file (a large plain FASTQ is still split
+        into byte ranges), all sharing one process pool. ONT output is usually
+        hundreds of small .fastq.gz, which a single thread reads one by one."""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        n_workers = self._n_procs()
+        bytes_done = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {}
+            for path, size in zip(paths, sizes):
+                if not path.lower().endswith(".gz") and size >= self._PARALLEL_THRESHOLD:
+                    n_chunks = min(n_workers, 8)
+                    chunk = size // n_chunks
+                    for i in range(n_chunks):
+                        s = i * chunk
+                        e = (i + 1) * chunk if i < n_chunks - 1 else 0
+                        fut = pool.submit(_fq_chunk_task, path, s, e)
+                        futures[fut] = (path, size // n_chunks, i == 0)
+                else:
+                    futures[pool.submit(_fq_file_task, path)] = (path, size, True)
+            for future in as_completed(futures):
+                if self._stop:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return
+                path, share, first = futures[future]
+                d = future.result()
+                if d.get("warning"):
+                    self._warnings.append(d["warning"])
+                acc.merge(d)
+                self._add_group(path, (0, 0, 0, 0.0, 0), _FqAcc.dict_snapshot(d),
+                                new_file=first)
+                bytes_done += share
+                self._emit_progress(acc, bytes_done)
 
     def _compute_and_emit(self, acc: _FqAcc):
         """Compute final statistics and histogram bins, then emit finished.
@@ -663,7 +783,9 @@ class _FastqInspectorWorker(QtCore.QThread):
 
         mean_q = acc.q_sum / n
         mean_gc = acc.gc_sum / n
-        std_gc = math.sqrt(sum((x - mean_gc) ** 2 for x in gc_pcts) / max(n - 1, 1))
+        # Sample std from running sums (no second pass over every read).
+        var_gc = (acc.gc_sq_sum - n * mean_gc * mean_gc) / max(n - 1, 1)
+        std_gc = math.sqrt(max(var_gc, 0.0))
 
         len_p01 = _nth(max(0, int(n * 0.01)))
         len_p99 = _nth(min(n - 1, int(n * 0.99)))
@@ -678,7 +800,13 @@ class _FastqInspectorWorker(QtCore.QThread):
 
         q_bin_min = min(q_scores)
         q_bin_max = max(q_scores)
-        len_bins = _make_bins(lengths, len_p01, len_p99)
+        # Lengths: binned from the length -> count table (a few thousand
+        # distinct lengths) instead of every read.
+        len_bins = [0] * N_BINS
+        len_span = len_p99 - len_p01 if len_p99 > len_p01 else 1.0
+        for k in keys:
+            if len_p01 <= k <= len_p99:
+                len_bins[min(int((k - len_p01) / len_span * N_BINS), N_BINS - 1)] += len_counts[k]
         q_bins = _make_bins(q_scores, q_bin_min, q_bin_max)
         gc_bins = _make_bins(gc_pcts, 0.0, 100.0)
 
@@ -702,7 +830,10 @@ class _FastqInspectorWorker(QtCore.QThread):
                 "bases_q10_pct": gb10 / gb * 100 if gb else 0.0,
             })
 
-        self.finished.emit({
+        self.done.emit({
+            "warnings":   list(getattr(self, "_warnings", [])),
+            "n_files":    getattr(self, "_n_files", len(self._paths)),
+            "n_bytes":    getattr(self, "_n_bytes", 0),
             "groups":     groups,
             "bases_q10_pct": acc.bases_q10 / total_bases * 100 if total_bases else 0.0,
             "bases_q15_pct": acc.bases_q15 / total_bases * 100 if total_bases else 0.0,
@@ -1136,7 +1267,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._worker = None
         if w is None:
             return
-        for sig in (w.progress, w.finished, w.error):
+        for sig in (w.progress, w.done, w.error):
             try:
                 sig.disconnect()
             except (TypeError, RuntimeError):
@@ -1243,7 +1374,7 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
         self._worker = _FastqInspectorWorker(files, getattr(self, "_group_of", {}))
         self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.done.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -1265,7 +1396,19 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._stop_btn.hide()
         self._last_result = r
         n = r["n_reads"]
-        self._status_lbl.setText(f"Done — {n:,} reads analyzed")
+        warnings = r.get("warnings") or []
+        if warnings:
+            # Partial input (truncated .gz, vanished file, unreadable chunk):
+            # the numbers are valid for what was read, but say so clearly.
+            self._status_lbl.setStyleSheet(f"color:{AMBER};")
+            self._status_lbl.setText(
+                f"Done — {n:,} reads analyzed  ·  ⚠ {len(warnings)} file problem(s): "
+                + warnings[0] + ("  (hover for all)" if len(warnings) > 1 else ""))
+            self._status_lbl.setToolTip("\n".join(warnings))
+        else:
+            self._status_lbl.setStyleSheet("")
+            self._status_lbl.setToolTip("")
+            self._status_lbl.setText(f"Done — {n:,} reads analyzed")
 
         def _fmt_bp(v):
             if v >= 1_000_000_000: return f"{v/1_000_000_000:.2f} Gbp"
@@ -1275,8 +1418,9 @@ class FastqInspectorPanel(QtWidgets.QWidget):
 
         self._sc_reads._val.setText(f"{n:,}")
         self._sc_bases._val.setText(_fmt_bp(r["total_bases"]))
-        self._sc_filesize._val.setText(_fmt_size(self._file_size))
-        self._sc_nfiles._val.setText(f"{len(self._files):,}")
+        # What was actually analyzed (files can vanish before the run starts)
+        self._sc_filesize._val.setText(_fmt_size(r.get("n_bytes") or self._file_size))
+        self._sc_nfiles._val.setText(f"{r.get('n_files', len(self._files)):,}")
 
         self._sc_min._val.setText(f"{r['min_len']:,} bp")
         self._sc_max._val.setText(f"{r['max_len']:,} bp")
@@ -1357,7 +1501,9 @@ class FastqInspectorPanel(QtWidgets.QWidget):
         self._stop_btn.hide()
         self._set_analyze_enabled(bool(self._files))
         self._status_lbl.setStyleSheet(f"color:{RED};")
-        self._status_lbl.setText(f"Error: {msg}")
+        self._status_lbl.setText(f"Error: {error_summary(msg)}")
+        if "\n" in msg:
+            show_error_dialog(self, "FASTQ Inspector error", msg)
 
     # ── PDF export ────────────────────────────────────────────────────────
 

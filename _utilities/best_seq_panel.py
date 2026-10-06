@@ -13,6 +13,10 @@ from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
 # Taxonomic columns that describe the expected classification of every query.
 # They must be present in each BLAST table, repeated on every hit row.
 QUERY_TAX_COLUMNS = ("Query_Order", "Query_Family", "Query_Genus", "Query_organism")
+# Taxonomy of each BLAST hit, written by the BLAST panel only when "Fetch
+# organism + taxonomy" is on. Without it every hit would score as a mismatch.
+SUBJECT_TAX_COLUMNS = ("Subject_Order", "Subject_Family", "Subject_Genus",
+                       "Subject_organism")
 
 # Column names accepted as the identifier column of a query-taxonomy reference
 # file. The first one present wins; if none is, the first column is used.
@@ -244,6 +248,25 @@ def display_taxon(value) -> str:
     return text
 
 
+# Open-nomenclature qualifiers: dropped before comparing species names, so
+# "Palicourea cf. guianensis" is compared as "palicourea guianensis".
+_SPECIES_QUALIFIERS = frozenset({"cf.", "cf", "aff.", "aff", "nr.", "nr", "near"})
+# Epithets that do not name a species: "sp.", "spp.", "sp1", "sp.2", ...
+_NOT_AN_EPITHET = re.compile(r"^spp?\.?\d*$")
+
+
+def species_key(name: str) -> str:
+    """'genus epithet' (lower case) of a species name, or "" when the name does
+    not identify a species: a bare genus, "Genus sp.", "Genus sp. ABC123",
+    "Genus spp.". Qualifiers (cf./aff./nr.) are skipped; authors and anything
+    after the epithet are ignored."""
+    words = [w for w in str(name or "").lower().split()
+             if w not in _SPECIES_QUALIFIERS]
+    if len(words) < 2 or _NOT_AN_EPITHET.match(words[1]):
+        return ""
+    return f"{words[0]} {words[1]}"
+
+
 def concordance_level(hit: dict, qtax: dict) -> str:
     """Deepest rank shared by the expected query taxonomy and the subject.
 
@@ -257,12 +280,12 @@ def concordance_level(hit: dict, qtax: dict) -> str:
         b = hit.get(rank, "").lower()
         return bool(a) and a == b
 
-    q_sp = qtax.get("organism", "").lower()
-    s_sp = hit.get("organism", "").lower()
-    if q_sp and s_sp:
-        # species names may carry authors or suffixes: compare the first two words
-        if " ".join(q_sp.split()[:2]) == " ".join(s_sp.split()[:2]):
-            return "organism"
+    # Species level only when BOTH sides name an actual species: two different
+    # "Genus sp." / "Genus cf. x" records, or a bare genus, are not a species
+    # match (they fall through to the genus comparison below).
+    q_sp = species_key(qtax.get("organism", ""))
+    if q_sp and q_sp == species_key(hit.get("organism", "")):
+        return "organism"
     if same("genus"):
         return "genus"
     if same("family"):
@@ -491,6 +514,10 @@ class _PairDropZone(QtWidgets.QFrame):
         cols = set(self._columns(path))
         return [c for c in QUERY_TAX_COLUMNS if c not in cols]
 
+    def _missing_subject_columns(self, path: str) -> List[str]:
+        cols = set(self._columns(path))
+        return [c for c in SUBJECT_TAX_COLUMNS if c not in cols]
+
     def set_reference_mode(self, enabled: bool):
         """Accept tables without the Query_* columns (a reference file fills them)."""
         if enabled != self._ref_mode:
@@ -526,6 +553,12 @@ class _PairDropZone(QtWidgets.QFrame):
         pairs = self.pairs()
         if not pairs:
             return False, "Add at least one FASTA with its BLAST table."
+        no_hit_tax = [os.path.basename(p["blast"]) for p in pairs
+                      if self._missing_subject_columns(p["blast"])]
+        if no_hit_tax:
+            return False, ("No hit taxonomy (Subject_* columns) in: "
+                           + ", ".join(no_hit_tax[:3]) + ("…" if len(no_hit_tax) > 3 else "")
+                           + " — re-run BLAST with 'Fetch organism + taxonomy' on.")
         bad = [os.path.basename(p["blast"]) for p in pairs
                if self._missing_tax_columns(p["blast"])]
         if bad and not self._ref_mode:
@@ -1396,7 +1429,8 @@ class BestSeqPanel(QtWidgets.QWidget):
 
     def on_error(self, msg: str):
         self.set_running(False)
-        self.update_status("result", f"ERROR       │ {msg[:80]}")
+        self.update_status("result", f"ERROR       │ {error_summary(msg)}")
+        show_error_dialog(self, "Best Sequence error", msg)
         ok, _msg = self._drop.is_valid()
         self._run_btn.setEnabled(ok)
         self._set_run_style(ok)
@@ -1466,11 +1500,23 @@ class _BestSeqWorker(QtCore.QThread):
         "P_identity", "Alignment_length", "Bit_score", "Score", "Runner_up_score",
     })
 
+    _PROGRESS_UNITS = 1000   # loading = first half, selection = second half
+
     def __init__(self, pairs: List[dict], cfg: dict, parent=None):
         super().__init__(parent)
         self.pairs = list(pairs)
         self.cfg   = dict(cfg)
         self._stop = False
+        self._last_pct = -1
+
+    def _emit_progress(self, fraction: float):
+        """progressUpdated on a fixed scale, only when the integer % changes:
+        every emit rebuilds the whole log widget in the GUI thread."""
+        units = int(self._PROGRESS_UNITS * max(0.0, min(1.0, fraction)))
+        pct = units * 100 // self._PROGRESS_UNITS
+        if pct != self._last_pct:
+            self._last_pct = pct
+            self.progressUpdated.emit(units, self._PROGRESS_UNITS)
 
     def stop(self):
         self._stop = True
@@ -1479,10 +1525,23 @@ class _BestSeqWorker(QtCore.QThread):
 
     @staticmethod
     def _read_fasta(path):
-        """Return an ordered {header: sequence} dict (headers kept verbatim)."""
+        """Return (ordered {header: sequence} dict, duplicated headers).
+
+        Headers are kept verbatim and are the key the BLAST table is matched
+        on, so a repeated header cannot be told apart: the FIRST record wins
+        and the repeats are returned so the caller can report them instead of
+        one silently overwriting the other."""
         seqs = {}
+        dups: List[str] = []
         header = None
         chunks = []
+
+        def _keep():
+            if header in seqs:
+                dups.append(header)
+            else:
+                seqs[header] = "".join(chunks)
+
         opener = __import__("gzip").open if path.endswith(".gz") else open
         with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -1491,14 +1550,14 @@ class _BestSeqWorker(QtCore.QThread):
                     continue
                 if line.startswith(">"):
                     if header is not None:
-                        seqs[header] = "".join(chunks)
+                        _keep()
                     header = line[1:]
                     chunks = []
                 else:
                     chunks.append(line)
         if header is not None:
-            seqs[header] = "".join(chunks)
-        return seqs
+            _keep()
+        return seqs, dups
 
     def _parse_header(self, header: str) -> dict:
         """DNS-1343_all.fa;758;807;ambs=0;estgaps=0 -> sample id + metrics.
@@ -1542,10 +1601,10 @@ class _BestSeqWorker(QtCore.QThread):
 
     @staticmethod
     def _to_float(value) -> float:
-        try:
-            return float(str(value).strip())
-        except (TypeError, ValueError):
-            return 0.0
+        # Tables edited in Excel can hold numbers as text ("99.5%", "99,5");
+        # reading those as 0 would silently drop the hit (alignment filter).
+        v = parse_number(value)
+        return 0.0 if v is None else v
 
     # ── Query taxonomy taken from a reference file ────────────────────────
 
@@ -1584,6 +1643,12 @@ class _BestSeqWorker(QtCore.QThread):
         if "Query_name" not in idx:
             raise ValueError(
                 f"{os.path.basename(path)} has no 'Query_name' column."
+            )
+        missing = [c for c in SUBJECT_TAX_COLUMNS if c not in idx]
+        if missing:
+            raise ValueError(
+                f"{os.path.basename(path)} has no hit taxonomy ({', '.join(missing)}): "
+                f"re-run BLAST with 'Fetch organism + taxonomy' on."
             )
 
         def get(row, name, default=None):
@@ -1877,6 +1942,7 @@ class _BestSeqWorker(QtCore.QThread):
 
         # ── Load every FASTA + BLAST pair ──
         candidates: Dict[str, List[dict]] = {}
+        dup_lines: List[str] = []   # run-log lines for FASTAs with repeated headers
         file_labels: List[str] = []
         total_seqs = 0
         for i, pair in enumerate(self.pairs):
@@ -1887,7 +1953,15 @@ class _BestSeqWorker(QtCore.QThread):
             self.statusUpdated.emit(
                 "files", f"Loading     │ [{i + 1}/{n_files}] {os.path.basename(pair['fasta'])}"
             )
-            seqs = self._read_fasta(pair["fasta"])
+            seqs, dups = self._read_fasta(pair["fasta"])
+            if dups:
+                dup_lines.append(
+                    f"    {os.path.basename(pair['fasta'])}: {len(dups)} repeated "
+                    f"header(s), first record kept — e.g. {dups[0]}")
+                self.statusUpdated.emit(
+                    "files",
+                    f"Warning     │ {os.path.basename(pair['fasta'])}: {len(dups)} "
+                    f"repeated header(s) ignored (first record kept)")
             blast, query_tax, raw_counts = self._load_blast(pair["blast"])
             total_seqs += len(seqs)
             for header, seq in seqs.items():
@@ -1909,7 +1983,7 @@ class _BestSeqWorker(QtCore.QThread):
                     "n_hits": len(hits), "n_hits_raw": raw_counts.get(qkey, 0),
                     "qtax": qtax, "best_hit": best_hit, "level": level,
                 })
-            self.progressUpdated.emit(i + 1, n_files + max(len(candidates), 1))
+            self._emit_progress(0.5 * (i + 1) / n_files)
 
         if self._stop:
             self.statusUpdated.emit("result", "Stopped     │ selection cancelled")
@@ -2061,6 +2135,7 @@ class _BestSeqWorker(QtCore.QThread):
                     fh_noid.write(record)
                     n_written["no_tax"] += 1
 
+                self._emit_progress(0.5 + 0.5 * done / n_samples)
                 if done % 25 == 0 or done == n_samples:
                     self.statusUpdated.emit(
                         "select",
@@ -2069,7 +2144,6 @@ class _BestSeqWorker(QtCore.QThread):
                         f"Selecting   │ {done}/{n_samples} samples · "
                         f"{n_identical} identical · {n_selected} decided by BLAST"
                     )
-                    self.progressUpdated.emit(n_files + done, n_files + n_samples)
         finally:
             for fh in (fh_tsv, fh_all, fh_id, fh_noid):
                 try:
@@ -2129,6 +2203,8 @@ class _BestSeqWorker(QtCore.QThread):
             f"  Query taxonomy reference : "
             f"{os.path.basename(ref_path) if ref_path else '(none - read from the tables)'}",
             *ref_lines,
+            *(["", "  Repeated FASTA headers (only the first record of each was used):"]
+              + dup_lines if dup_lines else []),
             "",
             "Scoring:",
             "  score = taxonomic bonus of the best concordant hit",

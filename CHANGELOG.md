@@ -15,7 +15,7 @@ repository):
 
 ---
 
-## [Unreleased]
+## [3.5b] — 2026-10
 
 ### Added
 - FASTA Tools: new **FASTA stats** operation (now the panel default). Writes
@@ -25,15 +25,38 @@ repository):
   Optional stop-codon check (Standard, Vertebrate / Invertebrate mitochondrial,
   Plant plastid) over all 6 frames, reporting best frame, stop count and
   positions.
-- `_utilities/compare_runs_report.py`: standalone per-sample comparison of two
-  run folders (or two runs of a Parameter Batch): QC-compliant / filtered
-  barcodes gained, lost or changed, and secondary variants newly flagged;
-  writes a TSV.
-- `_utilities/batch_coverage_report.py`: standalone CLI that cross-checks a
-  completed Parameter Batch against a Best Sequence Selection run to work out
-  exactly which combinations were needed to recover the taxonomically-
-  identified sequences (per-combination coverage + greedy minimal run set +
-  Excel report). Documented in the manual (§17.6).
+- `_utilities/compare_runs_report.py`: per-sample comparison of two run
+  folders (or two runs of a Parameter Batch): QC-compliant / filtered barcodes
+  gained, lost or changed, and secondary variants newly flagged; writes a TSV.
+  Also available in the Parameter Batch panel as **Compare two runs** (manual
+  §17.7).
+- `_utilities/batch_coverage_report.py`: cross-checks a completed Parameter
+  Batch against a Best Sequence Selection run to work out exactly which
+  combinations were needed to recover the taxonomically-identified sequences
+  (per-combination coverage + greedy minimal run set + Excel report). Also
+  writes `minimal_run_set.cfg`, the minimal set as a `# combos` config, and is
+  available in the Parameter Batch panel as **Coverage report**, which offers
+  to load that config right away (manual §17.6).
+- Parameter Batch: **resumable batches**. Each batch folder keeps
+  `batch_config.cfg`, `batch_state.json` (dataset + base parameters) and
+  `batch_progress.tsv` (one line per completed combination, written as it
+  completes, so it survives a crash or power cut). **Resume batch…** runs only
+  the combinations not yet completed, with the saved config and parameters,
+  and merges old and new runs together (manual §17.5b).
+- Parameter Batch: **Stop now** aborts the running combination immediately
+  (Stop still lets it finish); the overall progress bar shows elapsed time and
+  an ETA; the log sits under a resizable divider with the progress bars
+  pinned above it.
+- FASTA Tools: **Match ID by** for *Append info* and the new **Match whole ID**
+  mode of *Extract by pattern*: the ID is the header up to the first space
+  (default, unchanged behaviour) or the text before a chosen separator, minus
+  an optional suffix (e.g. ONTbarcoder's `DNS-1_all.fa;758;…` → `DNS-1`), with
+  a live preview of the ID and of how many sequences match. Whole-ID matching
+  is switched on automatically for pattern files, so `DNS-1` no longer also
+  selects `DNS-10`, `DNS-11`….
+- BOLD Formatter: hit rows without a Query ID are reported before formatting,
+  with the choice to rename each block (`No_query_ID_01`, …) or remove them,
+  instead of being pooled into one fake query.
 - Parameter Batch `.cfg`: an explicit combination list, as an alternative to
   the grid (Cartesian product) shape. A file whose first non-blank line is
   `# combos` is parsed as one full combination per line
@@ -50,6 +73,33 @@ repository):
   **"Create example cfg (grid)"**) one. Documented in the manual (§17.1b).
 
 ### Changed
+- BLAST: polling follows NCBI's URL API guidelines — each search's status is
+  checked once per minute (backing off to 2 min), any two Blast.cgi requests
+  are ≥ 10 s apart, `tool=` is sent to BLAST too, and only the status
+  (`FORMAT_OBJECT=SearchInfo`) is downloaded while waiting instead of the full
+  result page. A short batch now takes at least ~1 min.
+- BLAST: only organisms whose taxonomy lookup failed for network reasons are
+  retried; organisms NCBI confirmed have no lineage are no longer re-requested
+  twice per batch. The `.dbx` caches are preloaded from sibling folders only,
+  not by walking the whole parent folder (which could be all of `output/`, or
+  a whole drive for a hand-picked folder).
+- FASTQ Inspector: several files are read in parallel across processes (ONT
+  `fastq_pass/` folders hold hundreds of small `.fastq.gz`, previously read in
+  one thread); 4.5x faster on a 120-file test with identical statistics.
+  Length histogram and GC std are computed without a second pass over all
+  reads.
+- Compare: each distinct pair of sequences is aligned once per ID (identical
+  sequences are not aligned at all) — same results, ~12x faster all-vs-all on
+  40 runs; the results-window legend wraps into a grid for many runs.
+- Best Sequence / BOLD Formatter: numbers stored as text (`99.5%`, `99,5`)
+  are read as numbers (`parse_number` in `shared.py`).
+- Load / save dialogs for batch `.cfg` files open in `_profiles/`; the example
+  templates are saved as `my_batch*.cfg` by default so the shipped ones are
+  never overwritten.
+- Worker errors in BLAST, Best Sequence, Compare, FASTA Tools, FASTQ
+  Inspector and BOLD Formatter show a one-line summary plus the full text
+  (traceback) under *Show Details…*, instead of a message cut at 80
+  characters.
 - Intra-sample variants: "several variants pass QC" now sets *needs review*
   only when a QC-passing secondary diverges >= `multi_qc_review_div` (1 %)
   from the dominant. Near-identical conspecific copies are still reported but
@@ -72,6 +122,50 @@ repository):
   written per sample and coverage level but never read by anything.
 
 ### Fixed
+- Compare: the comparison never started since 3.4b — a slot decorator had
+  ended up on the wrong method (`writeErrors` could not be connected), leaving
+  the panel spinning. A failing comparison worker now restores the panel and
+  shows the error; an output folder chosen with *Change…* is used; an
+  unreadable file is reported instead of passing for an empty one; IDs merged
+  by an over-broad extraction pattern are counted and reported.
+- Taxonomic concordance (Best Sequence, BLAST `Tax_level_match`, BOLD
+  Formatter): species level now requires a real epithet on both sides, with
+  `cf.` / `aff.` / `nr.` ignored. Before, the first two words were compared,
+  so `Genus cf. a` vs `Genus cf. b`, `Genus sp.` vs `Genus sp. X` or a bare
+  genus scored as a species match (the highest bonus).
+- Best Sequence: BLAST tables without hit taxonomy (`Subject_*` columns, i.e.
+  BLAST run without taxonomy lookup) are rejected with an explanation instead
+  of scoring every hit as a mismatch; repeated FASTA headers are reported
+  (first kept) instead of silently overwritten; progress no longer runs
+  backwards; restarting during a run no longer destroys a running thread.
+- Parameter Batch: a combination cut off mid-run is left out of the summary
+  and merge (it inflated `N_runs_total`); the end message says *Batch
+  stopped — N/M completed* when it did not finish; the `.cfg` is re-read on
+  Start and a changed combination count is confirmed; progress bars are no
+  longer hidden by the log.
+- `compare_runs_report.py`: secondary variants written only as
+  `type=corrected` (too many Ns for the raw export) were not counted;
+  a malformed `div=` no longer aborts the report.
+- `batch_coverage_report.py`: winners that are secondary variants are matched
+  against each run's `secondary_variants.fa` (whatever their `_var` number);
+  taxonomy is joined by header, so it is not blank when Best Sequence removed
+  a suffix; tolerant FASTA reading (CRLF, non-UTF-8 bytes).
+- FASTQ Inspector: a truncated / damaged `.fastq.gz` (e.g. still being
+  written by MinKNOW) no longer aborts the whole analysis — the reads before
+  the damage are used and the file is named in an amber status line; a failed
+  parallel chunk and files that vanished before the run are reported too.
+- FASTA Tools: a missing or empty pattern file gets its own message; `.xls`
+  is no longer offered for *Append info* (it could not be read); the Excel is
+  opened read-only; Excel row-limit truncation is reported.
+- BOLD Formatter: the header row is located among the first five rows;
+  `ID%` / `Indels` stored as text are converted, so they sort correctly.
+- Stopping BLAST no longer `terminate()`s its thread (each socket call is
+  capped at 30 s and a busy worker is left to unwind); closing the app stops
+  every utility worker (BLAST, BLAST web results, Compare, Best Sequence,
+  FASTA Tools, FASTQ Inspector, BOLD Formatter) and never destroys one that
+  is still running.
+- Worker signals named `finished` (FASTA Tools, FASTQ Inspector, BOLD
+  Formatter) shadowed `QThread.finished`; renamed `done`.
 - non-Coding markers: a consensus is accepted by absence of Ns alone (the
   rule the GUI already applied). The worker still required length == expected
   length, which disabled the consensus-frequency sweep rescue (0.3–0.5) for
