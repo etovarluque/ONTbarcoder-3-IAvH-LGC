@@ -21,6 +21,10 @@ original.
 | ![Conventional mode](guide/images/mode-conventional.png) | ![Real-time mode](guide/images/mode-realtime.png) |
 | Single completed FASTQ file | FASTQ files generated live during sequencing |
 
+**Light and dark themes** (toggle in the top bar), with the sidebar split into *Workflow* and *Utilities* tabs:
+
+![Dark theme](guide/images/theme-dark.png)
+
 ## Releases (ready-to-run executables)
 
 Prebuilt bundles are published on the **[Releases](../../releases)** page — no
