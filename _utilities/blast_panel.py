@@ -14,7 +14,7 @@ from .best_seq_panel import (
     _RefDropZone, read_tax_reference, QUERY_TAX_COLUMNS,
     sample_id_of, lookup_tax, concordance_level, display_taxon,
     read_tax_reference_cached, reference_match_check, fasta_headers,
-    table_column, _cached,
+    table_column, _cached, reference_format_warning, reference_report_lines,
 )
 
 
@@ -960,6 +960,9 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
                 msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
             if n_match >= 0:
                 msg += f"  Tax_level_match updated on {n_match} row(s)."
+            _fmt = reference_format_warning(ref_table)
+            if _fmt:
+                msg += "  ⚠ " + _fmt
 
             # Regenerate the matching .xlsx from the just-updated table, overwriting
             # whichever one (if any) sits next to it — otherwise it would keep
@@ -3108,6 +3111,81 @@ class _BlastWorker(QtCore.QThread):
         self._saved_tax_keys = set(self._taxadb.keys())
         self._saved_acc_keys = set(self._accdb.keys())
 
+    _TAX_NOT_FOUND = "Not_found_in_Taxonomy"
+    _N_TAX_FIELDS = 5    # Subject_Kingdom … Subject_Genus
+
+    def _tax_fields(self, org: str) -> str:
+        """The 5 tab-separated taxonomy fields of a hit row. An unresolved
+        lineage keeps the 5 columns (marker in Subject_Kingdom, '-' in the
+        rest), so Subject_organism never slides into the wrong column."""
+        tax = self._taxadb.get(org, self._TAX_NOT_FOUND) if org else self._TAX_NOT_FOUND
+        if tax == self._TAX_NOT_FOUND:
+            return "\t".join([self._TAX_NOT_FOUND] + ["-"] * (self._N_TAX_FIELDS - 1))
+        return tax
+
+    def _repair_taxonomy_rows(self, tsv_path: str) -> Tuple[int, int]:
+        """Final pass over the table: every hit has an accession, and every
+        accession has an organism and a lineage in NCBI, so a row without them
+        is a failed lookup, not an answer. Re-fetch the organism of those
+        accessions and the lineage of those organisms (including negatives
+        cached earlier) and rewrite the rows that now resolve.
+        Returns (rows repaired, rows still unresolved)."""
+        n_blast = 13   # Hit_rank + 12 BLAST columns
+        try:
+            with open(tsv_path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return 0, 0
+        if len(lines) < 2:
+            return 0, 0
+
+        def _bad(fields):
+            return (len(fields) != n_blast + self._N_TAX_FIELDS + 1
+                    or not fields[-1].strip()
+                    or fields[n_blast] == self._TAX_NOT_FOUND)
+
+        rows = [l.split("\t") for l in lines[1:]]
+        bad = [i for i, f in enumerate(rows) if len(f) > 2 and _bad(f)]
+        if not bad:
+            return 0, 0
+        self.statusUpdated.emit(
+            "taxonomy", f"Taxonomy    │ Final check: {len(bad)} hit row(s) without "
+                        f"organism / lineage, fetching them again…")
+        accs = list(dict.fromkeys(rows[i][2] for i in bad if rows[i][2]))
+        with self._cache_lock:
+            for a in accs:
+                if not self._accdb.get(a):
+                    self._accdb.pop(a, None)
+        self._fetch_organisms_batch(accs)
+        orgs = list(dict.fromkeys(self._accdb.get(a, "") for a in accs if self._accdb.get(a)))
+        with self._cache_lock:
+            for o in orgs:
+                if self._taxadb.get(o) == self._TAX_NOT_FOUND:
+                    self._taxadb.pop(o, None)
+        if orgs and not self._stop:
+            self._fetch_taxonomy_batch(orgs)
+            self._retry_unresolved_taxonomy(orgs, "[final check] ")
+        n_fixed = n_still = 0
+        for i in bad:
+            f = rows[i]
+            org = self._accdb.get(f[2], "")
+            new = f[:n_blast] + self._tax_fields(org).split("\t") + [org]
+            if org and new[n_blast] != self._TAX_NOT_FOUND:
+                n_fixed += 1
+            else:
+                n_still += 1
+            rows[i] = new
+        tmp = tsv_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(lines[0] + "\n")
+                for f in rows:
+                    fh.write("\t".join(f) + "\n")
+            os.replace(tmp, tsv_path)
+        except OSError:
+            return 0, len(bad)
+        return n_fixed, n_still
+
     def _retry_unresolved_taxonomy(self, unique_orgs: List[str], prefix: str = ""):
         """Re-fetch only what failed TRANSIENTLY (network/stop) — never an
         organism NCBI already confirmed has no lineage, which re-asking cannot
@@ -3461,145 +3539,187 @@ class _BlastWorker(QtCore.QThread):
         elif ctx.get("changes"):
             self.statusUpdated.emit("blast", "BLAST       │ From now on: " + self._changes_text(ctx["changes"]))
 
-        total_expected = n_batches * self._BATCH_UNITS
-
-        for batch_idx, batch_pairs in enumerate(batch_pairs_list):
-            if self._stop:
-                break
-
-            batch_seq   = len(batch_pairs)
-            batch_label = f"Batch {batch_idx+1}/{n_batches}"
-            batch_base  = batch_idx * self._BATCH_UNITS
-
-            # ── BLAST (auto-retries as smaller sub-batches if NCBI rejects it) ──
-            self.statusUpdated.emit(
-                "blast",
-                f"BLAST       │ [{batch_label}] Submitting {batch_seq} sequences…"
-            )
-            blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
-            if self._stop:
-                break
-            self._emit_progress(batch_base + 400, total_expected)
-            if not used_pairs:
-                continue  # every split down to the floor was rejected; already logged
-
-            self.statusUpdated.emit(
-                "blast",
-                f"BLAST       │ [{batch_label}] {len(blast_rows)} hits retrieved  ✓"
-            )
-
-            if fetch_tax:
-                # ── Fetch organisms (batch: one POST for all accessions) ──
-                accessions = [
-                    (row.split("\t")[1] if "\t" in row else "") for row in blast_rows
-                ]
-                unique_accs   = list(dict.fromkeys(a for a in accessions if a))
-                n_unique_accs = len(unique_accs)
-                self.statusUpdated.emit(
-                    "organism",
-                    f"Organism ID │ [{batch_label}] Fetching {n_unique_accs} accessions…"
-                )
-                self._fetch_organisms_batch(unique_accs)
-                if self._stop:
-                    break
-                n_org_found = sum(1 for a in unique_accs if a in self._accdb)
-                self.statusUpdated.emit(
-                    "organism",
-                    f"Organism ID │ [{batch_label}] {n_org_found}/{n_unique_accs} resolved  ✓"
-                )
-                self._emit_progress(batch_base + 600, total_expected)
-
-                organisms: List[str] = [
-                    (self._accdb.get(acc, "") if acc else "") for acc in accessions
-                ]
-
-                # ── Fetch taxonomy (batch: one POST per 500 taxids) ───────
-                unique_orgs   = list(dict.fromkeys(o for o in organisms if o))
-                n_unique_orgs = len(unique_orgs)
-                self.statusUpdated.emit(
-                    "taxonomy",
-                    f"Taxonomy    │ [{batch_label}] Fetching {n_unique_orgs} organisms…"
-                )
-                self._fetch_taxonomy_batch(unique_orgs)
+        def _run_batches(plist, tag):
+            """Search a list of batches and append their hits to the table."""
+            nonlocal total_hits_done
+            n_batches = len(plist)
+            total_expected = n_batches * self._BATCH_UNITS
+            for batch_idx, batch_pairs in enumerate(plist):
                 if self._stop:
                     break
 
-                # ── Retry organisms whose lookup failed transiently ───────
-                self._retry_unresolved_taxonomy(unique_orgs, f"[{batch_label}] ")
+                batch_seq   = len(batch_pairs)
+                batch_label = f"{tag}{batch_idx+1}/{n_batches}"
+                batch_base  = batch_idx * self._BATCH_UNITS
 
-                n_tax_found = sum(
-                    1 for o in unique_orgs
-                    if self._taxadb.get(o, "Not_found_in_Taxonomy") != "Not_found_in_Taxonomy"
-                )
+                # ── BLAST (auto-retries as smaller sub-batches if NCBI rejects it) ──
                 self.statusUpdated.emit(
-                    "taxonomy",
-                    f"Taxonomy    │ [{batch_label}] {n_tax_found}/{n_unique_orgs} resolved  ✓"
+                    "blast",
+                    f"BLAST       │ [{batch_label}] Submitting {batch_seq} sequences…"
                 )
-                self._emit_progress(batch_base + 800, total_expected)
+                blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
+                if self._stop:
+                    break
+                self._emit_progress(batch_base + 400, total_expected)
+                if not used_pairs:
+                    continue  # every split down to the floor was rejected; already logged
 
-                taxonomies: List[str] = [
-                    (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
-                    for o in organisms
-                ]
+                self.statusUpdated.emit(
+                    "blast",
+                    f"BLAST       │ [{batch_label}] {len(blast_rows)} hits retrieved  ✓"
+                )
 
-                batch_rows_out = self._rank_rows([
-                    f"{row}\t{tax}\t{org}"
-                    for row, tax, org in zip(blast_rows, taxonomies, organisms)
-                ])
+                if fetch_tax:
+                    # ── Fetch organisms (batch: one POST for all accessions) ──
+                    accessions = [
+                        (row.split("\t")[1] if "\t" in row else "") for row in blast_rows
+                    ]
+                    unique_accs   = list(dict.fromkeys(a for a in accessions if a))
+                    n_unique_accs = len(unique_accs)
+                    self.statusUpdated.emit(
+                        "organism",
+                        f"Organism ID │ [{batch_label}] Fetching {n_unique_accs} accessions…"
+                    )
+                    self._fetch_organisms_batch(unique_accs)
+                    if self._stop:
+                        break
+                    n_org_found = sum(1 for a in unique_accs if a in self._accdb)
+                    self.statusUpdated.emit(
+                        "organism",
+                        f"Organism ID │ [{batch_label}] {n_org_found}/{n_unique_accs} resolved  ✓"
+                    )
+                    self._emit_progress(batch_base + 600, total_expected)
 
-                # ── Persist only new entries after every batch ──
-                # Exclude _tax_unconfirmed: negatives from a failed efetch are kept
-                # in memory for the in-run retry but must not poison taxadb.dbx.
+                    organisms: List[str] = [
+                        (self._accdb.get(acc, "") if acc else "") for acc in accessions
+                    ]
+
+                    # ── Fetch taxonomy (batch: one POST per 500 taxids) ───────
+                    unique_orgs   = list(dict.fromkeys(o for o in organisms if o))
+                    n_unique_orgs = len(unique_orgs)
+                    self.statusUpdated.emit(
+                        "taxonomy",
+                        f"Taxonomy    │ [{batch_label}] Fetching {n_unique_orgs} organisms…"
+                    )
+                    self._fetch_taxonomy_batch(unique_orgs)
+                    if self._stop:
+                        break
+
+                    # ── Retry organisms whose lookup failed transiently ───────
+                    self._retry_unresolved_taxonomy(unique_orgs, f"[{batch_label}] ")
+
+                    n_tax_found = sum(
+                        1 for o in unique_orgs
+                        if self._taxadb.get(o, "Not_found_in_Taxonomy") != "Not_found_in_Taxonomy"
+                    )
+                    self.statusUpdated.emit(
+                        "taxonomy",
+                        f"Taxonomy    │ [{batch_label}] {n_tax_found}/{n_unique_orgs} resolved  ✓"
+                    )
+                    self._emit_progress(batch_base + 800, total_expected)
+
+                    taxonomies: List[str] = [self._tax_fields(o) for o in organisms]
+
+                    batch_rows_out = self._rank_rows([
+                        f"{row}\t{tax}\t{org}"
+                        for row, tax, org in zip(blast_rows, taxonomies, organisms)
+                    ])
+
+                    # ── Persist only new entries after every batch ──
+                    # Exclude _tax_unconfirmed: negatives from a failed efetch are kept
+                    # in memory for the in-run retry but must not poison taxadb.dbx.
+                    with self._cache_lock:
+                        new_tax = {k: self._taxadb[k] for k in self._taxadb
+                                   if k not in self._saved_tax_keys
+                                   and k not in self._tax_unconfirmed}
+                        new_acc = {k: self._accdb[k]  for k in self._accdb  if k not in self._saved_acc_keys}
+                        self._append_cache(new_tax, taxadb_path)
+                        self._append_cache(new_acc,  accdb_path)
+                        self._saved_tax_keys.update(new_tax.keys())
+                        self._saved_acc_keys.update(new_acc.keys())
+
+                else:
+                    batch_rows_out = self._rank_rows(blast_rows)
+
+                # ── Append batch rows to disk immediately ──
+                row_phase_start = 800 if fetch_tax else 400
+                row_phase_range = 200 if fetch_tax else 600
+                n_batch_rows = max(len(batch_rows_out), 1)
+                _batch_written = False
+                for _attempt in range(20):   # retry up to 10 s if TSV is open in Excel
+                    try:
+                        with open(tsv_path, "a", encoding="utf-8") as tsv_fh:
+                            for row_idx, r in enumerate(batch_rows_out, 1):
+                                tsv_fh.write(r + "\n")
+                                self._emit_progress(
+                                    batch_base + row_phase_start + int(row_phase_range * row_idx / n_batch_rows),
+                                    total_expected
+                                )
+                        _batch_written = True
+                        break  # write succeeded
+                    except PermissionError:
+                        self.statusUpdated.emit(
+                            "result",
+                            f"⚠ TSV file is open — close it and the run will resume… ({_attempt + 1}/20)"
+                        )
+                        self._interruptible_sleep(0.5)
+
+                # Solo marcar como procesadas las secuencias cuyas filas llegaron al disco;
+                # de lo contrario deben aparecer en el FASTA de "missing". used_pairs es
+                # el subconjunto de batch_pairs que NCBI realmente respondio (puede ser
+                # parcial si _submit_batch_with_retry tuvo que dividir el lote).
+                if _batch_written:
+                    total_hits_done += len(batch_rows_out)
+                    self._processed.update(h[1:] for h, _s in used_pairs)
+                    # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
+                    # which is the FASTA header of the query without the leading '>'.
+                    for _r in batch_rows_out:
+                        _fields = _r.split("\t")
+                        if len(_fields) > 1:
+                            hit_queries.add(_fields[1])
+                    self._save_state()
+
+        _run_batches(batch_pairs_list, "Batch ")
+
+        # ── Final retry pass ──
+        # A sequence with no hit, or whose batch failed, is searched once more
+        # in a batch of its own at the end: an empty answer from NCBI can be
+        # transient (overload, a job dropped server-side), and every sequence
+        # of a barcode marker is expected to hit something in core_nt.
+        n_retried = n_rescued = 0
+        if not self._stop:
+            retry_pairs = [p for p in all_pairs if p[0][1:] not in hit_queries]
+            if retry_pairs:
+                n_retried = len(retry_pairs)
+                had = set(hit_queries)
+                self.statusUpdated.emit(
+                    "blast", f"BLAST       │ Final retry: searching again {n_retried} "
+                             f"sequence(s) without hits or from failed batches…")
+                _run_batches(self._plan_batches(retry_pairs, nseq), "Retry ")
+                n_rescued = len(set(hit_queries) - had)
+                self.statusUpdated.emit(
+                    "blast", f"BLAST       │ Final retry: {n_rescued}/{n_retried} "
+                             f"now with hits  ✓")
+
+        # ── Final taxonomy check: rows without organism / lineage ──
+        n_tax_fixed = n_tax_still = 0
+        if fetch_tax and not self._stop and total_hits_done > 0:
+            n_tax_fixed, n_tax_still = self._repair_taxonomy_rows(tsv_path)
+            if n_tax_fixed or n_tax_still:
+                self.statusUpdated.emit(
+                    "taxonomy", f"Taxonomy    │ Final check: {n_tax_fixed} row(s) repaired"
+                                + (f", {n_tax_still} still unresolved" if n_tax_still else "")
+                                + "  ✓")
                 with self._cache_lock:
                     new_tax = {k: self._taxadb[k] for k in self._taxadb
                                if k not in self._saved_tax_keys
                                and k not in self._tax_unconfirmed}
-                    new_acc = {k: self._accdb[k]  for k in self._accdb  if k not in self._saved_acc_keys}
+                    new_acc = {k: self._accdb[k] for k in self._accdb
+                               if k not in self._saved_acc_keys and self._accdb[k]}
                     self._append_cache(new_tax, taxadb_path)
-                    self._append_cache(new_acc,  accdb_path)
+                    self._append_cache(new_acc, accdb_path)
                     self._saved_tax_keys.update(new_tax.keys())
                     self._saved_acc_keys.update(new_acc.keys())
-
-            else:
-                batch_rows_out = self._rank_rows(blast_rows)
-
-            # ── Append batch rows to disk immediately ──
-            row_phase_start = 800 if fetch_tax else 400
-            row_phase_range = 200 if fetch_tax else 600
-            n_batch_rows = max(len(batch_rows_out), 1)
-            _batch_written = False
-            for _attempt in range(20):   # retry up to 10 s if TSV is open in Excel
-                try:
-                    with open(tsv_path, "a", encoding="utf-8") as tsv_fh:
-                        for row_idx, r in enumerate(batch_rows_out, 1):
-                            tsv_fh.write(r + "\n")
-                            self._emit_progress(
-                                batch_base + row_phase_start + int(row_phase_range * row_idx / n_batch_rows),
-                                total_expected
-                            )
-                    _batch_written = True
-                    break  # write succeeded
-                except PermissionError:
-                    self.statusUpdated.emit(
-                        "result",
-                        f"⚠ TSV file is open — close it and the run will resume… ({_attempt + 1}/20)"
-                    )
-                    self._interruptible_sleep(0.5)
-
-            # Solo marcar como procesadas las secuencias cuyas filas llegaron al disco;
-            # de lo contrario deben aparecer en el FASTA de "missing". used_pairs es
-            # el subconjunto de batch_pairs que NCBI realmente respondio (puede ser
-            # parcial si _submit_batch_with_retry tuvo que dividir el lote).
-            if _batch_written:
-                total_hits_done += len(batch_rows_out)
-                self._processed.update(h[1:] for h, _s in used_pairs)
-                # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
-                # which is the FASTA header of the query without the leading '>'.
-                for _r in batch_rows_out:
-                    _fields = _r.split("\t")
-                    if len(_fields) > 1:
-                        hit_queries.add(_fields[1])
-                self._save_state()
 
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
         # Over the whole run, so after a resume it lists what is still left.
@@ -3654,6 +3774,7 @@ class _BlastWorker(QtCore.QThread):
         # both are added in the same read/rewrite pass over the file.
         ref_msg = ""
         tax_match_msg = ""
+        ref_report: List[str] = []
         ref_path = cfg.get("tax_reference", "")
         if ref_path and not self._stop and total_hits_done > 0:
             try:
@@ -3666,6 +3787,13 @@ class _BlastWorker(QtCore.QThread):
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
                 if n_match >= 0:
                     tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+                _fmt = reference_format_warning(ref_table)
+                if _fmt:
+                    ref_msg += " · ⚠ " + _fmt
+                ref_report = reference_report_lines(
+                    {sample_id_of(q, cfg.get("strip_suffix", ""))
+                     for q in table_column(tsv_path, "Query_name") if q},
+                    ref_table, unknown=unknown)
             except Exception as exc:
                 ref_msg = f"Reference query taxonomy skipped: {exc}"
 
@@ -3766,10 +3894,20 @@ class _BlastWorker(QtCore.QThread):
             log_lines.append(f"  Missing seqs      : {miss_msg}")
         if nohit_msg:
             log_lines.append(f"  No-hit seqs       : {nohit_msg}")
+        if n_retried:
+            log_lines.append(f"  Final retry       : {n_retried} seq(s) without hits or from "
+                             f"failed batches searched again · {n_rescued} now with hits"
+                             + (" (the rest are confirmed: no hit after retry)"
+                                if n_rescued < n_retried else ""))
+        if n_tax_fixed or n_tax_still:
+            log_lines.append(f"  Taxonomy check    : {n_tax_fixed} hit row(s) without organism / "
+                             f"lineage repaired · {n_tax_still} still unresolved")
         if ref_msg:
             log_lines.append(f"  Reference tax     : {ref_msg}")
         if tax_match_msg:
             log_lines.append(f"  Tax level match   : {tax_match_msg}")
+        if ref_report:
+            log_lines += ["", "Reference taxonomy:"] + ref_report
         if nohit_pairs:
             log_lines += ["", "Sequences with no BLAST hit:"]
             for h, _sq in nohit_pairs:
@@ -3966,10 +4104,7 @@ class _BlastFileWorker(_BlastWorker):
                     self._saved_tax_keys.update(new_tax.keys())
                     self._saved_acc_keys.update(new_acc.keys())
 
-            taxonomies = [
-                (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
-                for o in organisms
-            ]
+            taxonomies = [self._tax_fields(o) for o in organisms]
             ranked_rows = self._rank_rows([
                 f"{row}\t{tax}\t{org}"
                 for row, tax, org in zip(blast_rows, taxonomies, organisms)
@@ -4003,6 +4138,7 @@ class _BlastFileWorker(_BlastWorker):
         # Both are added in the same read/rewrite pass over the file.
         ref_msg = ""
         tax_match_msg = ""
+        ref_report: List[str] = []
         ref_path = cfg.get("tax_reference", "")
         if ref_path and ranked_rows and not self._stop:
             try:
@@ -4015,6 +4151,13 @@ class _BlastFileWorker(_BlastWorker):
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
                 if n_match >= 0:
                     tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+                _fmt = reference_format_warning(ref_table)
+                if _fmt:
+                    ref_msg += " · ⚠ " + _fmt
+                ref_report = reference_report_lines(
+                    {sample_id_of(q, cfg.get("strip_suffix", ""))
+                     for q in table_column(tsv_path, "Query_name") if q},
+                    ref_table, unknown=unknown)
             except Exception as exc:
                 ref_msg = f"Reference query taxonomy skipped: {exc}"
 
@@ -4071,6 +4214,8 @@ class _BlastFileWorker(_BlastWorker):
             log_lines.append(f"  Reference tax     : {ref_msg}")
         if tax_match_msg:
             log_lines.append(f"  Tax level match   : {tax_match_msg}")
+        if ref_report:
+            log_lines += ["", "Reference taxonomy:"] + ref_report
         log_lines += [
             "",
             "NOTE: this tab does not produce a FASTA of queried sequences (the input",

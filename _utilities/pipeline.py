@@ -1073,7 +1073,9 @@ def _runconsensusparts_fn(inlist):
     # the threshold (~conspecific variation: another individual of the same
     # species, heteroplasmia, alleles) the mixture is informative; above it
     # (heterospecific level) it suggests cross-contamination or sample mixing.
-    _resolve_divrev = float(resolve_cfg.get("divergence_review", 0.03))
+    # The user's "alert divergence" (Parameters panel) drives it when present.
+    _resolve_divrev = float(resolve_cfg.get(
+        "alert_divergence", resolve_cfg.get("divergence_review", 0.03)))
     # Minimum dominant<->secondary divergence for 'several variants pass QC'
     # to force 'needs review' (below it the variants are near-identical).
     _resolve_passdiv = float(resolve_cfg.get("multi_qc_review_div", 0.01))
@@ -1286,8 +1288,10 @@ def _runconsensusparts_fn(inlist):
                             # non-Coding: accepted by 0 Ns; length may vary
                             # between species (ITS, etc.), len~=plen is not required.
                             return True
+                        # Same length rule as the main barcode QC (qclentol),
+                        # not the much wider read-length window (postdemlen).
                         return (c.get("translates")
-                                and abs(c["len"] - plen) <= postdemlen)
+                                and abs(c["len"] - plen) <= qclentol)
                     _n_pass = sum(1 for c in cl if _passes_qc(c))
                     needs_review = (chosen_idx != 0)
                     # Reassign roles: the chosen one is 'dominant', the rest 'secondary'.
@@ -1509,9 +1513,16 @@ def _runconsensusparts_fn(inlist):
                         n_col = len(col)
                         cnt = Counter(col)
                         col_stats.append({b: c / n_col for b, c in cnt.items()})
-                    n = rangefreq[1]
-                    while n >= rangefreq[0]:
-                        if n != fixthresh:
+                    # Integer steps: subtracting a float step repeatedly drifts
+                    # (0.30000000000000004 != 0.3), re-running the fixed
+                    # threshold and skipping the lowest one of the range.
+                    _nsteps = int(round((rangefreq[1] - rangefreq[0]) / stepsize)) \
+                        if stepsize > 0 else 0
+                    for _k in range(_nsteps + 1):
+                        n = round(rangefreq[1] - _k * stepsize, 6)
+                        if n < rangefreq[0] - 1e-9:
+                            break
+                        if abs(n - fixthresh) > 1e-9:
                             sequence = []
                             for freq_dict in col_stats:
                                 baseset = {b: f for b, f in freq_dict.items() if f > n}
@@ -1537,7 +1548,6 @@ def _runconsensusparts_fn(inlist):
                                             flag2 = True
                                 if flag2 and conseq2 not in otherconseqs:
                                     otherconseqs.append(conseq2)
-                        n -= stepsize
                     
             if len(otherconseqs) == 1:
                 if gencode_for(name) == 0:

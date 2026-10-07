@@ -47,6 +47,35 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   demultiplexing, and swept keys that cannot change the result. *Resume
   sweep…* lists the interrupted sweeps found in `output/`. *Create example*
   offers to load the file and open it in the text editor.
+- **Intra-sample variants exported by tier.** A secondary variant is
+  exported to `secondary_variants.fa` as a *quality variant* (>= 20% of the
+  reads, >= *Min. reads per exported variant* reads (default 10), 0 Ns, and
+  translating for a Coding marker; at most 3 per sample) or as a
+  *contamination / paralog alert* (>= *Contamination alert divergence* from
+  the dominant (default 3%), >= 10% of the reads, >= 5 reads, <= 2 Ns; never
+  capped, sample flagged *needs review*). Divergent signals too weak for a
+  reliable sequence are listed in the log as traces; close, weakly supported
+  variants are only counted. Headers carry `tier=`, and the *Intra-sample
+  variants* sheet an *Export tier* column. Both new parameters can be swept.
+  On an ITS run the export went from 329 to 111 variants, keeping every
+  other-family contaminant.
+- **BLAST: final retry and taxonomy check.** Sequences without hits, or from
+  failed batches, are searched once more at the end of the run. Every hit row
+  without organism or lineage is looked up again (also negatives cached by
+  earlier runs) and rewritten. The run log reports both.
+- **Best Sequence: not-identified sequences split by cause.**
+  `_no_blast_hit.fasta` (no hit, or only hits shorter than the minimum
+  alignment) and `_tax_mismatch.fasta` (good hits of another taxon, and hits
+  with no expected taxonomy to compare with, flagged `no_query_taxonomy`)
+  replace `_no_tax_hit.fasta`. The status line and the log give the counts.
+- **Query-taxonomy reference: headerless files and layout check.** A file
+  without a header row keeps its first sample. A warning shows when the
+  columns after the identifier hold numbers or codes instead of taxa, and the
+  samples missing from the reference or with empty taxonomy are named in the
+  check and in the run logs.
+- **Manual:** the BLAST results columns (§13.5, *Query* = your sequence and
+  your expected taxonomy, *Subject* = the database hit and its NCBI
+  taxonomy), `Tax_level_match` with examples, and the variant export tiers.
 
 ### Changed
 - **FASTA Tools:** *Extract sequences* groups Unique, Identical, By pattern
@@ -69,6 +98,14 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   Resume are disabled and a note says why.
 - Settings boxes of every panel share one rounded style.
 - No emojis on footer buttons nor in the BLAST tab titles.
+- **Best Sequence:** a secondary variant replaces its sample's barcode only
+  when its top hit reaches a deeper taxonomic rank than the barcode's (on an
+  ITS run, 82 variants selected → 3, same identifications).
+- **Intra-sample variants:** "several variants pass QC" uses the QC length
+  tolerance instead of the read-length window.
+- **FASTA Tools / FASTA Compare:** *Append info to headers* (ID and field
+  separators) and the Compare ID delimiter use the same separator drop-down
+  as *By header fields*.
 
 ### Fixed
 - Compare: a delimiter occurring fewer times than the chosen occurrence made
@@ -80,6 +117,18 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   from the headers; Run could become enabled while a job was running.
 - Parameter Sweep: a key listed twice in a `.cfg` silently replaced the
   first one.
+- BLAST: a hit whose lineage lookup failed was written with one taxonomy
+  field instead of five, so `Subject_organism` slid into `Subject_Class`.
+- Consensus threshold sweep: float drift re-ran the fixed threshold and could
+  skip the lowest one of the range.
+- *3.Final barcodes* sheet: `estgaps` was read by position (wrong when a
+  header repeated `ambs=`) and `#ambiguities` came from the phase-2a header;
+  both now follow the QC classification, the normal and the stopped run share
+  one implementation, and final headers no longer repeat `ambs=`/`estgaps=`.
+- A results workbook that could not be saved when stopping a run (e.g. open in
+  Excel) is reported as an error instead of being lost silently.
+- A small empty window flashed at startup, and the process took seconds to
+  exit after closing (crash during Qt teardown).
 
 ---
 

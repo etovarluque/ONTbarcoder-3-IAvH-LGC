@@ -1109,11 +1109,13 @@ class BatchSweepPanel(QtWidgets.QWidget):
             body.setVisible(on)
             sub.setVisible(not on)
         btn.toggled.connect(_sync)
-        _sync(False)
 
         lay.addWidget(btn)
         lay.addWidget(sub)
         lay.addWidget(body)
+        # After the widgets are parented: setVisible(True) on a parentless
+        # widget would flash it as a top-level window at startup.
+        _sync(False)
         return card
 
     # ── Compare two runs ─────────────────────────────────────────────────

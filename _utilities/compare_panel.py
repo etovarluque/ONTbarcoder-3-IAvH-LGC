@@ -324,9 +324,9 @@ class ComparePanel(QtWidgets.QWidget):
     compareRequested = QtCore.pyqtSignal(list, str, str, str, dict)
 
     # (label, delimiter) of the ID delimiter drop-down; Custom… comes last
-    _DELIMS = ((";  semicolon", ";"), ("|  pipe", "|"), ("_  underscore", "_"),
-               ("-  hyphen", "-"), (".  dot", "."), (",  comma", ","),
-               ("␣  space", " "))
+    _DELIMS = (('"|"  pipe', "|"), ('";"  semicolon', ";"), ('","  comma', ","),
+               ("␣  space", " "), ("⇥  tab", "	"), ('"_"  underscore', "_"),
+               ('"-"  hyphen', "-"))
     _DELIM_CUSTOM = "__custom__"
 
     _LEGEND = (
@@ -1107,7 +1107,7 @@ class ComparePanel(QtWidgets.QWidget):
         )
 
         # Reset ID extraction controls
-        self._id_delim_combo.setCurrentIndex(0)
+        self._id_delim_combo.setCurrentIndex(max(0, self._id_delim_combo.findData(";")))
         self._id_delim_edit.clear()
         self._id_occ_combo.setCurrentIndex(0)
         self._id_delim_anyset_chk.setChecked(False)

@@ -2494,6 +2494,8 @@ class ParamsPanel(BasePanel):
         "resolve_mixed_on":    False,
         "resolve_secfrac":     20,
         "resolve_variant_tol": 10,
+        "resolve_min_var_reads": 10,
+        "resolve_alert_div":   3,
         "gencode_index":       4,
         "minlen":              658,
         "explen":              658,
@@ -2529,7 +2531,7 @@ class ParamsPanel(BasePanel):
 
         self._lbl_params_title = make_label("Configure parameters", size=19, bold=True)
         self.add(self._lbl_params_title)
-        self._mode_subtitle_src = "Default values ​​are suitable for COI 658 bp"
+        self._mode_subtitle_src = "Default values are suitable for COI 658 bp"
         self._mode_subtitle = make_label(
             _tr("ParamsPanel", self._mode_subtitle_src), color=TEXT_SEC
         )
@@ -2649,7 +2651,7 @@ class ParamsPanel(BasePanel):
                 f"border-radius:6px; padding:6px 10px;"
             )
         else:
-            self._mode_subtitle_src = "Default values ​​are suitable for COI 658 bp"
+            self._mode_subtitle_src = "Default values are suitable for COI 658 bp"
             self._mode_subtitle.setText(_tr("ParamsPanel", self._mode_subtitle_src))
             self._mode_subtitle.setStyleSheet(f"font-size:17px; color:{TEXT_SEC}; padding:6px 10px;")
 
@@ -2942,11 +2944,37 @@ class ParamsPanel(BasePanel):
             "Default 10%.")
         self.p_resolve_tol = _spin(0, 40, self._defaults["resolve_variant_tol"])
         self.p_resolve_tol.setToolTip(_tip_rtol)
+
+        _tip_rreads = (
+            "Minimum reads supporting a secondary variant for it to be exported\n"
+            "as a quality variant (also needs >=20% of the reads and 0 Ns).\n"
+            "An ONT consensus built from fewer reads keeps residual errors.\n"
+            "Lower it for shallow runs. Default 10.")
+        self.p_resolve_minreads = _spin(1, 1000, self._defaults["resolve_min_var_reads"])
+        self.p_resolve_minreads.setToolTip(_tip_rreads)
+
+        _tip_ralert = (
+            "Divergence from the dominant barcode at which a secondary variant\n"
+            "is treated as a possible contaminant / paralog: it is exported as\n"
+            "an alert (>=10% of the reads, >=5 reads, <=2 Ns) even when it is\n"
+            "too weak to be a quality variant, and the sample is flagged\n"
+            "'needs review'. Weaker divergent signals are only noted in the\n"
+            "log as traces. Variants closer than this are intra-specific or\n"
+            "intra-genomic (e.g. rDNA copies) and do not change the\n"
+            "identification. Default 3%.\n"
+            "Alerts below the 'Min. secondary variant fraction' are only seen\n"
+            "if that fraction is lowered to 10%.")
+        self.p_resolve_alert = _spin(1, 50, self._defaults["resolve_alert_div"])
+        self.p_resolve_alert.setToolTip(_tip_ralert)
         self._resolve_grid = _grid(
             self._tf(ctx, "Min. secondary variant fraction (%)",
                      self.p_resolve_secfrac, tooltip=_tip_rsec),
             self._tf(ctx, "Variant tolerance (% of diagnostic sites)",
                      self.p_resolve_tol, tooltip=_tip_rtol),
+            self._tf(ctx, "Min. reads per exported variant",
+                     self.p_resolve_minreads, tooltip=_tip_rreads),
+            self._tf(ctx, "Contamination alert divergence (%)",
+                     self.p_resolve_alert, tooltip=_tip_ralert),
             cols=1,
         )
         self._resolve_grid.setContentsMargins(22, 0, 0, 0)
@@ -2955,9 +2983,12 @@ class ParamsPanel(BasePanel):
         # Description shown only while this option is on.
         self._resolve_info = QtWidgets.QLabel(
             "  Mixed samples are not rejected: the dominant (most abundant) variant "
-            "is kept as the barcode and the secondary one(s) are written to "
-            "secondary_variants.fa. The per-sample cluster breakdown is reported in "
-            "the 'Intra-sample variants' sheet of runsummary.xlsx.")
+            "is kept as the barcode. Secondary variants are exported to "
+            "secondary_variants.fa by tier: quality variants (well supported, "
+            "0 Ns) and contamination/paralog alerts (divergent from the "
+            "dominant). Divergent but weak signals are listed in the log as "
+            "traces. The per-sample cluster breakdown is reported in the "
+            "'Intra-sample variants' sheet of runsummary.xlsx.")
         self._resolve_info.setStyleSheet(
             f"color: {TEXT_HINT}; font-size:13px; margin-left:22px;")
         self._resolve_info.setWordWrap(True)
@@ -3117,6 +3148,8 @@ class ParamsPanel(BasePanel):
                 "resolve_mixed_on":     self.p_resolve.isChecked(),
                 "resolve_secfrac":      self.p_resolve_secfrac.value(),
                 "resolve_variant_tol":  self.p_resolve_tol.value(),
+                "resolve_min_var_reads": self.p_resolve_minreads.value(),
+                "resolve_alert_div":    self.p_resolve_alert.value(),
                 "gencode_index":   self.p_gencode.currentIndex(),
                 "minlen":          self.p_minlen.value(),
                 "explen":          self.p_explen.value(),
@@ -3204,12 +3237,18 @@ class ParamsPanel(BasePanel):
                       self.p_cov2b, self.p_nthreads):
                 w.blockSignals(False)
 
-            for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol):
+            for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol,
+                        self.p_resolve_minreads, self.p_resolve_alert):
                 _rw.blockSignals(True)
             self.p_resolve.setChecked(profile.get("resolve_mixed_on", d["resolve_mixed_on"]))
             self.p_resolve_secfrac.setValue(profile.get("resolve_secfrac", d["resolve_secfrac"]))
             self.p_resolve_tol.setValue(profile.get("resolve_variant_tol", d["resolve_variant_tol"]))
-            for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol):
+            self.p_resolve_minreads.setValue(
+                profile.get("resolve_min_var_reads", d["resolve_min_var_reads"]))
+            self.p_resolve_alert.setValue(
+                profile.get("resolve_alert_div", d["resolve_alert_div"]))
+            for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol,
+                        self.p_resolve_minreads, self.p_resolve_alert):
                 _rw.blockSignals(False)
             self._sync_resolve_controls()
 
@@ -3273,12 +3312,16 @@ class ParamsPanel(BasePanel):
                   self.p_cov2b, self.p_nthreads):
             w.blockSignals(False)
 
-        for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol):
+        for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol,
+                        self.p_resolve_minreads, self.p_resolve_alert):
             _rw.blockSignals(True)
         self.p_resolve.setChecked(d["resolve_mixed_on"])
         self.p_resolve_secfrac.setValue(d["resolve_secfrac"])
         self.p_resolve_tol.setValue(d["resolve_variant_tol"])
-        for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol):
+        self.p_resolve_minreads.setValue(d["resolve_min_var_reads"])
+        self.p_resolve_alert.setValue(d["resolve_alert_div"])
+        for _rw in (self.p_resolve, self.p_resolve_secfrac, self.p_resolve_tol,
+                        self.p_resolve_minreads, self.p_resolve_alert):
             _rw.blockSignals(False)
         self._sync_resolve_controls()
 
@@ -3536,6 +3579,10 @@ class ParamsPanel(BasePanel):
                             if getattr(self, 'p_resolve_secfrac', None) else 0.2)
         _resolve_tol = ((self.p_resolve_tol.value() / 100.0)
                         if getattr(self, 'p_resolve_tol', None) else 0.10)
+        _resolve_minreads = (self.p_resolve_minreads.value()
+                             if getattr(self, 'p_resolve_minreads', None) else 10)
+        _resolve_alert = ((self.p_resolve_alert.value() / 100.0)
+                          if getattr(self, 'p_resolve_alert', None) else 0.03)
 
         return {
             "minlen": self.p_minlen.value(),
@@ -3580,7 +3627,12 @@ class ParamsPanel(BasePanel):
                 # same species, heteroplasmy, alleles) the mix is informative;
                 # above it (heterospecific level) it suggests cross-
                 # contamination or a sample mix-up.
-                "divergence_review": 0.03,
+                "divergence_review": _resolve_alert,
+                # Export tiers for secondary variants (see _variant_tier):
+                # reads behind a quality variant, and the divergence that makes
+                # a variant a contamination / paralog alert.
+                "min_variant_reads": _resolve_minreads,
+                "alert_divergence": _resolve_alert,
                 # Several QC-passing variants force 'needs review' only when
                 # they diverge >= this from the dominant (near-identical
                 # conspecific copies are reported but not flagged).
@@ -6336,6 +6388,9 @@ class MainWindow(QtWidgets.QMainWindow):
             logfile.write(f"    · min secondary variant fraction: {_rm.get('min_secondary_frac', '?')} "
                           f"(derived per-column polymorphism threshold: {_rm.get('minor_thresh', '?')})\n")
             logfile.write(f"    · variant tolerance: {_rm.get('tolerance', '?')}\n")
+            logfile.write(f"    · variant export: quality >= {_rm.get('min_variant_reads', 10)} reads, "
+                          f">=20% of reads, 0 Ns; contamination alert at >= "
+                          f"{float(_rm.get('alert_divergence', 0.03)) * 100:.0f}% divergence\n")
             logfile.write(f"    · divergence review threshold: "
                           f"{_rm.get('divergence_review', 0.03)}\n")
         if not params.get("non_coi", False):
@@ -8351,6 +8406,77 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._finish_analysis()
 
+    # Export tiers of a secondary variant. Fixed thresholds are quality rules
+    # (an exported sequence must be reliable); the reads behind a quality
+    # variant and the alert divergence are user parameters (resolve_mixed).
+    _TIER1_MIN_FRAC = 0.20
+    _TIER2_MIN_FRAC = 0.10
+    _TIER2_MIN_READS = 5
+    _TIER2_MAX_N = 2
+
+    def _variant_tier(self, s: dict):
+        """Export tier of one secondary variant (an entry of mixinfo
+        'secondaries'):
+          "quality" - real, well-supported variant: >=20% of the reads,
+                      >= min_variant_reads reads, 0 Ns (and, for a Coding
+                      marker, it translates). Exported.
+          "alert"   - divergent from the dominant (>= alert_divergence):
+                      possible contaminant / paralog. Exported with weaker
+                      support (>=10% of the reads, >=5 reads, <=2 Ns).
+          "trace"   - divergent but too weak to give a reliable sequence:
+                      noted in the log and the Excel sheet, not exported.
+          None      - close to the dominant and weakly supported: counted
+                      only (intra-specific / intra-genomic noise)."""
+        rm = self._params.get("resolve_mixed", {}) or {}
+        min_reads = int(rm.get("min_variant_reads", 10))
+        alert_div = float(rm.get("alert_divergence", 0.03))
+        try:
+            mincov = int(self._params.get("mincoverage", 1))
+        except (TypeError, ValueError):
+            mincov = 1
+        seq = (s.get("seq") or "").replace("-", "")
+        if not seq:
+            return None
+        frac = float(s.get("frac") or 0)
+        size = s.get("size")
+        # Unknown size (back-compat records): judged on the fraction alone.
+        reads = int(size) if size is not None else None
+
+        def _enough(n):
+            return reads is None or reads >= max(n, mincov)
+
+        n_ns = seq.count("N")
+        div = float(s.get("divergence") or 0)
+        coding = self._params.get("gencode", 5) != 0
+        # Divergence decides first: a divergent variant is a contamination /
+        # paralog signal however well supported it is.
+        if div >= alert_div:
+            if (frac >= self._TIER2_MIN_FRAC and _enough(self._TIER2_MIN_READS)
+                    and n_ns <= self._TIER2_MAX_N):
+                return "alert"
+            return "trace"
+        if (frac >= self._TIER1_MIN_FRAC and _enough(min_reads) and n_ns == 0
+                and not (coding and s.get("translates") is False)):
+            return "quality"
+        return None
+
+    def _sample_variant_tiers(self, v: dict) -> list:
+        """[(index, secondary, tier)] for every secondary of one sample, index
+        being its 1-based position ({sample}_var{index}). Quality variants are
+        capped at max_variants per sample (most abundant first); alerts are
+        never capped, a possible contaminant must always be visible."""
+        rm = self._params.get("resolve_mixed", {}) or {}
+        maxvar = int(rm.get("max_variants", 3))
+        out, n_quality = [], 0
+        for idx, sec in enumerate(v.get("secondaries") or [], start=1):
+            tier = self._variant_tier(sec)
+            if tier == "quality":
+                n_quality += 1
+                if n_quality > maxvar:
+                    tier = None
+            out.append((idx, sec, tier))
+        return out
+
     def _write_variant_summary(self, stage: str = "2a"):
         """Writes secondary_variants.fa and the intra-sample variant stats from
         mixinfo_all. Called when phase 2a ends and again after phase 2b when
@@ -8367,25 +8493,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         _mixed = {k: v for k, v in getattr(self, 'mixinfo_all', {}).items()
                   if k in self.con200barcodes and v.get("secondary")}
-        # ALL secondary variants per sample are reported (not just one). No
-        # cross-sample "source" is inferred: an analysis routinely contains
+        # Secondary variants are exported by tier (see _variant_tier): quality
+        # variants and contamination / paralog alerts. Divergent but weak
+        # signals are only listed in the log as traces; the rest is counted.
+        # No cross-sample "source" is inferred: an analysis routinely contains
         # several samples of the same species, so a secondary matching
         # another sample's barcode does NOT imply it is the source.
-        # Skip low-quality secondaries (≥5 Ns) to keep the file informative.
-        _MAX_VARIANT_N = 5
+        _tier_count = {"quality": 0, "alert": 0, "trace": 0, None: 0}
+        _traces = []
         for k in sorted(_mixed.keys()):
             v = _mixed[k]
-            # Prefer the full per-cluster breakdown; fall back to the
-            # back-compat single 'secondary' field if absent.
-            _secs = v.get("secondaries")
-            if not _secs:
-                _secs = [{"frac": 1.0 - float(v.get("frac", 0)),
-                          "seq": v.get("secondary", ""),
-                          "translates": None}]
-            for _i, s in enumerate(_secs, start=1):
-                seq = s.get("seq", "")
-                if not seq or seq.count("N") >= _MAX_VARIANT_N:
+            # Back-compat: only the single 'secondary' field is present.
+            if not v.get("secondaries"):
+                v = dict(v, secondaries=[{"frac": 1.0 - float(v.get("frac", 0)),
+                                          "seq": v.get("secondary", ""),
+                                          "translates": None}])
+            for _i, s, _tier in self._sample_variant_tiers(v):
+                _tier_count[_tier] += 1
+                if _tier == "trace":
+                    _traces.append((k, s))
+                if _tier not in ("quality", "alert"):
                     continue
+                seq = s.get("seq", "")
                 _tr = s.get("translates")
                 _tr_tag = ("yes" if _tr is True
                            else "no" if _tr is False else "NA")
@@ -8394,6 +8523,7 @@ class MainWindow(QtWidgets.QMainWindow):
                            if _dv is not None else "NA")
                 self._variant_raw_records.append(
                     (f"{k}_var{_i}",
+                     f"tier={_tier};"
                      f"frac={float(s.get('frac',0))*100:.0f}%;"
                      f"len={len(seq)};div={_dv_tag};translates={_tr_tag};"
                      f"coverage={s.get('size') if s.get('size') is not None else 'NA'};"
@@ -8410,7 +8540,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._resolve_stats = {"enabled": True, "mixed": len(_mixed),
                                "recovered": _n_recovered,
                                "needs_review": _n_review,
-                               "contaminants": _n_written}
+                               "contaminants": _n_written,
+                               "tier_quality": _tier_count["quality"],
+                               "tier_alert": _tier_count["alert"],
+                               "tier_trace": _tier_count["trace"],
+                               "tier_dropped": _tier_count[None]}
         if _mixed:
             _rev_txt = (f"; ⚠ {_n_review} need manual review"
                         if _n_review else "")
@@ -8419,7 +8553,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"  Intra-sample variant resolution{_upd}: {len(_mixed)} sample(s) "
                 f"resolved ({_n_recovered} now QC-compliant){_rev_txt}; "
                 f"{_n_written} secondary variant(s) written to "
-                f"secondary_variants.fa.", "warn")
+                f"secondary_variants.fa ({_tier_count['quality']} quality, "
+                f"{_tier_count['alert']} contamination/paralog alert); "
+                f"{_tier_count[None]} close low-support variant(s) not exported.",
+                "warn")
+            for k, s in _traces:
+                _sz = s.get("size")
+                _sz_txt = f", {_sz} reads" if _sz is not None else ""
+                self._panel_progress.append_log(
+                    f"    trace: {k} — divergent template at "
+                    f"{float(s.get('divergence') or 0) * 100:.1f}% "
+                    f"({float(s.get('frac') or 0) * 100:.0f}% of reads{_sz_txt}, "
+                    f"{(s.get('seq') or '').count('N')} Ns) — too weak to "
+                    f"export, possible trace contamination", "warn")
 
     def _write_secondary_variants_fa(self, corrected=None):
         """Writes the single secondary_variants.fa (consensus_by_length and the
@@ -8964,7 +9110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         outpath = self._outpath
         params = self._params
 
-        self._panel_progress.set_phase("3", "Phase 3: fixing barcodes by conparison...")
+        self._panel_progress.set_phase("3", "Phase 3: fixing barcodes by comparison...")
         os.makedirs(os.path.join(outpath, "3_ConsensusByBarcodeComparison"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "barcodesets", "fixing"), exist_ok=True)
 
@@ -9017,8 +9163,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for k in musclergoodset:
                 sample = k.split("_all.fa")[0]
                 ambs = self.con200barcodes.get(sample, "").count("N")
-                estg = k.split(";estgaps=")[1] if ";estgaps=" in k else "0"
-                base = k.split(";estgaps=")[0]
+                estg, base = self._split_qc_fields(k)
                 header = f">{base};ambs={ambs};estgaps={estg}\n"
                 outfile.write(header + musclergoodset[k] + "\n")
                 outfile2.write(header + musclergoodset[k] + "\n")
@@ -9029,8 +9174,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not self.n90barcodes.get(sample):
                     continue  # sample has no phase 2b data — ignore
                 ambs = self.n90barcodes[sample].count("N")
-                estg = k.split(";estgaps=")[1] if ";estgaps=" in k else "0"
-                base = k.split(";estgaps=")[0]
+                estg, base = self._split_qc_fields(k)
                 header = f">{base};ambs={ambs};estgaps={estg}\n"
                 outfile.write(header + musclepgoodset[k] + "\n")
                 outfile2.write(header + musclepgoodset[k] + "\n")
@@ -9367,7 +9511,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         file_map["Allbarcodes.fa"].write(j + next_line)
                         alllist.append(j.split(";")[0][1:])
 
-                        estgaps = int(j.split("estgaps=")[1].strip()) if "estgaps=" in j else 0
+                        estgaps = self._header_int(j.strip().lstrip(">").split(";"), "estgaps", 0)
                         n_ambs = seq.count("N")
 
                         _skey = j.split(";")[0][1:].replace("_all.fa", "")
@@ -9421,50 +9565,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ── Excel Sheet 3.Final barcodes ─────────────────────────────────────
         if not self._is_live() or getattr(self, "_live_finalizing", False):
             try:
-                sheet3 = self.wb.add_worksheet("3.Final barcodes")
-                non_coi_xl = self._params.get("non_coi", False)
-                trans_col = "length check" if non_coi_xl else "translation check"
-                headers3 = ["SpecimenID", "Number of sequences demultiplexed",
-                             "Number used for generating barcodes", "stage", "type",
-                             "length", "barcode", trans_col, "#ambiguities"]
-                for c, h in enumerate(headers3):
-                    sheet3.write(0, c, h)
-                row3 = 1
-                if os.path.isfile(final_all):
-                    with open(final_all, encoding="utf-8", errors="replace") as fa_in:
-                        lines3 = fa_in.readlines()
-                    for i3, j3 in enumerate(lines3):
-                        if ">" in j3:
-                            seq3 = lines3[i3+1].strip() if i3+1 < len(lines3) else ""
-                            parts3 = j3.strip().lstrip(">").split(";")
-                            sample3 = parts3[0].replace("_all.fa", "")
-                            slen3 = parts3[1] if len(parts3) > 1 else "NA"
-                            cov3 = parts3[2] if len(parts3) > 2 else "NA"
-                            ambs3 = int(parts3[3].split("=")[1]) if len(parts3) > 3 and "=" in parts3[3] else seq3.count("N")
-                            estgaps3 = int(parts3[4].split("=")[1]) if len(parts3) > 4 and "=" in parts3[4] else 0
-                            # determine type (stage)
-                            if sample3 in self.n90barcodes:
-                                stage3 = "Consensus by similarity"
-                                if estgaps3 > 0:
-                                    stage3 += ", fixed indel"
-                                btype3 = f"removed {estgaps3} indels" if estgaps3 > 0 else "correct"
-                            else:
-                                stage3 = "Consensus by length"
-                                if estgaps3 > 0:
-                                    stage3 += ", fixed indel"
-                                btype3 = f"removed {estgaps3} indels" if estgaps3 > 0 else "correct"
-                            cov_num3 = self.n90cov.get(sample3, self.con200cov.get(sample3, "NA"))
-                            trans3 = 1 if (ambs3 == 0 and estgaps3 == 0) else 0
-                            sheet3.write(row3, 0, sample3)
-                            sheet3.write(row3, 1, self.sampleids.get(sample3, "NA"))
-                            sheet3.write(row3, 2, cov_num3)
-                            sheet3.write(row3, 3, stage3)
-                            sheet3.write(row3, 4, btype3)
-                            sheet3.write(row3, 5, int(slen3) if str(slen3).isdigit() else slen3)
-                            sheet3.write(row3, 6, seq3)
-                            sheet3.write(row3, 7, trans3)
-                            sheet3.write(row3, 8, ambs3)
-                            row3 += 1
+                self._write_final_barcodes_sheet(final_all)
             except Exception as e:
                 self._panel_progress.append_log(f"  Warning Excel 3: {e}", "warn")
 
@@ -9490,6 +9591,77 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_write_consensus_files_from_main(main)
 
         self._finish_analysis()
+
+    @classmethod
+    def _split_qc_fields(cls, key: str):
+        """(estgaps, header without its ambs= / estgaps= fields), so a header
+        rebuilt as base;ambs=..;estgaps=.. never carries those fields twice."""
+        parts = key.split(";")
+        base = ";".join(p for p in parts
+                        if p.partition("=")[0].strip() not in ("ambs", "estgaps"))
+        return cls._header_int(parts, "estgaps", 0), base
+
+    @staticmethod
+    def _header_int(parts: list, key: str, default: int) -> int:
+        """Integer value of a "key=value" header field, found by key name
+        wherever it sits (headers may carry ambs= or not, or repeat fields)."""
+        for p in parts:
+            k, eq, v = p.partition("=")
+            if eq and k.strip() == key:
+                try:
+                    return int(v.strip())
+                except ValueError:
+                    return default
+        return default
+
+    def _write_final_barcodes_sheet(self, final_all: str) -> dict:
+        """Write the "3.Final barcodes" sheet from Final_all_combined_barcodes.fa
+        and return the per-sample info {sample: {len, ambs, estgaps}} for the
+        Sample QC status sheet. Shared by the normal finish and the stop path,
+        so both produce the same sheet. #ambiguities counts the Ns of the final
+        sequence, as the QC Compliant / Filtered classification does."""
+        non_coi = self._params.get("non_coi", False)
+        sids = getattr(self, "sampleids", {})
+        n90bc = getattr(self, "n90barcodes", {})
+        n90cov = getattr(self, "n90cov", {})
+        con200cov = getattr(self, "con200cov", {})
+        bc_info = {}
+        sheet = self.wb.add_worksheet("3.Final barcodes")
+        trans_col = "length check" if non_coi else "translation check"
+        headers = ["SpecimenID", "Number of sequences demultiplexed",
+                   "Number used for generating barcodes", "stage", "type",
+                   "length", "barcode", trans_col, "#ambiguities"]
+        for c, h in enumerate(headers):
+            sheet.write(0, c, h)
+        if not os.path.isfile(final_all):
+            return bc_info
+        with open(final_all, encoding="utf-8", errors="replace") as fa_in:
+            lines = fa_in.readlines()
+        row = 1
+        for i, hdr in enumerate(lines):
+            if ">" not in hdr:
+                continue
+            seq = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            parts = hdr.strip().lstrip(">").split(";")
+            sample = parts[0].replace("_all.fa", "")
+            slen = parts[1] if len(parts) > 1 else "NA"
+            ambs = seq.count("N")
+            gaps = self._header_int(parts, "estgaps", 0)
+            stage = ("Consensus by similarity" if sample in n90bc
+                     else "Consensus by length") + (", fixed indel" if gaps > 0 else "")
+            btype = f"removed {gaps} indels" if gaps > 0 else "correct"
+            bc_info[sample] = {"len": len(seq), "ambs": ambs, "estgaps": gaps}
+            sheet.write(row, 0, sample)
+            sheet.write(row, 1, sids.get(sample, "NA"))
+            sheet.write(row, 2, n90cov.get(sample, con200cov.get(sample, "NA")))
+            sheet.write(row, 3, stage)
+            sheet.write(row, 4, btype)
+            sheet.write(row, 5, int(slen) if str(slen).isdigit() else slen)
+            sheet.write(row, 6, seq)
+            sheet.write(row, 7, 1 if (ambs == 0 and gaps == 0) else 0)
+            sheet.write(row, 8, ambs)
+            row += 1
+        return bc_info
 
     # ══════════════════════════════════════════════════════════════════════════
     # HTML REPORT
@@ -9760,6 +9932,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if _rm_enabled:
                 _rm_lbl += (f" (min secondary variant fraction: {_rm.get('min_secondary_frac','?')}; "
                             f"variant tolerance: {_rm.get('tolerance','?')}; "
+                            f"min reads per exported variant: {_rm.get('min_variant_reads', 10)}; "
+                            f"contamination alert divergence: {_rm.get('alert_divergence', 0.03)}; "
                             f"derived polymorphism threshold: {_rm.get('minor_thresh','?')})")
                 _rstats = getattr(self, "_resolve_stats", {}) or {}
                 if _rstats.get("enabled"):
@@ -10325,7 +10499,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Cluster rank", "Reads", "Fraction (%)", "Length (bp)",
                     "Ns", "Translates (Coding)", "Role",
                     "Divergence vs dominant (%)",
-                    "Identical to N other barcodes"]
+                    "Identical to N other barcodes",
+                    "Export tier"]
             for c, h in enumerate(hdrs):
                 ws.write(0, c, h)
             # Barcode sequence -> samples carrying it, to report how many OTHER
@@ -10353,6 +10528,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 _sec_by_rank = {s.get("rank"): s
                                 for s in (v.get("secondaries") or [])
                                 if s.get("rank") is not None}
+                _tier_by_rank = {s.get("rank"): t
+                                 for _i, s, t in self._sample_variant_tiers(v)
+                                 if s.get("rank") is not None}
                 for ci, c in enumerate(clusters):
                     _tr = c.get("translates")
                     tr_txt = ("yes" if _tr is True
@@ -10386,6 +10564,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         ws.write(r, 13,
                                  len(_bc_by_seq.get(_sseq, set()) - {k})
                                  if _sseq else "")
+                        _t = _tier_by_rank.get(c.get("rank", ci + 1))
+                        ws.write(r, 14, {"quality": "quality variant",
+                                         "alert": "contamination/paralog alert",
+                                         "trace": "trace (not exported)"}.get(
+                                             _t, "not exported"))
                     r += 1
             # Samples with a bimodal read-length distribution (possible mixture
             # of different-length products that the by-length subsampling would
@@ -10425,22 +10608,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             gencode = params.get("gencode", 5)
             is_coi = (gencode != 0)   # non-Coding (gencode 0): accepted by 0 Ns
-            maxn = int(_rm.get("max_variant_Ns", 5))
-            maxvar = int(_rm.get("max_variants", 3))
-            # Honour the user's "Minimum read coverage": a secondary cluster
-            # whose read count (size) is below mincov is dropped, exactly like a
-            # main barcode below coverage is not produced.
-            try:
-                mincov = int(params.get("mincoverage", 1))
-            except (TypeError, ValueError):
-                mincov = 1
-
-            # Eligible secondaries: < maxn Ns, ≥ mincov reads, the maxvar most
-            # abundant per sample.
+            # Eligible secondaries: the exported tiers (quality variants and
+            # contamination alerts, see _variant_tier), which also honour the
+            # user's "Minimum read coverage".
             candidates = []  # (varname, seq)
             cov_map = {}      # varname -> size (number of reads = cluster coverage)
             frac_map = {}     # varname -> frac (cluster proportion, 0..1)
             div_map = {}      # varname -> divergence vs. dominant (0..1)
+            tier_map = {}     # varname -> export tier (quality / alert)
             for k, v in getattr(self, "mixinfo_all", {}).items():
                 if k not in getattr(self, "con200barcodes", {}):
                     continue
@@ -10448,16 +10623,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 # idx is the position in the full secondaries list, so the
                 # corrected variant keeps the {sample}_var{i} name of its raw
                 # consensus in secondary_variants.fa.
-                n_taken = 0
-                for idx, s in enumerate(secs, start=1):
-                    if n_taken >= maxvar:
-                        break
-                    if not (s.get("seq") and s["seq"].count("N") < maxn
-                            and (s.get("size") is None
-                                 or int(s.get("size")) >= mincov)):
+                if not secs:
+                    continue
+                for idx, s, tier in self._sample_variant_tiers(v):
+                    if tier not in ("quality", "alert"):
                         continue
-                    n_taken += 1
                     vname = f"{k}_var{idx}"
+                    tier_map[vname] = tier
                     candidates.append((vname, s["seq"].replace("-", "").upper()))
                     cov_map[vname] = s.get("size")
                     frac_map[vname] = s.get("frac")
@@ -10682,7 +10854,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 _dvv = div_map.get(vname)
                 div_tag = (f"{float(_dvv) * 100:.1f}%"
                            if _dvv is not None else "NA")
-                corrected[vname] = (f"frac={frac_tag};div={div_tag};"
+                corrected[vname] = (f"tier={tier_map.get(vname, 'NA')};"
+                                    f"frac={frac_tag};div={div_tag};"
                                     f"len={len(seq)};"
                                     f"coverage={cov_val};"
                                     f"translates={tr_tag};"
@@ -11310,8 +11483,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if timeline:
                 try:
                     self._panel_live_chart.export_charts(outpath)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._panel_progress.append_log(f"  Warning RT charts: {e}", "warn")
             try:
                 self._generate_html_report(outpath, rt_summary, timeline)
                 self._panel_progress.append_log("  HTML report generated: report.html", "ok")
@@ -11325,8 +11498,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self.wb is not None:
                     self.wb.close()
                     self.wb = None
-            except Exception:
-                pass
+            except Exception as e:
+                # e.g. the .xlsx is open in Excel: the results workbook is lost.
+                self._panel_progress.append_log(f"  ERROR saving Excel file: {e}", "error")
             try:
                 self._organize_output_folder(outpath, is_live=True)
                 self._panel_progress.append_log("  RT output folder organized.", "ok")
@@ -11462,6 +11636,9 @@ class MainWindow(QtWidgets.QMainWindow):
             logfile.write(f"    · min secondary variant fraction: {_rm.get('min_secondary_frac', '?')} "
                           f"(derived per-column polymorphism threshold: {_rm.get('minor_thresh', '?')})\n")
             logfile.write(f"    · variant tolerance: {_rm.get('tolerance', '?')}\n")
+            logfile.write(f"    · variant export: quality >= {_rm.get('min_variant_reads', 10)} reads, "
+                          f">=20% of reads, 0 Ns; contamination alert at >= "
+                          f"{float(_rm.get('alert_divergence', 0.03)) * 100:.0f}% divergence\n")
             logfile.write(f"    · divergence review threshold: "
                           f"{_rm.get('divergence_review', 0.03)}\n")
         if not params.get("non_coi", False):
@@ -11840,8 +12017,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._is_live() and timeline:
                 try:
                     self._panel_live_chart.export_charts(outpath)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._panel_progress.append_log(f"  Warning RT charts: {e}", "warn")
             # Generate HTML
             try:
                 self._generate_html_report(outpath, summary, timeline)
@@ -11856,8 +12033,10 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 if self.wb is not None:
                     self.wb.close()
-            except Exception:
-                pass
+                    self.wb = None
+            except Exception as e:
+                # e.g. the .xlsx is open in Excel: the results workbook is lost.
+                self._panel_progress.append_log(f"  ERROR saving Excel file: {e}", "error")
             # Organize results folder (zips and deletes subfolders including barcodesets/)
             try:
                 self._organize_output_folder(outpath, is_live=self._is_live())
@@ -12049,47 +12228,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Sheet 3: Final barcodes (only if merged file exists)
         final_all = os.path.join(outpath, "barcodesets",
                                  "Final_all_combined_barcodes.fa") if outpath else ""
-        con200cov = getattr(self, 'con200cov', {})
         bc_info = {}   # per-sample barcode info for the Sample QC status sheet
         if sids and final_all and os.path.isfile(final_all):
             try:
-                sh3 = self.wb.add_worksheet("3.Final barcodes")
-                trans_col3 = "length check" if non_coi else "translation check"
-                headers3 = ["SpecimenID", "Number of sequences demultiplexed",
-                            "Number used for generating barcodes", "stage", "type",
-                            "length", "barcode", trans_col3, "#ambiguities"]
-                for c, h in enumerate(headers3):
-                    sh3.write(0, c, h)
-                row3 = 1
-                with open(final_all, encoding="utf-8", errors="replace") as fa_in:
-                    lines3 = fa_in.readlines()
-                for i3, j3 in enumerate(lines3):
-                    if ">" in j3:
-                        seq3   = lines3[i3 + 1].strip() if i3 + 1 < len(lines3) else ""
-                        parts3 = j3.strip().lstrip(">").split(";")
-                        smp3   = parts3[0].replace("_all.fa", "")
-                        slen3  = parts3[1] if len(parts3) > 1 else "NA"
-                        ambs3  = int(parts3[3].split("=")[1]) if len(parts3) > 3 and "=" in parts3[3] else seq3.count("N")
-                        gaps3  = int(parts3[4].split("=")[1]) if len(parts3) > 4 and "=" in parts3[4] else 0
-                        if smp3 in n90bc:
-                            stage3 = "Consensus by similarity" + (", fixed indel" if gaps3 > 0 else "")
-                        else:
-                            stage3 = "Consensus by length" + (", fixed indel" if gaps3 > 0 else "")
-                        btype3   = f"removed {gaps3} indels" if gaps3 > 0 else "correct"
-                        cov_num3 = n90cov.get(smp3, con200cov.get(smp3, "NA"))
-                        trans3   = 1 if (ambs3 == 0 and gaps3 == 0) else 0
-                        bc_info[smp3] = {"len": len(seq3), "ambs": seq3.count("N"),
-                                         "estgaps": gaps3}
-                        sh3.write(row3, 0, smp3)
-                        sh3.write(row3, 1, sids.get(smp3, "NA"))
-                        sh3.write(row3, 2, cov_num3)
-                        sh3.write(row3, 3, stage3)
-                        sh3.write(row3, 4, btype3)
-                        sh3.write(row3, 5, int(slen3) if str(slen3).isdigit() else slen3)
-                        sh3.write(row3, 6, seq3)
-                        sh3.write(row3, 7, trans3)
-                        sh3.write(row3, 8, ambs3)
-                        row3 += 1
+                bc_info = self._write_final_barcodes_sheet(final_all)
             except Exception as e:
                 self._panel_progress.append_log(
                     f"  Warning Excel stop (Hoja 3): {e}", "warn")
@@ -12738,7 +12880,16 @@ def main():
         window = MainWindow()
         window.setWindowIcon(icon)
         window.show()
-        sys.exit(app.exec_())
+        rc = app.exec_()
+        # Tear down Qt in a fixed order: left to the interpreter's shutdown,
+        # widgets and the QApplication are destroyed in arbitrary order and
+        # the process dies with an access violation, which Windows Error
+        # Reporting then holds for a few seconds before the console returns.
+        window.deleteLater()
+        del window
+        app.processEvents()
+        app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+        sys.exit(rc)
     except Exception:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"\n{'='*60}\n")

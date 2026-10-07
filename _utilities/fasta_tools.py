@@ -1067,7 +1067,9 @@ class _IdRuleWidget(QtWidgets.QWidget):
     preview line the panel fills in. Used by Append info and exact-ID grep."""
     changed = QtCore.pyqtSignal()
 
-    _SEPS = [(";", '";"  semicolon'), ("|", '"|"  pipe'), (" ", "space"), ("", "custom…")]
+    _SEPS = [("|", '"|"  pipe'), (";", '";"  semicolon'), (",", '","  comma'),
+             (" ", "␣  space"), ("	", "⇥  tab"), ("_", '"_"  underscore'),
+             ("-", '"-"  hyphen'), ("", "Custom…")]
 
     def __init__(self, parent=None, default_sep: str = ";"):
         super().__init__(parent)
@@ -1644,19 +1646,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._excel_edit.textChanged.connect(self._update_append_preview)
         al.addWidget(self._append_id_rule)
 
-        sep_row = QtWidgets.QHBoxLayout()
-        sep_row.setSpacing(12)
-        sep_row.addWidget(make_label("Field separator:", color=TEXT_SEC))
-        self._sep_group = QtWidgets.QButtonGroup(self)
-        self._sep_pipe = QtWidgets.QRadioButton('  "|"  pipe')
-        self._sep_semi = QtWidgets.QRadioButton('  ";"  semicolon')
-        self._sep_pipe.setChecked(True)
-        self._sep_group.addButton(self._sep_pipe)
-        self._sep_group.addButton(self._sep_semi)
-        sep_row.addWidget(self._sep_pipe)
-        sep_row.addWidget(self._sep_semi)
-        sep_row.addStretch()
-        al.addLayout(sep_row)
+        self._append_sep = _SeparatorPicker()
+        al.addWidget(self._append_sep)
 
         self._append_widget.hide()
         ops_layout.addWidget(self._append_widget)
@@ -2475,7 +2466,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._grep_file_note.hide()
 
         self._excel_edit.clear()
-        self._sep_pipe.setChecked(True)
+        self._append_sep.reset()
         self._append_id_rule.reset()
         self._hdr_cache.clear()
         self._excel_cache.clear()
@@ -2591,7 +2582,14 @@ class FastaToolsPanel(QtWidgets.QWidget):
             params["criteria"] = criteria
         elif operation == "append":
             params["excel_file"] = self._excel_edit.text().strip()
-            params["separator"]  = "|" if self._sep_pipe.isChecked() else ";"
+            if self._append_sep.custom_empty():
+                QtWidgets.QMessageBox.warning(
+                    self, "Append configuration",
+                    "Custom separator is empty.\n"
+                    "Please enter a separator character or choose a different option."
+                )
+                return
+            params["separator"]  = self._append_sep.separator()
             params["id_rule"]    = self._append_id_rule.rule()
         elif operation == "reformat":
             params["mode"]      = "wrap" if self._rf_radio_wrap.isChecked() else "linearize"

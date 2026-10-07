@@ -67,6 +67,8 @@ PARAM_SPECS: Dict[str, tuple] = {
     "resolve_mixed.enabled":            ("bool",),
     "resolve_mixed.min_secondary_frac": ("percent", 10, 50),
     "resolve_mixed.tolerance":          ("percent", 0, 40),
+    "resolve_mixed.min_variant_reads":  ("int", 1, 1000),
+    "resolve_mixed.alert_divergence":   ("percent", 1, 50),
 }
 
 # Parameters that change what Phase 1 (demultiplexing) actually does — i.e.

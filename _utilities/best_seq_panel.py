@@ -36,7 +36,10 @@ def read_tax_reference(path: str):
     The identifier column is the first one carrying a known ID header (Sample,
     ID, Query_name, ...), else the first column of the file. The FOUR columns
     that follow it are taken, in that order, as Order, Family, Genus and
-    Organism, whatever their own headers say.
+    Organism, whatever their own headers say — or whether there are headers
+    at all: unless the first row names a known ID header, it is also read as
+    an entry, so a file without a header row keeps its first sample (a real
+    header row becomes a harmless entry no sample is ever called).
 
     Returns (id_column_name, [4 taxonomy column names],
              {identifier: (order, family, genus, organism)}).
@@ -45,10 +48,14 @@ def read_tax_reference(path: str):
     if not headers:
         raise ValueError(f"Empty or unreadable reference file: {os.path.basename(path)}")
     id_i = 0
+    named_id = False
     for i, name in enumerate(headers):
         if str(name).strip().lower() in _REF_ID_HEADERS:
             id_i = i
+            named_id = True
             break
+    if not named_id:
+        rows = [list(headers)] + list(rows)
     if len(headers) < id_i + 5:
         raise ValueError(
             f"{os.path.basename(path)}: the identifier column "
@@ -73,7 +80,11 @@ def read_tax_reference(path: str):
             f"{os.path.basename(path)}: no identifier found in column "
             f"'{headers[id_i]}'."
         )
-    return str(headers[id_i]).strip(), tax_cols, table
+    # Without a recognised ID header the first row may be data: name the
+    # column by position rather than by what may be a sample code.
+    id_name = (str(headers[id_i]).strip() if named_id
+               else f"column {id_i + 1} (first row: '{str(headers[id_i]).strip()}')")
+    return id_name, tax_cols, table
 
 
 # ── Writing the reference taxonomy into a BLAST table ───────────────────────
@@ -184,12 +195,18 @@ def reference_match_check(samples, ref: dict) -> Tuple[str, str, int, int]:
     samples = [s for s in dict.fromkeys(samples) if s]
     if not samples or not ref:
         return "", "", 0, 0
+    fmt_warn = reference_format_warning(ref)
+    if fmt_warn:
+        return fmt_warn, RED, 0, len(samples)
     ref_lower = {k.lower() for k in ref}
     missing = [s for s in samples if s not in ref and s.lower() not in ref_lower]
     found = len(samples) - len(missing)
+    empty = reference_empty_ids(samples, ref)
+    empty_txt = (f" · {len(empty)} with empty taxonomy (e.g. {', '.join(empty[:3])})"
+                 if empty else "")
     if not missing:
-        return (f"Reference check: all {found} sample ID(s) found in the reference.",
-                GREEN, found, len(samples))
+        return (f"Reference check: all {found} sample ID(s) found in the reference"
+                f"{empty_txt}.", AMBER if empty else GREEN, found, len(samples))
 
     def norm(x):
         return _ID_SEPARATORS.sub("", x.lower())
@@ -206,7 +223,64 @@ def reference_match_check(samples, ref: dict) -> Tuple[str, str, int, int]:
                 f"separators in both")
     else:
         msg += " · not found, e.g. " + ", ".join(missing[:3])
+    msg += empty_txt
     return msg, (RED if found == 0 else AMBER), found, len(samples)
+
+
+def reference_format_warning(ref: dict) -> str:
+    """Warning when the reference does not look like ID + Order, Family,
+    Genus, Organism: taxon names carry no digits, so Order/Family/Genus
+    columns that are mostly numbers or codes mean the columns are not where
+    they should be (e.g. a lab sheet with plate / well columns after the ID).
+    "" when the layout looks right."""
+    values = [v for tax in ref.values() for v in tax[:3] if v]
+    if not values:
+        return ("Reference check: the Order / Family / Genus columns are empty — "
+                "the 4 columns after the identifier must hold Order, Family, Genus "
+                "and Organism.")
+    n_digit = sum(1 for v in values if any(ch.isdigit() for ch in v))
+    if n_digit / len(values) > 0.5:
+        example = next(iter(ref.values()))
+        return ("Reference check: the columns after the identifier look like numbers "
+                f"or codes, not taxa (e.g. {' / '.join(x for x in example if x)}) — "
+                "the identifier must be followed by Order, Family, Genus and Organism.")
+    return ""
+
+
+def reference_empty_ids(samples, ref: dict) -> List[str]:
+    """Samples found in the reference but with all four taxonomy cells empty:
+    they get no expected taxonomy, so none of their hits can be judged."""
+    ref_lower = {k.lower(): v for k, v in ref.items()}
+    out = []
+    for s in dict.fromkeys(samples):
+        tax = lookup_tax(s, ref, ref_lower) if s else None
+        if tax is not None and not any(tax):
+            out.append(s)
+    return out
+
+
+def reference_report_lines(samples, ref: dict, unknown=None, limit: int = 50) -> List[str]:
+    """Run-log lines naming the samples a run cannot judge taxonomically:
+    absent from the reference, present with empty taxonomy, plus a layout
+    warning. [] when everything is in order."""
+    lines = []
+    warn = reference_format_warning(ref)
+    if warn:
+        lines += ["", "  " + warn]
+    if unknown is None:
+        ref_lower = {k.lower() for k in ref}
+        unknown = [s for s in dict.fromkeys(samples)
+                   if s and s not in ref and s.lower() not in ref_lower]
+    for title, ids in (("Samples missing from the reference (no expected taxonomy):",
+                        sorted(unknown)),
+                       ("Samples in the reference with empty taxonomy:",
+                        reference_empty_ids(samples, ref))):
+        if ids:
+            lines += ["", f"  {title} {len(ids)}"]
+            lines += [f"    {x}" for x in ids[:limit]]
+            if len(ids) > limit:
+                lines.append(f"    … {len(ids) - limit} more")
+    return lines
 
 
 def lookup_tax(sample: str, ref: dict, ref_lower: dict):
@@ -1679,10 +1753,20 @@ class _BestSeqWorker(QtCore.QThread):
     (Query_Order / Query_Family / Query_Genus / Query_organism, which must be
     present on every hit row) with the classification of the subject.
 
-    The selected sequences are written to three FASTA files: '_all', and a split
-    of it into '_identified' (best hit concordant at some rank) and
-    '_no_tax_hit' (no rank matched). The split is decided by taxonomy alone —
-    being identical in every run makes a consensus reproducible, not identified.
+    A secondary variant only replaces its sample's barcode when the top hit of
+    the variant reaches a deeper taxonomic level than the top hit of the
+    barcode. Otherwise both identify the same taxon and the bit-score gap is
+    noise (a variant 1-2 bases away from the barcode), so the barcode is kept.
+
+    The selected sequences are written to '_all', split by why they are or are
+    not identified: '_identified' (best hit concordant at some rank),
+    '_no_blast_hit' (BLAST found nothing similar: no hit, or only hits shorter
+    than the minimum alignment) and '_tax_mismatch' (good hits that contradict
+    the expected taxonomy). A sequence with hits but no expected taxonomy to
+    compare them with (sample missing from the reference, or empty there) also
+    goes to '_tax_mismatch', flagged 'no_query_taxonomy' in the report. The
+    split is decided by taxonomy alone — being identical in every run makes a
+    consensus reproducible, not identified.
     """
 
     statusUpdated   = QtCore.pyqtSignal(str, str)   # (slot_key, text)
@@ -2140,17 +2224,20 @@ class _BestSeqWorker(QtCore.QThread):
                     + (f" · {len(unknown)} sample(s) not in the reference"
                        if unknown else "")
                 )
+            _fmt = reference_format_warning(ref_table)
+            if _fmt:
+                self.statusUpdated.emit("files", "Warning     │ " + _fmt)
             if all_unknown:
                 self.statusUpdated.emit(
                     "files",
                     f"Reference   │ Query taxonomy written · {len(all_unknown)} "
                     f"sample(s) not found in the reference"
                 )
-                ref_lines += ["", "    Samples missing from the reference:"]
-                for sample in sorted(all_unknown)[:50]:
-                    ref_lines.append(f"      {sample}")
-                if len(all_unknown) > 50:
-                    ref_lines.append(f"      … {len(all_unknown) - 50} more")
+            if all_unknown or _fmt:
+                # Empty-taxonomy samples are listed once the run's samples
+                # are known (after loading, below).
+                ref_lines += reference_report_lines([], ref_table,
+                                                    unknown=all_unknown)
             else:
                 self.statusUpdated.emit(
                     "files",
@@ -2213,10 +2300,15 @@ class _BestSeqWorker(QtCore.QThread):
                 hits = blast.get(qkey, [])
                 qtax = query_tax.get(qkey, _EMPTY_TAX)
                 best_hit, level = self._evaluate(hits, qtax)
+                # Level of the TOP hit (highest bit score), used to decide
+                # whether a secondary variant really beats the barcode.
+                top_level = (concordance_level(max(hits, key=lambda h: h["bit"]), qtax)
+                             if hits else "none")
                 candidates.setdefault(info["sample"], []).append({
                     "file": label, "header": header, "seq": seq, "info": info,
                     "n_hits": len(hits), "n_hits_raw": raw_counts.get(qkey, 0),
                     "qtax": qtax, "best_hit": best_hit, "level": level,
+                    "top_level": top_level,
                 })
             self._emit_progress(0.5 * (i + 1) / n_files)
 
@@ -2233,19 +2325,30 @@ class _BestSeqWorker(QtCore.QThread):
             f"Loaded      │ {n_files} runs · {total_seqs} sequences · "
             f"{len(candidates)} samples"
         )
+        if ref_path:
+            _empty = reference_empty_ids(list(candidates), ref_table)
+            if _empty:
+                ref_lines += ["", f"  Samples in the reference with empty taxonomy: {len(_empty)}"]
+                ref_lines += [f"    {x}" for x in _empty[:50]]
+                self.statusUpdated.emit(
+                    "files", f"Warning     │ {len(_empty)} sample(s) with empty taxonomy "
+                             f"in the reference (e.g. {', '.join(_empty[:3])})")
 
         # ── Output files ──
         tsv_path = os.path.join(output_dir, f"bestseq-{mydate}.tsv")
         fa_all   = os.path.join(output_dir, f"bestseq-{mydate}_all.fasta")
         fa_id    = os.path.join(output_dir, f"bestseq-{mydate}_identified.fasta")
-        fa_noid  = os.path.join(output_dir, f"bestseq-{mydate}_no_tax_hit.fasta")
+        fa_nohit = os.path.join(output_dir, f"bestseq-{mydate}_no_blast_hit.fasta")
+        fa_mism  = os.path.join(output_dir, f"bestseq-{mydate}_tax_mismatch.fasta")
 
         n_samples   = len(candidates)
         n_identical = 0
         n_selected  = 0
         n_single    = 0
         n_one_run   = 0
-        n_written   = {"all": 0, "identified": 0, "no_tax": 0}
+        n_written   = {"all": 0, "identified": 0, "no_blast_hit": 0,
+                       "below_min_aln": 0, "tax_mismatch": 0, "no_query_tax": 0}
+        n_variant_overruled = 0   # variants that won on score with no taxonomic gain
         level_counts = {lvl: 0 for lvl in TAX_LEVELS}
         flag_counts: Dict[str, int] = {}
 
@@ -2253,7 +2356,8 @@ class _BestSeqWorker(QtCore.QThread):
             fh_tsv   = open(tsv_path, "w", encoding="utf-8")
             fh_all   = open(fa_all,   "w", encoding="utf-8")
             fh_id    = open(fa_id,    "w", encoding="utf-8")
-            fh_noid  = open(fa_noid,  "w", encoding="utf-8")
+            fh_nohit = open(fa_nohit, "w", encoding="utf-8")
+            fh_mism  = open(fa_mism,  "w", encoding="utf-8")
         except PermissionError as e:
             self.taskError.emit(f"Could not write output files (locked/permission denied):\n{e}")
             return
@@ -2281,6 +2385,18 @@ class _BestSeqWorker(QtCore.QThread):
                                           -(c["info"]["length"] or 0),
                                           -(c["info"]["reads"] or 0),
                                           c["file"]))
+                # A secondary variant only beats the barcode with a real
+                # taxonomic gain: its top hit must reach a deeper level than
+                # the top hit of the best barcode candidate. Otherwise both
+                # point to the same taxon and the score gap is noise.
+                if is_variant_header(cands[0]["header"]):
+                    bc = next((c for c in cands if not is_variant_header(c["header"])),
+                              None)
+                    if bc is not None and (self.TAX_BONUS[cands[0]["top_level"]]
+                                           <= self.TAX_BONUS[bc["top_level"]]):
+                        cands.remove(bc)
+                        cands.insert(0, bc)
+                        n_variant_overruled += 1
                 best      = cands[0]
                 runner_up = cands[1] if len(cands) > 1 else None
 
@@ -2369,15 +2485,27 @@ class _BestSeqWorker(QtCore.QThread):
                 # sequence identical in every run is a reproducible consensus,
                 # not a verified identification, so it only reaches
                 # '_identified' if its hits actually match the expected taxonomy.
+                # Not identified is split by WHY: BLAST found nothing similar
+                # (no hit / only short hits) vs. similar sequences of another
+                # taxon (contamination / mislabelling candidate).
                 record = ">%s\n%s\n" % (best["header"], best["seq"])
                 fh_all.write(record)
                 n_written["all"] += 1
                 if best["level"] != "none":
                     fh_id.write(record)
                     n_written["identified"] += 1
+                elif best["n_hits"] == 0:
+                    fh_nohit.write(record)
+                    n_written["no_blast_hit"] += 1
+                    if best["n_hits_raw"]:
+                        n_written["below_min_aln"] += 1
                 else:
-                    fh_noid.write(record)
-                    n_written["no_tax"] += 1
+                    # Includes hits with no expected taxonomy to compare with
+                    # (flag no_query_taxonomy): not identified, for review.
+                    fh_mism.write(record)
+                    n_written["tax_mismatch"] += 1
+                    if not any(best["qtax"].values()):
+                        n_written["no_query_tax"] += 1
 
                 self._emit_progress(0.5 + 0.5 * done / n_samples)
                 if done % 25 == 0 or done == n_samples:
@@ -2389,7 +2517,7 @@ class _BestSeqWorker(QtCore.QThread):
                         f"{n_identical} identical · {n_selected} decided by BLAST"
                     )
         finally:
-            for fh in (fh_tsv, fh_all, fh_id, fh_noid):
+            for fh in (fh_tsv, fh_all, fh_id, fh_nohit, fh_mism):
                 try:
                     fh.close()
                 except Exception:
@@ -2420,7 +2548,11 @@ class _BestSeqWorker(QtCore.QThread):
         kept = "sequences" if n_files == 1 else "best sequences"
         result_msg = (
             f"{status_str}   │ {n_written['all']} {kept} · "
-            f"{n_written['identified']} identified · {n_written['no_tax']} without taxonomic hit"
+            f"{n_written['identified']} identified · "
+            f"{n_written['no_blast_hit']} no BLAST hit · "
+            f"{n_written['tax_mismatch']} taxonomic mismatch"
+            + (f" ({n_written['no_query_tax']} without expected taxonomy)"
+               if n_written["no_query_tax"] else "")
         )
         self.statusUpdated.emit("result", result_msg)
 
@@ -2472,6 +2604,8 @@ class _BestSeqWorker(QtCore.QThread):
             f"        + {bit_weight:g} x (bit score of that hit, normalised within the sample)",
             f"        - {amb_penalty:g} x ambs  -  {gap_penalty:g} x estgaps",
             "  Ties are broken by longer sequence, then more reads, then file name.",
+            "  A secondary variant replaces the barcode only if its top hit reaches a",
+            "  deeper taxonomic level than the barcode's top hit.",
             "",
             "Results:",
             f"  Samples                  : {n_samples}",
@@ -2480,6 +2614,18 @@ class _BestSeqWorker(QtCore.QThread):
             *([] if n_files == 1 else
               [f"  Found in one run only    : {n_one_run}",
                f"  Resolved by score        : {n_selected}"]),
+            "",
+            f"  Variants overruled       : {n_variant_overruled}"
+            "  (won on score, same taxonomic level as the barcode)",
+            "",
+            "  Classification of the selected sequences:",
+            f"    identified          : {n_written['identified']}",
+            f"    no BLAST hit        : {n_written['no_blast_hit']}"
+            f"  (no hit at all: {n_written['no_blast_hit'] - n_written['below_min_aln']}"
+            f" · only hits below the minimum alignment: {n_written['below_min_aln']})",
+            f"    taxonomic mismatch  : {n_written['tax_mismatch']}"
+            + (f"  (of which {n_written['no_query_tax']} without expected taxonomy:"
+               f" flag no_query_taxonomy)" if n_written["no_query_tax"] else ""),
             "",
             "  Taxonomic level reached by the selected sequence:",
         ]
@@ -2502,15 +2648,22 @@ class _BestSeqWorker(QtCore.QThread):
             f"  Report XLSX              : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
             f"  All best sequences       : {os.path.basename(fa_all)}  ({n_written['all']} seqs)",
             f"  Taxonomically identified : {os.path.basename(fa_id)}  ({n_written['identified']} seqs)",
-            f"  Without taxonomic hit    : {os.path.basename(fa_noid)}  ({n_written['no_tax']} seqs)",
+            f"  No BLAST hit             : {os.path.basename(fa_nohit)}  ({n_written['no_blast_hit']} seqs)",
+            f"  Taxonomic mismatch       : {os.path.basename(fa_mism)}  ({n_written['tax_mismatch']} seqs)",
             "",
-            "NOTE: the two subsets split strictly on taxonomic concordance and together",
-            "      add up to the '_all' file. '_identified' holds only the sequences whose",
-            "      best hit matched the expected taxonomy at some rank; '_no_tax_hit' holds",
-            "      the rest. A sequence identical in every run is a reproducible consensus,",
-            "      not a verified identification: without a taxonomic hit it goes to",
-            "      '_no_tax_hit' like any other. Use the 'Decision' column of the report to",
-            "      tell those apart from the ones that also disagreed between runs.",
+            "NOTE: the subsets split strictly on taxonomic concordance and together add",
+            "      up to the '_all' file. '_identified' holds the sequences whose best hit",
+            "      matched the expected taxonomy at some rank. '_no_blast_hit' holds those",
+            "      for which BLAST found nothing similar in the database (no hit, or only",
+            "      short local hits below the minimum alignment): an unknown or poorly",
+            "      represented taxon, or a non-target / low-quality sequence.",
+            "      '_tax_mismatch' holds those with good hits of another taxon, and those",
+            "      with hits but no expected taxonomy to compare with (flag",
+            "      no_query_taxonomy: complete the reference). A sequence",
+            "      identical in every run is a reproducible consensus, not a verified",
+            "      identification: without a taxonomic hit it is split like any other.",
+            "      Use the 'Decision' column of the report to tell those apart from the",
+            "      ones that also disagreed between runs.",
             "",
             "      Review 'tax_mismatch' first: those samples have good BLAST hits that",
             "      contradict the expected taxonomy, which is what a contamination, an",

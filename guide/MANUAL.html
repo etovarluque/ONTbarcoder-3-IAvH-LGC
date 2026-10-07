@@ -510,14 +510,51 @@ markers. Off by default.</p>
           higher = lumps more reads together. Applied as a percentage of the sites
           found, so its effect grows with the number of variants present — see
           <a href="#manyvariants">Tuning for specimens with many variants</a>.</td></tr>
+  <tr><td><b>Min. reads per exported variant</b></td><td>10</td><td>1 … 1000</td>
+      <td>Reads a secondary variant needs to be exported as a <b>quality variant</b>
+          (see <a href="#varexport">Which variants are exported</a>). An ONT consensus
+          built from fewer reads keeps residual errors. Lower it for shallow runs.</td></tr>
+  <tr><td><b>Contamination alert divergence (%)</b></td><td>3</td><td>1 … 50</td>
+      <td>Divergence from the dominant barcode at which a secondary variant is treated as
+          a possible contaminant or paralog: it is exported as an <b>alert</b> even with
+          weak support, and the sample is flagged <b>NEEDS REVIEW</b>.</td></tr>
 </table>
+
+<h4 id="varexport">Which variants are exported</h4>
+<p>Most secondary variants sit within a few bases of the dominant barcode: intra-specific
+or intra-genomic variation (e.g. the many rDNA copies of ITS) that does not change the
+identification. Exporting all of them buries the few that matter, so each secondary is
+assigned a tier:</p>
+<table>
+  <tr><th>Tier</th><th>Criteria</th><th>Destination</th></tr>
+  <tr><td><b>Alert</b> (contaminant / paralog)</td>
+      <td>divergence ≥ alert divergence, ≥ 10% of the reads, ≥ 5 reads, ≤ 2 Ns</td>
+      <td><code>secondary_variants.fa</code> with <code>tier=alert</code>; sample flagged
+          NEEDS REVIEW. Never capped.</td></tr>
+  <tr><td><b>Quality variant</b></td>
+      <td>below the alert divergence, ≥ 20% of the reads, ≥ min. reads per exported
+          variant, 0 Ns (and, for a coding marker, translates)</td>
+      <td><code>secondary_variants.fa</code> with <code>tier=quality</code> (at most 3 per
+          sample, most abundant first).</td></tr>
+  <tr><td><b>Trace</b></td>
+      <td>divergence ≥ alert divergence but weaker support</td>
+      <td>Not exported (too few reads for a reliable sequence); listed in the run log as a
+          possible trace contamination.</td></tr>
+  <tr><td>Not exported</td><td>close to the dominant and weakly supported</td>
+      <td>Counted in the log; still listed in the variants sheet.</td></tr>
+</table>
+<p>The divergence is checked first, so a divergent variant is always an alert however
+well supported it is. The <b>Export tier</b> column of the <b>Intra-sample variants</b>
+sheet gives the tier of every cluster. Alerts below the <i>Min. secondary variant
+fraction</i> are only seen if that fraction is lowered (e.g. to 10%), since weaker
+clusters are not detected at all.</p>
 
 <h4>Mixture triage — how a flagged sample is interpreted</h4>
 <p>Finding two haplotypes is not the same as finding a contamination. Three built-in rules
 separate a real, actionable mixture from ordinary within-species variation and from noise:</p>
 <table>
   <tr><th>Rule</th><th>Threshold</th><th>What it means</th></tr>
-  <tr><td><b>Dominant↔secondary divergence</b></td><td>≥ 3% → <b>NEEDS REVIEW</b></td>
+  <tr><td><b>Dominant↔secondary divergence</b></td><td>≥ alert divergence (3%) → <b>NEEDS REVIEW</b></td>
       <td>The genetic distance between the kept (dominant) haplotype and each secondary
           one is computed per cluster (IUPAC-aware). At or above 3% the two templates are
           at heterospecific level — a cross-contamination or sample-mix candidate — and the
@@ -604,17 +641,15 @@ thumb, aim for at least <code>30 / fraction</code> reads per specimen: ~300 read
 <h5>4. Built-in caps you cannot reach from the GUI</h5>
 <table>
   <tr><th>Cap</th><th>Value</th><th>Effect</th></tr>
-  <tr><td>Variants recovered per specimen</td><td>3</td>
-      <td>Only the 3 most abundant secondary variants are re-processed (2a re-consensus +
-          Phase 3) and added to <code>secondary_variants.fa</code> as <code>type=corrected</code>
-          records. The rest are still written there as <code>type=raw</code> only, and the
-          count left out is reported in the <b>Variants beyond cap (not recovered)</b>
-          column of the variants sheet.</td></tr>
-  <tr><td>Ambiguities per secondary variant</td><td>&lt; 5 Ns</td>
-      <td>A secondary consensus with 5 or more Ns is dropped from
-          <code>secondary_variants.fa</code> and from recovery, to keep the file
-          informative. A corrected version that ends up with more than 10 Ns (deletions
-          are filled with N) is discarded; its <code>type=raw</code> record is kept.</td></tr>
+  <tr><td>Quality variants per specimen</td><td>3</td>
+      <td>At most the 3 most abundant quality variants are exported; alerts are never
+          capped. Every exported variant is also re-processed (Phase 3) and added to
+          <code>secondary_variants.fa</code> as a <code>type=corrected</code> record next to
+          its <code>type=raw</code> one.</td></tr>
+  <tr><td>Ambiguities per exported variant</td><td>0 Ns (quality) · ≤ 2 Ns (alert)</td>
+      <td>See <a href="#varexport">Which variants are exported</a>. A corrected version
+          that ends up with more than 10 Ns (deletions are filled with N) is discarded;
+          its <code>type=raw</code> record is kept.</td></tr>
   <tr><td>Linked polymorphic columns</td><td>≥ 2</td>
       <td>Single-SNP variants are never reported (anti-hotspot guard, above).</td></tr>
   <tr><td>Reads per cluster</td><td>≥ 3</td>
@@ -1329,7 +1364,16 @@ so the reference check (§13.3) already sees the loaded files while you set it u
       the normalized single-line form actually sent to NCBI — so its headers are exactly the
       <code>Query_name</code> values of the results table. It is written before the first
       query, so it survives a run stopped half way.</li>
-  <li>Sequences that were queried but returned <b>no hit</b> are collected in
+  <li><b>Final retry and taxonomy check.</b> When every batch is done, the sequences that
+      got no hit, or whose batch failed, are searched <b>once more</b> in a batch of their
+      own &mdash; an empty answer from NCBI can be transient. Then every hit row is checked:
+      a hit always has an accession, and every accession has an organism and a lineage in
+      NCBI, so a row without them is a failed lookup. Their organism and lineage are fetched
+      again (including negatives cached by earlier runs) and the rows rewritten. The run log
+      reports how many sequences the retry rescued and how many rows were repaired; a row
+      that still cannot be resolved keeps its six taxonomy columns, with
+      <code>Not_found_in_Taxonomy</code> in <code>Subject_Kingdom</code>.</li>
+  <li>Sequences that still returned <b>no hit</b> after the retry are collected in
       <code>nohit_seqs_&lt;ts&gt;.fa</code>, ready to be re-run against another database.
       Sequences of batches that failed or were never processed go instead to
       <code>missing_seqs_&lt;ts&gt;.fa</code> — including a batch whose search finished
@@ -1543,16 +1587,50 @@ column), Best Sequence (§14.1) and BOLD Formatter (§15, the <code>Query ID</co
 column).</p>
 
 <h4>The Tax_level_match column</h4>
-<p>When a run has <b>both</b> sides of the taxonomy — hit taxonomy from "Fetch organism +
-taxonomy" (<code>Subject_Order</code>/<code>Family</code>/<code>Genus</code>/<code>organism</code>)
-and expected taxonomy from the reference file above (<code>Query_Order</code>/<code>Family</code>/
-<code>Genus</code>/<code>organism</code>) &mdash; the table gains one more column at its right
-end, <code>Tax_level_match</code>, recording the deepest rank at which the two agree:
-<code>organism</code>, <code>genus</code>, <code>family</code>, <code>order</code>, or
-<code>none</code>. This is the same rule Best Sequence's own <code>Tax_level</code> column
-(§14.2) uses to judge a hit, so a BLAST table already shows whether a hit taxonomically
-supports the sample without waiting for Best Sequence to run. If either side of the taxonomy
-is missing, no column is added.</p>
+<p><code>Tax_level_match</code> answers one question for each hit: <b>does the database
+sequence that was hit belong to the taxon you assigned to the specimen, and down to which
+rank?</b> It compares, rank by rank, two classifications that sit on the same row:</p>
+<ul>
+  <li>the <b>hit's</b> classification, <code>Subject_Order</code> / <code>Family</code> /
+      <code>Genus</code> / <code>organism</code> (from NCBI Taxonomy, with "Fetch organism +
+      taxonomy"), and</li>
+  <li><b>your</b> expected classification of the specimen, <code>Query_Order</code> /
+      <code>Family</code> / <code>Genus</code> / <code>organism</code> (from the reference file
+      above).</li>
+</ul>
+<p>The value is <b>not</b> a yes/no nor a percentage: it is the <b>deepest taxonomic rank at
+which both classifications agree</b>. Read it as "the hit confirms the identification down
+to&hellip;":</p>
+<table>
+  <tr><th>Value</th><th>Meaning</th><th>Example (your specimen: <i>Weinmannia pubescens</i>, Cunoniaceae)</th></tr>
+  <tr><td><code>organism</code></td><td>Same species &mdash; the hit confirms the identification fully.</td>
+      <td>hit <i>Weinmannia pubescens</i></td></tr>
+  <tr><td><code>genus</code></td><td>Same genus, different (or unnamed) species.</td>
+      <td>hit <i>Weinmannia reticulata</i></td></tr>
+  <tr><td><code>family</code></td><td>Same family, different genus.</td>
+      <td>hit <i>Cunonia capensis</i></td></tr>
+  <tr><td><code>order</code></td><td>Same order only &mdash; weak support.</td>
+      <td>hit <i>Elaeocarpus</i> sp. (Elaeocarpaceae, Oxalidales)</td></tr>
+  <tr><td><code>none</code></td><td>The two classifications share <b>no</b> rank, not even the
+      order: the hit belongs to another lineage. This is <b>not</b> missing data &mdash; it is
+      the result that most needs review.</td>
+      <td>hit <i>Piper</i> sp. (Piperales)</td></tr>
+</table>
+<p>How the rank is found: the ranks are checked from the deepest (species) to the highest
+(order), and the first one on which both sides carry the same name is reported. Names are
+compared ignoring case, and NCBI's underscores count as spaces
+(<code>Weinmannia_pubescens</code> = <i>Weinmannia pubescens</i>). The species rank counts
+only when <b>both</b> sides name an actual species, by genus and epithet: <i>Weinmannia</i>
+sp., <i>Weinmannia</i> sp. ABC123 or a bare genus never make an <code>organism</code> match,
+and authors after the epithet are ignored. Qualifiers such as cf., aff. or nr. are dropped,
+so <i>Weinmannia</i> cf. <i>pubescens</i> matches <i>Weinmannia pubescens</i>; write the
+genus in full, an abbreviated <i>W. pubescens</i> does not match. A rank left empty in your
+reference cannot match, so fill in every rank you know. A hit is evaluated on its own; whether the
+<i>specimen</i> is identified is decided over all its hits by Best Sequence, whose
+<code>Tax_level</code> column (§14.2) applies exactly the same rule to the best supporting
+hit. The column is added at the right end of the table only when the run has <b>both</b>
+sides of the taxonomy; if either is missing there is nothing to compare and no column is
+added.</p>
 
 <h3>13.4 Fixing or adding query taxonomy after a run</h3>
 <p>The <b>Apply reference taxonomy to a results file&hellip;</b> link, under the checkbox in
@@ -1572,6 +1650,55 @@ taxonomy. Running it more than once on the same table is safe: a rematch reuses 
 <code>Tax_level_match</code> column instead of adding another one.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
+<h3 id="blastcols">13.5 Reading the BLAST results table</h3>
+<p>Each row of the results table (<code>.tsv</code> / <code>.xlsx</code>) is <b>one hit</b> of
+one query sequence; a query has up to <i>Hits per sequence</i> rows, ranked by bit score.
+The column names follow the BLAST convention:</p>
+<ul>
+  <li><b>Query</b> = <b>your</b> sequence (the consensus you submitted) and, in the
+      <code>Query_*</code> taxonomy columns, the classification <b>you</b> assigned to the
+      specimen &mdash; the expected identification, taken from the reference file (§13.3).
+      It is the same on every hit row of a query.</li>
+  <li><b>Subject</b> = the <b>database sequence that was hit</b> and, in the
+      <code>Subject_*</code> taxonomy columns, the classification of that hit as stored in
+      the NCBI Taxonomy &mdash; what BLAST says the sequence resembles.</li>
+</ul>
+<p>Comparing the two sides tells you whether the hit supports the identification:
+<code>Tax_level_match</code> records the deepest rank at which they agree.</p>
+<table>
+  <tr><th>Column</th><th>Meaning</th></tr>
+  <tr><td><code>Hit_rank</code></td><td>Position of the hit for this query (1 = best bit score).</td></tr>
+  <tr><td><code>Query_name</code></td><td>FASTA header of your sequence, with spaces replaced by <code>_</code>.</td></tr>
+  <tr><td><code>Subject_accession.ver</code></td><td>GenBank accession (and version) of the database sequence hit.</td></tr>
+  <tr><td><code>P_identity</code></td><td>Percentage of identical bases over the aligned region.</td></tr>
+  <tr><td><code>Alignment_length</code></td><td>Length of the aligned region (bp). Compare it with the length of your
+      sequence: a high identity over a short alignment only covers part of the barcode.</td></tr>
+  <tr><td><code>Num_mismatches</code> / <code>Gap_opens</code></td><td>Mismatched positions and gaps opened in the alignment.</td></tr>
+  <tr><td><code>Query_start</code> / <code>Query_end</code></td><td>Aligned region on <b>your</b> sequence.</td></tr>
+  <tr><td><code>Subject_start</code> / <code>Subject_end</code></td><td>Aligned region on the <b>database</b> sequence
+      (start &gt; end means the hit is on the reverse strand).</td></tr>
+  <tr><td><code>Evalue</code></td><td>Expected number of hits this good by chance; the lower, the more significant.</td></tr>
+  <tr><td><code>Bit_score</code></td><td>Alignment score, independent of the database size; the basis of the ranking.</td></tr>
+  <tr><td><code>Subject_Kingdom</code> &hellip; <code>Subject_organism</code></td><td>Taxonomy of the <b>hit</b>
+      (Kingdom, Class, Order, Family, Genus, organism) from the NCBI Taxonomy. Only with
+      <i>Fetch organism + taxonomy</i>.</td></tr>
+  <tr><td><code>Query_Order</code> &hellip; <code>Query_organism</code></td><td><b>Your</b> expected taxonomy of the
+      specimen (Order, Family, Genus, organism), from the reference file. Empty when no
+      reference was given.</td></tr>
+  <tr><td><code>Tax_level_match</code></td><td>"The hit confirms your identification down to&hellip;":
+      the deepest rank at which the hit's classification (<code>Subject_*</code>) and yours
+      (<code>Query_*</code>) agree &mdash; <code>organism</code>, <code>genus</code>,
+      <code>family</code>, <code>order</code>, or <code>none</code> when they share no rank
+      (a disagreement, not missing data). Only when both sides are present. Details and
+      examples in §13.3.</td></tr>
+</table>
+<div class="tip">
+<code>Tax_level_match = none</code> with a high <code>P_identity</code> over a long alignment is the
+pattern to review first: BLAST is confident the sequence belongs to <b>another</b> taxon than
+the one you assigned &mdash; a contamination, an index hop or a mislabelled voucher. A low identity
+or a short alignment instead means the database simply holds nothing close to your specimen.
+</div>
+
 <h2 id="util-best">14. Utility — Best Sequence</h2>
 <p>When the same library is processed several times with different parameters, each run
 recovers a slightly different set of consensus sequences — and, for the samples recovered
@@ -1595,7 +1722,7 @@ arbiter. Open it from <b>Best Sequence</b> in the sidebar, just below <b>BLAST</
 <b>Select best sequences →</b> with two or more.</p>
 <div class="tip">
 The single-run mode is the quick way to triage one BLAST run: it produces the same report
-and the same <code>_identified</code> / <code>_no_tax_hit</code> split, so you can pull out
+and the same <code>_identified</code> / <code>_no_blast_hit</code> / <code>_tax_mismatch</code> split, so you can pull out
 the sequences with a taxonomic match — and spot the <code>tax_mismatch</code> ones — without
 having to process the library twice.
 </div>
@@ -1658,7 +1785,14 @@ the comparison starts, from that one list.</p>
       first column of the file when none of those is present.</li>
   <li>The <b>four columns following it</b> are read, in that order, as <b>Order, Family,
       Genus and Organism</b> &mdash; whatever their own headers say. Anything further to the
-      right is ignored.</li>
+      right is ignored. Headers are optional: unless the first row names one of the
+      identifier headers above, it is read as a sample too, so a file without a header row
+      keeps its first sample.</li>
+  <li>The layout is checked: if the columns after the identifier hold mostly numbers or
+      codes instead of taxon names (e.g. a lab sheet with plate and well columns after the
+      ID), a red warning says the reference is not in the expected layout. Samples present
+      in the reference but with all four ranks empty are listed too, since none of their
+      hits can be judged.</li>
   <li>Matching is exact first, then case-insensitive. A sample absent from the reference
       gets empty ranks (flagged <code>no_query_taxonomy</code>), and every such sample is
       listed in the run log. The <a href="#ref-check">reference check</a> (§13.3) reports,
@@ -1778,9 +1912,17 @@ by default, or a folder you pick):</p>
   <tr><td><code>bestseq-&lt;ts&gt;_identified.fasta</code></td>
       <td>Sequences whose best hit matched the expected taxonomy at <b>some</b> rank
           (species, genus, family or order).</td></tr>
-  <tr><td><code>bestseq-&lt;ts&gt;_no_tax_hit.fasta</code></td>
-      <td>Sequences whose hits matched <b>no</b> taxonomic rank — the ones that need
-          manual review.</td></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;_no_blast_hit.fasta</code></td>
+      <td>Sequences for which BLAST found <b>nothing similar</b> in the database: no hit
+          at all, or only short local hits below the minimum alignment. An unknown or
+          poorly represented taxon, or a non-target / low-quality sequence.</td></tr>
+  <tr><td><code>bestseq-&lt;ts&gt;_tax_mismatch.fasta</code></td>
+      <td>Sequences with good hits that <b>contradict</b> the expected taxonomy — what a
+          contamination, an index hop or a mislabelled voucher looks like. Review these
+          first. Sequences with hits but <b>no expected taxonomy</b> to compare with (sample
+          missing from the reference, or with empty ranks) also land here, flagged
+          <code>no_query_taxonomy</code> in the report, so they never silently leave the
+          identified set &mdash; complete the reference and run again.</td></tr>
   <tr><td><code>bestseq-&lt;ts&gt;.tsv</code> / <code>.xlsx</code></td>
       <td>Decision report, one row per sample (see below).</td></tr>
   <tr><td><code>bestseq_run_log_&lt;ts&gt;.txt</code></td>
@@ -1789,17 +1931,18 @@ by default, or a folder you pick):</p>
 </table>
 <div class="note">
 <b>FASTA format</b>
-All three FASTA files keep the <b>original header verbatim</b> — nothing is appended — and
+All the FASTA files keep the <b>original header verbatim</b> — nothing is appended — and
 write each sequence on a <b>single line</b>, so they drop straight into any downstream
-tool. The two subsets are disjoint and together add up to <code>_all</code>.
+tool. The subsets are disjoint and together add up to <code>_all</code>; the run log and
+the status line report how many sequences fell in each.
 </div>
 <div class="warn">
 <b>Reproducible is not the same as identified</b>
 The split is decided by <b>taxonomy alone</b>. A sample whose sequence came out identical in
 every run has a reproducible consensus, but that says nothing about whether it is the right
 organism — the same wrong template amplified under every parameter set is still wrong. If
-its hits match no taxonomic rank it goes to <code>_no_tax_hit</code> like any other, and
-must be reviewed. Use the <b>Decision</b> column of the report to tell those apart from the
+its hits match no taxonomic rank it goes to <code>_no_blast_hit</code> or
+<code>_tax_mismatch</code> like any other, and must be reviewed. Use the <b>Decision</b> column of the report to tell those apart from the
 samples that also disagreed between runs.
 </div>
 
