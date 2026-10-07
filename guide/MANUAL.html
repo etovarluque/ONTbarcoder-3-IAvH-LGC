@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.6.5 — User Manual</title>
+<title>ONTbarcoder 3.7.0 — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -113,7 +113,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.6.5 — User Manual</span>
+    <span class="ver">v3.7.0 — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -1004,10 +1004,19 @@ against a curated reference.</p>
   <tr><td><b>Only in reference</b></td>
       <td>(Versus-a-reference mode.) The ID exists in the reference file but in none of
           the compared files.</td></tr>
-  <tr><td><b>No reference</b></td>
+  <tr><td><b>Not in reference</b></td>
       <td>(Versus-a-reference mode.) The opposite case: the ID exists in a compared file
           but is absent from the reference file itself.</td></tr>
+  <tr><td><b>Unique</b></td>
+      <td>(All-vs-all mode.) The ID was found in one file only.</td></tr>
 </table>
+<p>The same legend is shown under the result summary once a comparison finishes.</p>
+<p><b>Ignore length differences at the ends</b> (in <i>Comparison mode</i>) compares only
+the region two barcodes share: when one is a trimmed version of the other (e.g. with and
+without primers), the extra bases at its ends are not counted as differences. Real
+differences inside the shared region are still reported, and the length difference keeps
+appearing in the <code>Length</code> column. Barcodes trimmed on opposite sides (one longer
+at the 5′ end, the other at the 3′ end) still count as different.</p>
 <p>Reverse-complement matches are detected and flagged <code>[RC]</code>. Outputs include a
 colour-coded <code>summary.xlsx</code> plus per-category FASTA files
 (<code>identical.fa</code>, <code>compatible_iupac.fa</code>, <code>different.fa</code>,
@@ -1019,10 +1028,13 @@ the header (<code>ambs=</code>, second field); when a header lacks them — e.g.
 the sequence itself. If an output cannot be written (typically <code>summary.xlsx</code>
 open in Excel), a warning lists the affected files; close them and run the comparison
 again.</p>
-<p>Load the files first: the <b>Sample ID extraction</b> settings sit below the file area
-and preview the ID extracted from a real header of the loaded files.</p>
-<p>An output folder picked with <b>Change…</b> is used as is; only without one does the panel
-ask where to save. If the ID extraction maps two records of the same file to one ID, the one
+<p>Load the files first: the <b>Sample ID extraction</b> box sits below the file area,
+previews the ID extracted from a real header and, below it, summarizes how the IDs match
+across <i>all</i> loaded files before anything runs — the IDs found per file, repeated IDs,
+headers without the delimiter (in orange) and how many IDs the files share (in
+versus-a-reference mode: how many reference IDs appear in the other files). <i>No IDs in
+common</i> (in red) means the delimiter or occurrence does not fit these headers.</p>
+<p>The output folder is asked for when the comparison starts. If the ID extraction maps two records of the same file to one ID, the one
 with the best quality is kept and the summary line warns (<i>Repeated IDs merged</i>, with
 the count per file; also in the <code>Repeated_IDs</code> column of the <b>Runs</b> sheet) —
 usually a sign that the extraction pattern is too broad. A file that cannot be read stops
@@ -1068,19 +1080,23 @@ keeps the ID short by giving each file a one-letter <b>alias</b> instead:</p>
 <p>Compare needs a consistent specimen ID to match records across files; headers rarely
 agree on format, so the panel offers two ways to derive one:</p>
 <ul>
-  <li><b>Delimiter mode (default).</b> Choose an ID delimiter (<code>;</code> by default —
-      matching ONTbarcoder's own FASTA headers, e.g.
-      <code>&gt;Cnt1_all.fa;745;22;ambs=2;estgaps=0</code> — plus <code>_</code>,
-      <code>|</code>, space, <code>.</code>, <code>-</code>, or a custom one) and which
-      occurrence to split before (1st … 5th) — this generalizes the old "split at
-      <code>_all.fa</code>" behavior. An <b>"any of these"</b> checkbox treats the
-      delimiter string as a set of individual characters rather than a literal
-      substring.</li>
+  <li><b>Delimiter mode (default).</b> Choose an ID delimiter from the list
+      (<code>;</code> by default — matching ONTbarcoder's own FASTA headers, e.g.
+      <code>&gt;Cnt1_all.fa;745;22;ambs=2;estgaps=0</code> — plus <code>|</code>,
+      <code>_</code>, <code>-</code>, <code>.</code>, <code>,</code> and space) or
+      <b>Custom…</b>, which enables a box for any text, several characters included
+      (e.g. <code>_all.fa</code>). Then pick which occurrence to split before
+      (1st … 5th). A header with fewer delimiters than that occurrence counts as
+      <i>without the delimiter</i>: its ID falls back to the text before the first
+      <code>;</code>, and the match summary reports it.</li>
   <li><b>Advanced (Regex) mode.</b> Supply one or more regex patterns, tried in order
       until one matches the header. Optional ID normalization can lowercase IDs, strip
       leading zeros, or strip a further regex from the extracted ID — useful when the
       same specimen is written <code>BEE001</code> in one file and <code>bee_001</code>
-      in another.</li>
+      in another. Advanced also holds <b>Delimiter is a set of characters</b>: a Custom
+      delimiter such as <code>_-</code> then cuts at whichever of its characters comes
+      first, so <code>BIOUG00045_all.fa</code> and <code>BIOUG00045-all.fa</code> both
+      give <code>BIOUG00045</code>.</li>
 </ul>
 <div class="tip">
 <b>Comparing coding vs. non-coding barcode lengths</b>
@@ -1088,7 +1104,9 @@ Compare aligns globally (edlib), so barcodes of very different lengths — e.g. 
 non-coding CytB barcode (with its stop codon and 3′ tail) against a trimmed coding-region
 barcode — can score as "Different" purely on length. <b>FASTA Tools → Trim to coding
 ORF</b> (§11) trims a non-coding FASTA down to its longest clean open reading frame,
-making it length-comparable before you load it into Compare.
+making it length-comparable before you load it into Compare. When one barcode is simply a
+trimmed version of the other, <b>Ignore length differences at the ends</b> is the quicker
+alternative.
 </div>
 
 <h2 id="util-tools">11. Utility — FASTA Tools</h2>
@@ -1097,8 +1115,9 @@ processing</b> to treat them as a single dataset, or process each file individua
 
 <figure class="">
   <img src="images/util-tools.png" alt="FASTA Tools utility">
-  <figcaption><b>Figure 8.</b> The FASTA Tools utility, here with the <b>Split FASTA
-  file</b> operation selected.</figcaption>
+  <figcaption><b>Figure 8.</b> The FASTA Tools utility, here with <b>Extract sequences → By
+  header fields</b>: one criterion by key name (<code>ambs = 0</code>) and one by position,
+  combined with OR.</figcaption>
 </figure>
 <table>
   <tr><th>Operation</th><th>Description</th></tr>
@@ -1135,23 +1154,35 @@ processing</b> to treat them as a single dataset, or process each file individua
           The invertebrate mitochondrial code (stops TAA, TAG) is a subset of the
           vertebrate one (TAA, TAG, AGA, AGG), so it is the conservative choice for files
           mixing vertebrates and invertebrates.</td></tr>
-  <tr><td><b>Extract unique sequences</b></td><td>Collapse duplicate sequences to a single
-      representative.</td></tr>
-  <tr><td><b>Extract identical sequences (duplicates)</b></td>
-      <td>Output the sequences that occur more than once, plus a
-          <code>_duplicate_groups.xlsx</code> grouping IDs by shared sequence.</td></tr>
-  <tr><td><b>Extract by pattern (grep)</b></td><td>Keep sequences whose headers match a
-      pattern; the pattern can be typed directly, loaded from a file (one pattern per
-      line), and optionally treated as a regex. By default a pattern is searched as text
-      anywhere in the header, so <code>DNS-1</code> also selects <code>DNS-10</code>,
-      <code>DNS-11</code>…; for a list of IDs turn on <b>Match whole ID</b> (switched on
-      automatically when patterns are loaded from a file), which compares each pattern
-      with the sequence ID taken as described below.</td></tr>
-  <tr><td><b>Filter sequences by header fields</b></td>
-      <td>Split headers by a separator and add one or more field-based criteria (by
-          field index, using <code>=</code>, <code>!=</code>, <code>&gt;</code>,
-          <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>contains</code>
-          or <code>not contains</code>) to keep only matching records.</td></tr>
+  <tr><td><b>Extract sequences</b></td>
+      <td>Keep a subset of the sequences, in one of four ways chosen below the option:
+          <ul>
+            <li><b>Unique sequences</b> — collapse duplicate sequences to a single
+                representative.</li>
+            <li><b>Identical sequences (duplicates)</b> — output the sequences that occur
+                more than once, plus a <code>_duplicate_groups.xlsx</code> grouping IDs by
+                shared sequence.</li>
+            <li><b>By pattern (grep)</b> — keep sequences whose headers match a pattern;
+                the pattern can be typed directly, loaded from a file (one pattern per
+                line), and optionally treated as a regex. By default a pattern is searched
+                as text anywhere in the header, so <code>DNS-1</code> also selects
+                <code>DNS-10</code>, <code>DNS-11</code>…; for a list of IDs turn on
+                <b>Match whole ID</b> (switched on automatically when patterns are loaded
+                from a file), which compares each pattern with the sequence ID taken as
+                described below. <b>Ignore case</b> makes plain text, regex and whole-ID
+                matching case-insensitive (<code>dns-1</code> finds
+                <code>DNS-1</code>).</li>
+            <li><b>By header fields</b> — split headers by a separator and add one or more
+                criteria (<code>=</code>, <code>!=</code>, <code>&gt;</code>,
+                <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>,
+                <code>contains</code>, <code>not contains</code>; text comparisons ignore
+                case). Each criterion picks its field by <b>Position</b> (the Nth field) or
+                by <b>Key name</b> for <code>key=value</code> fields (e.g.
+                <code>ambs</code>), found wherever it sits in the header — robust when
+                files differ in structure. <b>Combine criteria with</b> AND (all must
+                match) or OR (any can match). A header that does not contain the
+                separator has no fields and fails its criteria.</li>
+          </ul></td></tr>
   <tr><td><b>Append info to headers from .xlsx</b></td>
       <td>Enrich headers with metadata from a spreadsheet (<code>.xlsx</code>): column 1 =
           sequence ID, columns 2+ = fields appended to the header with the chosen
@@ -1182,12 +1213,20 @@ processing</b> to treat them as a single dataset, or process each file individua
           <b>By total length</b> — consecutive files of at most <i>N</i> bases
           (1&nbsp;000&nbsp;000 is NCBI's limit per blastn query; a single longer sequence
           gets a file of its own);
-          <b>By header field</b> — one file per distinct value of a header field, named
-          after it (e.g. one file per sample or species). Unlike <b>Extract</b> or
-          <b>Filter</b>, which write one file with the sequences matching a value you
-          type, this needs no values and leaves no sequence out: headers without the
-          field go to <code>&lt;name&gt;_no_field.fasta</code>.</td></tr>
+          <b>By header field</b> — one file per distinct value of a header field (by
+          position or key name, as in Extract), named after it (e.g. one file per sample
+          or species). Unlike <b>Extract</b>, which writes one file with the sequences
+          matching a value you type, this needs no values and leaves no sequence out:
+          headers without the field go to <code>&lt;name&gt;_no_field.fasta</code>. The
+          preview counts the files it would write; <b>Run</b> stays disabled when no
+          header has the chosen separator or field, and more than 100 files ask for
+          confirmation. File names keep only letters, digits, <code>.</code> and
+          <code>-</code>.</td></tr>
 </table>
+<p><b>Field separators.</b> Filter, Sort and Split share one drop-down: <code>|</code>,
+<code>;</code>, <code>,</code>, space, tab, <code>_</code>, <code>-</code> or
+<b>Custom…</b>, whose box is enabled only when chosen (Sort also offers <i>None (whole
+header)</i>). The field box never goes beyond the number of fields the headers have.</p>
 
 <h4>Matching sequence IDs (Append info · Match whole ID)</h4>
 <p>Both operations need the ID of each sequence: the header text before the first
@@ -1273,6 +1312,8 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
   <figcaption><b>Figure 10.</b> BLAST API Search: batch submission and taxonomy options;
   <b>Resume run…</b> next to <b>Run BLAST</b> continues a stopped run.</figcaption>
 </figure>
+<p>As in every panel, the file area comes first and the <b>BLAST Settings</b> box below it,
+so the reference check (§13.3) already sees the loaded files while you set it up.</p>
 <ul>
   <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> &mdash; recommended,
       <code>blastn</code>, or <code>megablast</code>), target database (<code>core_nt</code>,
@@ -1489,6 +1530,17 @@ ID already matches the reference file's identifier exactly. A match is tried on 
 typed first, then case-insensitively; a sample ID not found in the reference is left blank
 rather than guessed, and is counted in the run's result message so mismatches are visible
 immediately rather than discovered later as empty <code>Query_*</code> columns.</p>
+<p id="ref-check"><b>Reference check.</b> As soon as the reference file and the input are
+both loaded, a line under the file reports how many sample IDs of the input the reference
+knows — in green when all are found, amber when only some are, red when none is. When IDs are
+missing only because of the separators used (e.g. <code>DNS-1343</code> in the data and
+<code>DNS_1343</code> in the reference), it says so with an example, since that is the usual
+cause. The check runs again when the input, the suffix or the reference change, and a run
+whose input matches <i>no</i> reference ID asks for confirmation first. It is the same check
+in every panel that takes a reference file: both BLAST tabs (input FASTA files or Hit
+Tables), the <b>Apply reference taxonomy</b> dialog (the table's <code>Query_name</code>
+column), Best Sequence (§14.1) and BOLD Formatter (§15, the <code>Query ID</code>
+column).</p>
 
 <h4>The Tax_level_match column</h4>
 <p>When a run has <b>both</b> sides of the taxonomy — hit taxonomy from "Fetch organism +
@@ -1539,6 +1591,8 @@ arbiter. Open it from <b>Best Sequence</b> in the sidebar, just below <b>BLAST</
           taxonomy and which do not. <code>Decision</code> reads
           <code>single_run</code> for every row.</td></tr>
 </table>
+<p>The run button follows the mode: <b>Classify sequences →</b> with one pair,
+<b>Select best sequences →</b> with two or more.</p>
 <div class="tip">
 The single-run mode is the quick way to triage one BLAST run: it produces the same report
 and the same <code>_identified</code> / <code>_no_tax_hit</code> split, so you can pull out
@@ -1548,8 +1602,9 @@ having to process the library twice.
 
 <figure class="">
   <img src="images/util-best.png" alt="Best Sequence utility">
-  <figcaption><b>Figure 12.</b> The Best Sequence utility: paired FASTA + BLAST inputs and
-  the scoring settings.</figcaption>
+  <figcaption><b>Figure 12.</b> The Best Sequence utility: one FASTA + BLAST pair (single-run
+  classification), with how many of its sequences the table holds and the sample-ID
+  preview next to the suffix.</figcaption>
 </figure>
 
 <h3>14.1 Input — one FASTA + one BLAST table per run</h3>
@@ -1565,8 +1620,15 @@ without a name match (e.g. a <code>blastfile-&lt;ts&gt;.tsv</code> from <b>BLAST
 results</b>), they are paired anyway; with more files, rename them to share a base name.</p>
 <p>One pair is enough (classification mode); two or more enable the comparison, with no
 upper limit. BLAST tables may be <code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>. Each row of the drop zone shows
-the pair, its sequence count and whether the table passed validation; a FASTA with no
-matching table (or a table with no matching FASTA) is listed in red and ignored.</p>
+the pair, its sequence count, <b>how many of those sequences the table holds</b> (its
+<code>Query_name</code> values must equal the FASTA headers) and whether the table passed
+validation; a FASTA with no matching table (or a table with no matching FASTA) is listed in
+red and ignored. A pair whose table holds <i>none</i> of the FASTA's sequences blocks the
+run — it usually means the table belongs to another FASTA — and headers missing from a table
+are listed in the run log, since those sequences get no hits.</p>
+<p>The file area sits at the top of the panel and the <b>Selection Settings</b> below it. The
+amber note about the required <code>Query_*</code> columns appears only while a loaded table
+lacks them and no usable reference file is set.</p>
 
 <div class="warn">
 <b>Required columns — expected taxonomy of the query</b>
@@ -1598,8 +1660,10 @@ the comparison starts, from that one list.</p>
       Genus and Organism</b> &mdash; whatever their own headers say. Anything further to the
       right is ignored.</li>
   <li>Matching is exact first, then case-insensitive. A sample absent from the reference
-      gets empty ranks (it can then only be flagged <code>tax_mismatch</code>), and every
-      such sample is listed in the run log.</li>
+      gets empty ranks (flagged <code>no_query_taxonomy</code>), and every such sample is
+      listed in the run log. The <a href="#ref-check">reference check</a> (§13.3) reports,
+      before running, how many sample IDs of the FASTA files the reference knows, and points
+      out IDs that differ only in their separators.</li>
   <li>The tables are <b>modified in place</b>: existing <code>Query_*</code> columns are
       overwritten with the reference values, and the missing ones are appended at the right
       end, leaving the rest of the table untouched. Close the tables in Excel before running
@@ -1633,9 +1697,11 @@ sequence is kept as it is and only its taxonomic level is computed. The scoring 
 only when there is more than one candidate to compare.</p>
 <ol>
   <li><b>Identical sequences are taken as they are.</b> If a sample's sequence is
-      byte-identical in every run where it appears, there is nothing to decide — it is
-      kept and flagged <code>identical_in_all_runs</code> (or
-      <code>identical_in_available_runs</code> when the sample is missing from some run).</li>
+      identical in every run where it appears (upper and lower case alike), there is nothing
+      to decide — it is kept as <code>identical_in_all_runs</code> (or
+      <code>identical_in_available_runs</code> when the sample is missing from some run). A
+      sample recovered in only one run has nothing to be identical to and is kept as
+      <code>only_one_run</code>.</li>
   <li><b>The rest are scored with their BLAST hits.</b> For each candidate the panel finds
       the hit that matches the expected taxonomy at the deepest rank, and computes:
       <pre>score = taxonomic bonus of that hit          (species 400 · genus 300 · family 200 · order 100 · none 0)
@@ -1670,7 +1736,8 @@ BOLD Formatter (§15).</p>
           marker and reference database.</td></tr>
   <tr><td>Strip suffix from sample ID</td><td><code>_all.fa</code></td>
       <td>Removed from the sample ID read out of the header. Clear it if your headers do
-          not carry a suffix.</td></tr>
+          not carry a suffix. A preview next to the field shows the first header of the
+          loaded FASTA and the sample it is grouped under.</td></tr>
 </table>
 
 <h4>Fixed scoring weights</h4>
@@ -1781,6 +1848,9 @@ rank was left blank in the input.</p>
       <td>The sample came out byte-identical in every run: no decision was needed.</td></tr>
   <tr><td><code>identical_in_available_runs</code></td>
       <td>Identical wherever it appeared, but the sample is missing from some run.</td></tr>
+  <tr><td><code>only_one_run</code></td>
+      <td>The sample was recovered in a single run (of two or more): kept, but not counted
+          as identical across runs.</td></tr>
   <tr><td><code>resolved_by_score</code></td>
       <td>The runs disagreed and the module had to arbitrate. These are the rows worth
           auditing; they are shown in bold in the workbook.</td></tr>
@@ -1801,6 +1871,11 @@ situation from BLAST returning nothing.</p>
           rank. The evidence is good and points somewhere else.</td>
       <td><b>Review first.</b> This is what contamination, an index hop or a mislabelled
           voucher looks like — especially at high identity.</td></tr>
+  <tr><td><code>no_query_taxonomy</code></td>
+      <td>Hits exist, but the sample has no expected taxonomy (its <code>Query_*</code>
+          columns are empty — e.g. it is missing from the reference file).</td>
+      <td>Not a mismatch: add the sample to the reference (check the
+          <a href="#ref-check">reference check</a>) and run again.</td></tr>
   <tr><td><code>low_taxonomic_support</code></td>
       <td>The best hit matches only at <b>order</b> level.</td>
       <td>Weak but consistent: usually a species with no close relative in the database.</td></tr>
@@ -1837,6 +1912,9 @@ supplied in the <code>Query_*</code> columns and whether the reference database 
 covers the group: an under-represented lineage can leave the true match absent, and the
 best available hit then lands in a different family.
 </div>
+<p>When the run ends, a <b>Review</b> line in the panel log counts the flags worth a manual
+look (e.g. <code>Review │ 3 tax_mismatch · 5 near_tie (see the Flag column)</code>), most
+important first.</p>
 <div class="tip">
 Filter the <code>.xlsx</code> by <b>Decision</b> = <code>resolved_by_score</code> to review
 only the samples where the runs disagreed and the module had to arbitrate; those rows are
@@ -1880,7 +1958,13 @@ choice is recorded in the log.</p>
           "Hits per sequence" setting in <a href="#util-blast">BLAST</a>. Default 5.</td></tr>
   <tr><td><b>Keep all hits</b></td>
       <td>Ignores the limit above and keeps every hit of every query.</td></tr>
+  <tr><td><b>Reference file with the query taxonomy</b></td>
+      <td>Optional, the same control as in BLAST (§13.3): adds the <code>Query_*</code>
+          columns and <code>Tax_level_match</code> to every row, keyed by the sample ID of
+          <code>Query ID</code>. The <a href="#ref-check">reference check</a> reports how many
+          Query IDs the reference knows as soon as both files are loaded.</td></tr>
 </table>
+<p>All three options sit in the <b>Options</b> box below the input file.</p>
 
 <h4>15.3 Output and colour coding</h4>
 <p>The formatted copy is written as <code>&lt;input name&gt;_formatted.xlsx</code> to the
@@ -1956,13 +2040,17 @@ notes are ordinary text files:</p>
 e.g. several <i>Main consensus calling frequency</i> / <i>Min. secondary variant
 fraction</i> / <i>Variant tolerance</i> values — instead of changing them by hand in
 <a href="#params">Parameters</a> and pressing <b>Run</b> again each time. It sits in the
-sidebar right below <b>Parameters</b>, shown in italics and locked until a dataset is
-loaded, to signal that it is optional rather than a required step of the workflow.
-Not available in Real-Time mode.</p>
+sidebar right below <b>Parameters</b>, shown in italics to signal that it is optional rather
+than a required step of the workflow. Starting a sweep needs a dataset loaded in Conventional
+mode; the additional tools at the bottom of the panel (§17.4, §17.6, §17.7) work on existing
+run folders and need none. In Real-Time mode an amber note says sweeps are Conventional-only
+and <b>Start sweep</b> / <b>Resume sweep…</b> are disabled.</p>
 
 <figure class="">
   <img src="images/util-batch.png" alt="Parameter Sweep utility">
-  <figcaption><b>Figure 15.</b> The Parameter Sweep utility.</figcaption>
+  <figcaption><b>Figure 15.</b> The Parameter Sweep utility with the shipped grid template
+  loaded: summary line, warnings and the table of combinations; <b>Resume sweep…</b> and
+  <b>Start sweep</b> in the footer.</figcaption>
 </figure>
 
 <h4>17.1 The <code>.cfg</code> grid file</h4>
@@ -1973,10 +2061,12 @@ parameters only needs 3 lines, not a copy of every setting:</p>
 <pre>consfreqfixed                    = 0.30, 0.35, 0.40, 0.45, 0.50
 resolve_mixed.min_secondary_frac = 20, 15, 10
 resolve_mixed.tolerance          = 10, 9, 8, 7, 6, 5</pre>
-<p>Click <b>Create example cfg (grid)</b> in the panel to save a copy of
-<code>_profiles/ontbarcoder_batch.cfg</code> (the save dialog opens in <code>_profiles/</code>
-as <code>my_batch.cfg</code>, so the shipped template is never overwritten; <b>Load batch
-config…</b> opens there too) — a fully commented template listing
+<p>Open <b>Config file format</b> in the panel and click <b>Create example (grid)</b> to save a
+copy of <code>_profiles/ontbarcoder_batch.cfg</code> (the save dialog opens in
+<code>_profiles/</code> as <code>my_batch.cfg</code>, so the shipped template is never
+overwritten; <b>Browse…</b> opens there too). The panel then offers to load it and open it in
+your text editor; edits saved there are picked up when the sweep starts. It is a fully
+commented template listing
 <i>every</i> sweepable parameter with its default, valid range and an example value
 list, ready to uncomment and edit. Percent fields (<i>Min. secondary variant
 fraction</i>, <i>Variant tolerance</i>) are written on the same 0–100 scale as their
@@ -2006,7 +2096,7 @@ out-of-range values are rejected before anything runs), and everything downstrea
 run numbering, <code>batch_run_summary.tsv</code>, the deduplicated FASTA — works
 the same regardless of which shape produced the combinations. <code>sweep_config.log</code>
 records the combination list directly instead of a per-key value list in this case.</p>
-<p>Click <b>Create example cfg (combo list)</b> in the panel to write out
+<p><b>Create example (combo list)</b>, next to it, writes out
 <code>_profiles/ontbarcoder_batch_combos.cfg</code> — kept as a separate file from the
 grid template above rather than a second section inside it, since the two shapes are
 mutually exclusive per batch and mixing both examples in one file invites copying the
@@ -2015,11 +2105,25 @@ replace with whichever ones you actually want to re-run — e.g. the run numbers
 coverage analysis (§17.6) singled out from a previous grid sweep.</p>
 
 <h4>17.2 Validation</h4>
-<p>The file is checked as soon as it is loaded — before anything runs:</p>
+<p>The file is checked as soon as it is loaded — before anything runs. The panel then shows a
+one-line summary (<i>90 combination(s) · 4 parameter(s), grid · Phase 1 (demultiplexing)
+runs: 1</i>), any warnings in an amber box, and a table with one row per combination and one
+column per swept parameter (in a combo list, a parameter a line does not set shows
+<i>(panel)</i>: it keeps the Parameters-panel value).</p>
 <ul>
   <li>Every key must be a recognised parameter name (a typo is rejected immediately,
       naming the offending line) and every value must fall inside that parameter's
-      valid range, the same bounds enforced by its GUI spinbox.</li>
+      valid range, the same bounds enforced by its GUI spinbox. A key listed twice — two
+      lines of a grid, or twice in one combination — is an error that names both lines,
+      instead of one silently replacing the other.</li>
+  <li>Combinations that repeat an earlier one (e.g. <code>0.3, 0.30</code>, or the same line
+      twice) are reported — <i>#9 = #1</i> — since they would only re-run the same analysis.
+      They are not removed, so a resumed sweep keeps its numbering.</li>
+  <li>A swept key that cannot change the result with the current Parameters panel is
+      reported: <code>coverage2b</code> with phase 2b off, or
+      <code>coverage2b</code> / <code>run_phase2b</code> / <code>run_phase3</code> /
+      <code>gencode</code> with the Non-Coding marker on. The warnings are refreshed every
+      time the panel is opened, since the Parameters panel may have changed.</li>
   <li><b>Non-Coding marker</b> (<code>non_coi</code>) cannot be swept: it decides the
       genetic code and which phases exist, so set it in the Parameters panel — the
       batch inherits whatever is checked there.</li>
@@ -2027,7 +2131,8 @@ coverage analysis (§17.6) singled out from a previous grid sweep.</p>
       tolerance) turns <b>Detect intra-sample sequence variants</b>
       (<a href="#params">§6.1</a>) <i>on</i> for the whole batch, even if the
       Parameters checkbox is unchecked — otherwise every combination would be
-      identical. This is logged in the panel so it is never a silent surprise.</li>
+      identical. The panel says so as soon as the file is loaded, so it is never a silent
+      surprise.</li>
   <li>A batch of more than 15 combinations shows a warning in the panel (each one is a
       full analysis); above 200 the app asks for confirmation before starting anything.</li>
 </ul>
@@ -2036,8 +2141,10 @@ coverage analysis (§17.6) singled out from a previous grid sweep.</p>
 <ol>
   <li>Load a dataset and set every parameter you want to keep <b>fixed</b> as usual, in
       <a href="#inputs">Input files</a> and <a href="#params">Parameters</a>.</li>
-  <li>Open <b>Parameter Sweep</b>, click <b>Load sweep config…</b> and pick the
-      <code>.cfg</code>. The panel shows the combination count before you commit.</li>
+  <li>Open <b>Parameter Sweep</b> and drop the <code>.cfg</code> on the <b>Sweep config</b>
+      field (or click <b>Browse…</b>); <b>✕</b> clears it. The panel shows the summary,
+      warnings and combinations before you commit. While <b>Start sweep</b> is disabled, the
+      text next to it says why (no dataset, no config, Real-Time mode).</li>
   <li>Click <b>Start sweep</b>. Each combination runs as an ordinary
       <code>ont-barcoder_*_conv</code> folder under <code>output/</code>, with its own
       self-documenting log recording the exact parameters used — indistinguishable from
@@ -2078,7 +2185,10 @@ with consensus-calling ones benefits from listing the demultiplex parameters
 <i>first</i> in the grid <code>.cfg</code>: <code>expand_grid()</code> varies the
 <i>last</i>-listed key fastest (standard Cartesian-product order), so putting
 consensus-calling parameters last keeps the demultiplex parameters unchanged across the
-longest possible run of consecutive combinations.</p>
+longest possible run of consecutive combinations. The panel shows how many times Phase 1
+will run and, when a different order would need fewer, says so with the parameters to move
+(<i>Demultiplexing (Phase 1) will run 16 times; 2 would be enough with the demultiplexing
+parameters (minlen) listed first</i>).</p>
 <p>Each combination's log line shows its own wall-clock start time and the batch's running
 elapsed time, and its "done" line reports how long that specific combination took —
 useful for spotting which combinations were demultiplexed fresh (slower) versus reused
@@ -2086,7 +2196,8 @@ useful for spotting which combinations were demultiplexed fresh (slower) versus 
 
 <h4>17.4 Output — per-run summary and deduplicated FASTA</h4>
 <p>Once every combination finishes (or the batch is stopped), three files are written to
-the batch's own output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_batch/</code>).
+the sweep's own output folder (<code>output/ont-barcoder_&lt;timestamp&gt;_sweep/</code>;
+<code>…_batch</code> in versions before 3.7.0, still accepted everywhere).
 Runs are identified by a short <b>run number</b> (1, 2, 3…, in the order they ran) rather
 than by their timestamped folder name — the same number is used consistently across all
 three files, and keeps things readable even for a sweep of 40+ combinations:</p>
@@ -2118,9 +2229,10 @@ three files, and keeps things readable even for a sweep of 40+ combinations:</p>
       against <code>batch_run_summary.tsv</code> for its parameters.</li>
 </ul>
 <p><b>Merge existing runs.</b> The same merge also works on analyses run by hand, without a
-batch: in the <b>Merge existing runs</b> box of the Parameter Sweep panel, add two or more
-run folders (button or drag &amp; drop; a folder holding several runs, such as
-<code>output/</code>, adds every run inside it) and click <b>Merge runs</b>. The results go to
+sweep: in the <b>Merge existing runs</b> box of the Parameter Sweep panel, add two or more
+run folders (<b>Add run folder…</b> or drag &amp; drop onto the list, whose empty box says
+so; a folder holding several runs, such as <code>output/</code>, adds every run inside it)
+and click <b>Merge runs</b>. The results go to
 a new <code>output/ont-barcoder_&lt;timestamp&gt;_merge</code> folder, with
 <code>merge_run_summary.tsv</code> numbering the runs as the <code>;run&lt;N&gt;</code> tags do.
 Runs marked <code>[variants]</code> (a non-empty <code>secondary_variants.fa</code>) also feed
@@ -2154,8 +2266,11 @@ The last log line reads <i>Batch stopped — N/M combination(s) completed</i> ra
 <code>.cfg</code> (<code>batch_config.cfg</code>), the dataset and the Parameters-panel values
 it was started with (<code>batch_state.json</code>), and <code>batch_progress.tsv</code>,
 which gains one line as <i>each</i> combination completes — so it survives Stop, closing the
-app, a crash or a power cut. With the same dataset loaded, click <b>Resume sweep…</b> (next
-to <b>Load sweep config…</b>) and pick the <code>ont-barcoder_*_batch</code> folder:</p>
+app, a crash or a power cut. With the same dataset loaded, click <b>Resume sweep…</b> (in the
+footer, next to <b>Start sweep</b>): it lists the interrupted sweeps found in
+<code>output/</code>, newest first, with their progress (<i>34/90 combination(s)
+completed</i>); pick one, or choose <b>Other folder…</b> to browse to a
+<code>…_sweep</code> folder elsewhere:</p>
 <ul>
   <li>only the combinations not yet completed are run; one that was cut off mid-run is run
       again from scratch;</li>
@@ -2175,12 +2290,17 @@ have turned the batch's merged FASTA into a taxonomically-identified best-sequen
 natural question is whether the sweep was worth it: does any single combination already
 reproduce every identified sequence, or were several combinations each needed to contribute
 their own share? The <b>Coverage report (minimal combination set)</b> section of the Parameter
-Sweep panel answers this: pick the sweep folder and the Best Sequence output folder, then
-click <b>Create coverage report</b>. A <b>Merge existing runs</b> folder (<code>…_merge</code>)
-works too: the minimal set is then named by run folder and no <code>.cfg</code> is written,
-since those runs record no parameters. The same analysis runs from a command line:</p>
+Sweep panel answers this. Drop (or <b>Browse…</b> to) the sweep folder on <b>Sweep
+folder</b> and the Best Sequence output folder on <b>Best Sequence folder</b>, then click
+<b>Create coverage report</b>. Each field checks what it gets by its content, so renamed
+folders still work: the sweep folder needs its <code>batch_run_summary.tsv</code>, the Best
+Sequence folder a <code>bestseq-*_identified.fasta</code>. A <b>Merge existing runs</b>
+folder (<code>…_merge</code>) works on the sweep side too: the minimal set is then named by
+run folder and no <code>.cfg</code> is written, since those runs record no parameters. If no
+identified sequence appears in any run, the panel warns that the two folders are probably
+from different datasets. The same analysis runs from a command line:</p>
 <pre>python _utilities/batch_coverage_report.py \
-    --batch-dir "output/ont-barcoder_&lt;timestamp&gt;_batch" \
+    --batch-dir "output/ont-barcoder_&lt;timestamp&gt;_sweep" \
     --bestseq-dir "output/ont-barcoder_&lt;timestamp&gt;_bestseq"</pre>
 <p>It re-derives, by direct sequence comparison against every run folder's own
 <code>consensus_filtered.fa</code> <i>and</i> <code>secondary_variants.fa</code> (a winner can
@@ -2221,17 +2341,20 @@ files inside the folders given, so exact filenames/timestamps don't need to be t
 
 <h4>17.7 Compare two runs</h4>
 <p>A per-sample A/B report of two analyses of the same dataset — two combinations of a batch,
-or a run made with another version or by hand. The <b>Compare two runs</b> box of the panel:
-<b>Load batch…</b> lists that batch's combinations (<code>run1 (…parameters…)</code>, …) and
-<b>Add run folder…</b> adds any other analysis folder; choose <b>Run A</b> and <b>Run B</b> and
-click <b>Compare runs</b>. For every sample it reports whether each run produced a
+or a run made with another version or by hand. The <b>Compare two runs</b> box has two
+fields, <b>Run A</b> and <b>Run B</b>: drop a run folder on each (or <b>Browse…</b>). A sweep
+folder is accepted too — a list of its combinations (<code>run1 (…parameters…)</code>, …)
+then lets you pick one — so a combination can be compared with a run made by hand. Folders
+are recognised by their content (<code>consensus_filtered.fa</code>), not their name. Picking
+the same run on both sides is flagged at once and keeps <b>Compare runs</b> disabled. For
+every sample it reports whether each run produced a
 QC-compliant (<code>consensus_no_errors.fa</code>) and a filtered
 (<code>consensus_filtered.fa</code>) barcode and whether the sequence is the same, plus the
 number of secondary variants and their highest divergence, and classifies the change
 (<i>barcode only in A/B</i>, <i>barcode differs</i>, <i>variants only in A/B</i>,
 <i>variant count differs</i>). The summary goes to the panel log and the per-sample detail to
-<code>compare_runs_&lt;A&gt;_vs_&lt;B&gt;.tsv</code> — in the batch folder, or in run A's
-folder (<i>List every sample</i> includes the unchanged ones). Unlike
+<code>compare_runs_&lt;A&gt;_vs_&lt;B&gt;.tsv</code> — in the sweep folder when both runs
+come from the same sweep, otherwise in run A's folder (<i>List every sample</i> includes the unchanged ones). Unlike
 <a href="#util-compare">FASTA Compare</a> (§10), which aligns the sequences of one file per
 run, this looks at the whole result of each analysis. Same logic as the command-line
 <code>_utilities/compare_runs_report.py</code>.</p>
@@ -2337,7 +2460,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.6.5 — User Manual · Generated for the research community ·
+ONTbarcoder 3.7.0 — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 

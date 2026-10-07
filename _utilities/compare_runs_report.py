@@ -18,7 +18,7 @@ summary. No Qt/PyQt import: runnable from the command line, and used by the
 compare_runs).
 
 Usage:
-    python compare_runs_report.py --batch-dir <..._batch folder> [--runs 1 2]
+    python compare_runs_report.py --batch-dir <..._sweep folder> [--runs 1 2]
     python compare_runs_report.py --run-a <run folder> --run-b <run folder>
 Options: --label-a/--label-b, --output <file.tsv>, --all
 """

@@ -13,6 +13,8 @@ from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
 from .best_seq_panel import (
     _RefDropZone, read_tax_reference, QUERY_TAX_COLUMNS,
     sample_id_of, lookup_tax, concordance_level, display_taxon,
+    read_tax_reference_cached, reference_match_check, fasta_headers,
+    table_column, _cached,
 )
 
 
@@ -571,6 +573,23 @@ class _BlastFileDropZone(QtWidgets.QFrame):
             self._add_files(paths)
 
 
+def hit_table_queries(path: str) -> List[str]:
+    """Query IDs (first column) of an NCBI 'Hit Table' export (.txt / .csv)."""
+    def load(p):
+        out = []
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                sep = "\t" if "\t" in line else ","
+                out.append(line.split(sep, 1)[0].strip())
+        return out
+    try:
+        return _cached(path, "hitq", load)
+    except Exception:
+        return []
+
+
 class _ReferenceFileGroup:
     """The optional 'query taxonomy reference file' control: a checkbox, a
     _RefDropZone and a description/validation label, together with the
@@ -644,6 +663,9 @@ class _ReferenceFileGroup:
         self.info_label.hide()
 
         self.ok = False
+        self.found = None             # sample IDs found in the reference (None: unknown)
+        self._names_provider = None   # () -> query names to check against it
+        self.suffix_edit.textChanged.connect(lambda _t: self._describe())
         self._describe()   # seed the hint text shown before any file is set
 
     def add_to(self, form: QtWidgets.QFormLayout):
@@ -668,6 +690,16 @@ class _ReferenceFileGroup:
         """The suffix to strip from the sample ID, or '' when the checkbox is off."""
         return self.suffix_edit.text().strip() if self.checked else ""
 
+    def set_names_provider(self, provider):
+        """provider() -> the query names (FASTA headers / Query_name values)
+        of the data the reference will be applied to, for the match check."""
+        self._names_provider = provider
+        self._describe()
+
+    def refresh_check(self):
+        """Re-run the match check after the data files changed."""
+        self._describe()
+
     def _on_toggled(self, checked: bool):
         self.zone.setVisible(checked)
         self.suffix_label.setVisible(checked)
@@ -681,6 +713,7 @@ class _ReferenceFileGroup:
     def _describe(self):
         """Validate the reference file and describe how it will be read."""
         self.ok = False
+        self.found = None
         path = self.zone.path
         if not path:
             self.info_label.setText(
@@ -691,17 +724,29 @@ class _ReferenceFileGroup:
             self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
             return
         try:
-            id_col, tax_cols, table = read_tax_reference(path)
+            id_col, tax_cols, table = read_tax_reference_cached(path)
         except Exception as exc:
             self.info_label.setText(f"⚠  {exc}")
             self.info_label.setStyleSheet(f"color:{RED}; font-size:14px;")
             return
         self.ok = True
+        check = ""
+        if self.checked and self._names_provider is not None:
+            try:
+                names = self._names_provider() or []
+            except Exception:
+                names = []
+            suffix = self.suffix_edit.text().strip()
+            check, colour, found, total = reference_match_check(
+                [sample_id_of(n, suffix) for n in names], table)
+            if total:
+                self.found = found
         self.info_label.setText(
             f"{len(table):,} entries  ·  identifier: <b>{id_col}</b>  ·  "
             f"<b>{' · '.join(tax_cols)}</b> → Query_Order · Query_Family · "
             f"Query_Genus · Query_organism.<br>"
             f"These columns will be added to the results table."
+            + (f"<br><span style='color:{colour}'><b>{check}</b></span>" if check else "")
         )
         self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
 
@@ -715,6 +760,15 @@ class _ReferenceFileGroup:
                 "'I have a reference file with the query taxonomy'."
             )
             return False
+        self._describe()   # the data may have changed since the last check
+        if self.checked and self.found == 0:
+            return QtWidgets.QMessageBox.question(
+                parent, "Reference file",
+                "No sample ID of the input was found in the reference file, so "
+                "no query taxonomy would be written (see the reference check).\n\n"
+                "Continue anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes
         return True
 
     def retranslateUi(self, ctx: str):
@@ -819,6 +873,9 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         ref_form.setLabelAlignment(QtCore.Qt.AlignRight)
         ref_form.setSpacing(10)
         self._ref_group.add_to(ref_form)
+        self._ref_group.set_names_provider(
+            lambda: table_column(self._tsv_zone.path, "Query_name")
+            if self._tsv_zone.path else [])
         v.addLayout(ref_form)
 
         self._status = QtWidgets.QLabel("")
@@ -841,6 +898,7 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         v.addLayout(btns)
 
     def _on_changed(self, *_args):
+        self._ref_group.refresh_check()
         self._apply_btn.setEnabled(bool(self._tsv_zone.path))
         self._set_status("")
 
@@ -1000,15 +1058,15 @@ class BlastPanel(QtWidgets.QWidget):
     stopFileRequested  = QtCore.pyqtSignal()             # user clicked Stop (tab 2)
     sendToBestSeq      = QtCore.pyqtSignal(list)         # [fasta, results] pair of the last run
 
-    # (icon, title, subtitle) of each tab
+    # (title, subtitle) of each tab
     _TAB_TEXTS = (
-        ("🔎", "BLAST API Search", "Send your FASTA to NCBI from here"),
-        ("🌐", "BLAST web results", "Use a Hit Table downloaded from the NCBI website"),
+        ("BLAST API Search", "Send your FASTA to NCBI from here"),
+        ("BLAST web results", "Use a Hit Table downloaded from the NCBI website"),
     )
 
     def _tab_text(self, index: int, ctx: str = "BlastPanel") -> str:
-        icon, title, sub = self._TAB_TEXTS[index]
-        return f"{icon}  {_tr(ctx, title)}\n{_tr(ctx, sub)}"
+        title, sub = self._TAB_TEXTS[index]
+        return f"{_tr(ctx, title)}\n{_tr(ctx, sub)}"
 
     _DATABASES        = ["core_nt", "nt", "refseq_rna", "16S_ribosomal_RNA"]
     _PROGRAMS         = ["blastn&MEGABLAST=on", "blastn", "megablast"]
@@ -1057,7 +1115,7 @@ class BlastPanel(QtWidgets.QWidget):
 
         # ── Settings group ──
         self._settings_box = QtWidgets.QGroupBox("BLAST Settings")
-        self._settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._settings_box.setStyleSheet(group_box_style())
         sg = QtWidgets.QFormLayout(self._settings_box)
         sg.setLabelAlignment(QtCore.Qt.AlignRight)
         sg.setSpacing(10)
@@ -1213,13 +1271,17 @@ class BlastPanel(QtWidgets.QWidget):
         self._ref_group = _ReferenceFileGroup()
         self._ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._ref_group.add_to(sg)
+        self._ref_group.set_names_provider(
+            lambda: [h.replace(" ", "_")
+                     for f in self._drop.files for h in fasta_headers(f)])
 
         self._layout.addWidget(self._settings_box)
 
-        # ── Drop zone ──
+        # ── Drop zone: above the settings (load → configure → run), as in
+        # the other panels; the reference check below reads these files ──
         self._drop = MultiDropZone()
         self._drop.filesDropped.connect(self._on_files)
-        self._layout.addWidget(self._drop)
+        self._layout.insertWidget(self._layout.indexOf(self._settings_box), self._drop)
         self._layout.addStretch()   # packs content at top; log lives outside the scroll
 
         # ── Live progress display (outside scroll so it expands to fill space) ──
@@ -1265,7 +1327,7 @@ class BlastPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._reset)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
@@ -1591,7 +1653,7 @@ class BlastPanel(QtWidgets.QWidget):
         self._tax_check.setText(_tr(ctx, "Fetch organism + taxonomy"))
         self._ref_group.retranslateUi(ctx)
         self._clear_btn.setText(_tr(ctx, "Clear"))
-        self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
+        self._open_folder_btn.setText(_tr(ctx, "Open folder"))
         self._blast_btn.setText(_tr(ctx, "Run BLAST  →"))
         self._drop.retranslateUi()
 
@@ -1616,8 +1678,8 @@ class BlastPanel(QtWidgets.QWidget):
             "Uses the NCBI API key configured in the 'BLAST API Search' tab."))
         self._file_ref_group.retranslateUi(ctx)
         self._file_clear_btn.setText(_tr(ctx, "Clear"))
-        self._file_open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._file_open_results_btn.setText(_tr(ctx, "Open results  📄"))
+        self._file_open_folder_btn.setText(_tr(ctx, "Open folder"))
+        self._file_open_results_btn.setText(_tr(ctx, "Open results"))
         self._file_run_btn.setText(_tr(ctx, "Parse results  →"))
         self._file_drop.retranslateUi()
 
@@ -1629,6 +1691,7 @@ class BlastPanel(QtWidgets.QWidget):
     # ── Slots ─────────────────────────────────────────────────────────────
 
     def _on_files(self, paths):
+        self._ref_group.refresh_check()
         enabled = len(paths) >= 1
         self._blast_btn.setEnabled(enabled)
         if enabled:
@@ -1885,7 +1948,7 @@ class BlastPanel(QtWidgets.QWidget):
 
         # ── Settings group ──
         self._file_settings_box = QtWidgets.QGroupBox("BLAST File Settings")
-        self._file_settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._file_settings_box.setStyleSheet(group_box_style())
         sg = QtWidgets.QFormLayout(self._file_settings_box)
         sg.setLabelAlignment(QtCore.Qt.AlignRight)
         sg.setSpacing(10)
@@ -1922,13 +1985,15 @@ class BlastPanel(QtWidgets.QWidget):
         self._file_ref_group = _ReferenceFileGroup()
         self._file_ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._file_ref_group.add_to(sg)
+        self._file_ref_group.set_names_provider(
+            lambda: [q for f in self._file_drop.files for q in hit_table_queries(f)])
 
         lay.addWidget(self._file_settings_box)
 
-        # ── Drop zone ──
+        # ── Drop zone: above the settings, as in tab 1 ──
         self._file_drop = _BlastFileDropZone()
         self._file_drop.filesDropped.connect(self._on_file_files)
-        lay.addWidget(self._file_drop)
+        lay.insertWidget(lay.indexOf(self._file_settings_box), self._file_drop)
         lay.addStretch()
 
         # ── Live progress display ──
@@ -1974,14 +2039,14 @@ class BlastPanel(QtWidgets.QWidget):
         self._file_clear_btn.clicked.connect(self._reset_file_tab)
         fl.addWidget(self._file_clear_btn)
 
-        self._file_open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._file_open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._file_open_folder_btn.setObjectName("secondary_btn")
         self._file_open_folder_btn.setFixedHeight(44)
         self._file_open_folder_btn.hide()
         self._file_open_folder_btn.clicked.connect(self._open_file_output_folder)
         fl.addWidget(self._file_open_folder_btn)
 
-        self._file_open_results_btn = QtWidgets.QPushButton("Open results  📄")
+        self._file_open_results_btn = QtWidgets.QPushButton("Open results")
         self._file_open_results_btn.setObjectName("secondary_btn")
         self._file_open_results_btn.setFixedHeight(44)
         self._file_open_results_btn.hide()
@@ -2027,6 +2092,7 @@ class BlastPanel(QtWidgets.QWidget):
             self._file_log.setFixedHeight(target_height)
 
     def _on_file_files(self, paths):
+        self._file_ref_group.refresh_check()
         enabled = len(paths) >= 1 and not self._file_run_locked
         self._file_run_btn.setEnabled(enabled)
         if enabled:

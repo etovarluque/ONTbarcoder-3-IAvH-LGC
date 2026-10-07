@@ -3,7 +3,7 @@ which run combinations were needed to recover the taxonomically-identified
 best sequences produced by Best Sequence Selection (best_seq_panel.py).
 
 Given:
-  - a Parameter Sweep output folder (the "..._batch" folder, containing
+  - a Parameter Sweep output folder (the "..._sweep" folder, "..._batch" in older versions, containing
     batch_run_summary.tsv, produced by batch_sweep.py), and
   - a Best Sequence Selection output folder (the "..._bestseq" folder,
     containing bestseq-<date>.tsv and bestseq-<date>_identified.fasta),
@@ -28,7 +28,7 @@ line, and used by the "Coverage report" section of the Parameter Sweep panel
 (run_coverage_report).
 
 Usage:
-    python batch_coverage_report.py --batch-dir <..._batch folder> \
+    python batch_coverage_report.py --batch-dir <..._sweep folder> \
         --bestseq-dir <..._bestseq folder> [--output report.xlsx]
 """
 from __future__ import annotations

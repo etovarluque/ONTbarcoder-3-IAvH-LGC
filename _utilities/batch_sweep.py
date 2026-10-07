@@ -156,6 +156,7 @@ def parse_sweep_config(path: str) -> Dict[str, List[str]]:
     of values within a key) is preserved, since it determines run order.
     """
     sweep: Dict[str, List[str]] = {}
+    first_line: Dict[str, int] = {}
     with open(path, "r", encoding="utf-8") as fh:
         for lineno, raw in enumerate(fh, start=1):
             line = raw.strip()
@@ -173,6 +174,12 @@ def parse_sweep_config(path: str) -> Dict[str, List[str]]:
                 raise ValueError(
                     f"{os.path.basename(path)}:{lineno}: empty key or value list"
                 )
+            if key in sweep:
+                raise ValueError(
+                    f"{os.path.basename(path)}:{lineno}: '{key}' is already listed "
+                    f"at line {first_line[key]} — put all its values on one line"
+                )
+            first_line[key] = lineno
             sweep[key] = values
     if not sweep:
         raise ValueError(f"{os.path.basename(path)}: no parameters found")
@@ -281,6 +288,11 @@ def parse_combo_list_config(path: str) -> List[Dict[str, str]]:
                 key, value = part.split("=", 1)
                 key, value = key.strip(), value.strip()
                 _cast_and_validate(key, value)  # raises with key/value context
+                if key in combo:
+                    raise ValueError(
+                        f"{os.path.basename(path)}:{lineno}: '{key}' appears twice "
+                        f"in this combination"
+                    )
                 combo[key] = value
             if not combo:
                 raise ValueError(f"{os.path.basename(path)}:{lineno}: empty combination")
@@ -315,6 +327,62 @@ def swept_keys(combos: List[Dict[str, str]]) -> set:
     for combo in combos:
         keys.update(combo.keys())
     return keys
+
+
+# ── Checks shown by the panel when a .cfg is loaded ─────────────────────
+# Informative only: they never change which combinations run or their order
+# (a resumed batch maps its progress onto combination indices).
+
+def _typed(combo: Dict[str, str], keys=None) -> tuple:
+    """Hashable, typed form of a combination (0.3 and 0.30 compare equal)."""
+    return tuple(sorted((k, _cast_and_validate(k, v)) for k, v in combo.items()
+                        if keys is None or k in keys))
+
+
+def duplicate_combos(combos: List[Dict[str, str]]) -> List[Tuple[int, int]]:
+    """[(n, first_n), ...] (1-based) for each combination that repeats an
+    earlier one — e.g. '0.3, 0.30' in a grid, or a line listed twice."""
+    seen: Dict[tuple, int] = {}
+    dups: List[Tuple[int, int]] = []
+    for n, combo in enumerate(combos, start=1):
+        key = _typed(combo)
+        if key in seen:
+            dups.append((n, seen[key]))
+        else:
+            seen[key] = n
+    return dups
+
+
+def phase1_runs(combos: List[Dict[str, str]]) -> Tuple[int, int]:
+    """(times Phase 1 will run, times it would run at best). Phase 1 is
+    reused only when a combination keeps the demultiplexing parameters of
+    the PREVIOUS one, so their order decides it: a demultiplexing key that
+    varies fastest (last line of a grid) re-runs Phase 1 every time."""
+    keys = set(PHASE1_PARAM_KEYS)
+    runs, prev, distinct = 0, None, set()
+    for combo in combos:
+        key = _typed(combo, keys)
+        distinct.add(key)
+        if key != prev:
+            runs += 1
+            prev = key
+    return runs, len(distinct)
+
+
+def ineffective_keys(keys, base_params: dict) -> List[Tuple[str, str]]:
+    """[(key, reason)] for swept keys that cannot change the result with the
+    Parameters-panel values the sweep starts from: their combinations would
+    all give the same output."""
+    out: List[Tuple[str, str]] = []
+    if base_params.get("non_coi"):
+        for k in ("run_phase2b", "run_phase3", "coverage2b", "gencode"):
+            if k in keys:
+                out.append((k, "the Non-Coding marker is on, so phases 2b/3 and "
+                               "the genetic code are not used"))
+    elif ("coverage2b" in keys and "run_phase2b" not in keys
+          and not base_params.get("run_phase2b", True)):
+        out.append(("coverage2b", "phase 2b is off in the Parameters panel"))
+    return out
 
 
 # ── Deduplication ────────────────────────────────────────────────────────

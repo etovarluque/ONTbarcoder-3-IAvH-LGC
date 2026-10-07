@@ -9,7 +9,7 @@ from .shared import _get_base_dir, _tr
 from .fasta_tools import _DragDropLineEdit
 from .best_seq_panel import (
     read_tax_reference, QUERY_TAX_COLUMNS, sample_id_of, lookup_tax,
-    concordance_level, display_taxon,
+    concordance_level, display_taxon, _cached,
 )
 from .blast_panel import _ReferenceFileGroup
 
@@ -474,7 +474,11 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._layout.addLayout(file_row)
 
         # ── Options ──
-        self._layout.addWidget(self._make_section_lbl("Options"))
+        opt_box = QtWidgets.QGroupBox("Options")
+        opt_box.setStyleSheet(group_box_style())
+        opt_layout = QtWidgets.QVBoxLayout(opt_box)
+        opt_layout.setContentsMargins(16, 16, 16, 16)
+        opt_layout.setSpacing(10)
 
         hits_row = QtWidgets.QHBoxLayout()
         hits_row.setSpacing(12)
@@ -486,12 +490,12 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._hits_spin.setFixedWidth(90)
         hits_row.addWidget(self._hits_spin)
         hits_row.addStretch()
-        self._layout.addLayout(hits_row)
+        opt_layout.addLayout(hits_row)
 
         self._keep_all_chk = QtWidgets.QCheckBox("Keep all hits (ignore the limit above)")
         self._keep_all_chk.toggled.connect(
             lambda on: (self._hits_spin.setDisabled(on), lbl_hits.setDisabled(on)))
-        self._layout.addWidget(self._keep_all_chk)
+        opt_layout.addWidget(self._keep_all_chk)
 
         # ── Optional query-taxonomy reference file (same control as BLAST) ──
         self._ref_group = _ReferenceFileGroup()
@@ -499,7 +503,9 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         ref_form = QtWidgets.QFormLayout()
         ref_form.setContentsMargins(0, 0, 0, 0)
         self._ref_group.add_to(ref_form)
-        self._layout.addLayout(ref_form)
+        self._ref_group.set_names_provider(self._query_ids)
+        opt_layout.addLayout(ref_form)
+        self._layout.addWidget(opt_box)
 
         # ── Status + progress ──
         self._status_lbl = make_label("", color=TEXT_SEC)
@@ -552,7 +558,7 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._clear)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
@@ -624,7 +630,24 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         if path:
             self._file_edit.setText(path)
 
+    def _query_ids(self) -> list:
+        """Query IDs of the BOLD table, for the reference match check."""
+        path = self._file_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            return []
+
+        def load(p):
+            headers, data = _BoldFormatWorker._load_rows(p)
+            q = headers.index(_BoldFormatWorker.QUERY_COL_NAME)
+            return [str(r[q]).strip() for _n, r in data
+                    if r[q] is not None and str(r[q]).strip()]
+        try:
+            return _cached(path, "boldq", load)
+        except Exception:
+            return []
+
     def _on_file_changed(self, text: str):
+        self._ref_group.refresh_check()
         self._set_run_enabled(bool(text.strip()))
         self._status_lbl.setText("")
         self._status_lbl.setStyleSheet("")

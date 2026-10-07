@@ -9,7 +9,7 @@ from __future__ import annotations
 # Single source of truth for the program version (MAJOR.MINOR.PATCH).
 # MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
 # PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
-__version__ = "3.6.5"
+__version__ = "3.7.0"
 # GitHub repository queried for newer releases at start-up.
 UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
 
@@ -4391,7 +4391,7 @@ class ResultsPanel(BasePanel):
         self.add_stretch()
 
         # Footer anchored below scroll area
-        self._btn_reset = QtWidgets.QPushButton("🔄   New analysis (clear and restart)")
+        self._btn_reset = QtWidgets.QPushButton("New analysis (clear and restart)")
         self._btn_reset.setObjectName("danger_btn")
         self._btn_reset.setFixedHeight(52)
         self._btn_reset.setStyleSheet(
@@ -4501,7 +4501,7 @@ class ResultsPanel(BasePanel):
         self._btn_xls.setText(_tr(ctx, "📊  Open summary"))
         self._btn_html.setText(_tr(ctx, "🌐  Open report"))
         self._btn_folder.setText(_tr(ctx, "📂  Open folder"))
-        self._btn_reset.setText(_tr(ctx, "🔄   New analysis (clear and restart)"))
+        self._btn_reset.setText(_tr(ctx, "New analysis (clear and restart)"))
         self._phase_table.setHorizontalHeaderLabels([_tr(ctx, "Per phase"), _tr(ctx, "Barcodes")])
         self._qual_table.setHorizontalHeaderLabels([_tr(ctx, "Quality"), _tr(ctx, "Seq. No.")])
         for card in (self.stat_total, self.stat_qc, self.stat_filt, self.stat_unresl):
@@ -5671,6 +5671,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_batch_sweep.stopRequested.connect(self._stop_batch_sweep)
         self._panel_batch_sweep.resumeRequested.connect(self._resume_batch_sweep)
         self._panel_batch_sweep.stopNowRequested.connect(self._stop_batch_now)
+        self._panel_batch_sweep.set_params_provider(self._panel_params.get_params)
         self._panel_results.resetRequested.connect(self._on_reset_analysis)
         self._topbar.languageChanged.connect(self._on_language_changed)
         self._topbar.aboutRequested.connect(self._show_about)
@@ -5994,6 +5995,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sidebar.unlock_item(key)
         self._panel_batch_sweep.set_dataset_loaded(True)
         self._runmode = runmode
+        self._panel_batch_sweep.set_live_mode(self._is_live())
         self._fastq = fastq
         self._demfile = demfile
         self._gencode_scan_cache = None  # rebuilt from this run's demfile
@@ -6458,7 +6460,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         program_dir = _get_base_dir()
-        self._batch_outdir = os.path.join(program_dir, "output", f"ont-barcoder_{ts}_batch")
+        self._batch_outdir = os.path.join(program_dir, "output", f"ont-barcoder_{ts}_sweep")
         os.makedirs(self._batch_outdir, exist_ok=True)
         try:
             with open(os.path.join(self._batch_outdir, "sweep_config.log"),
@@ -11719,6 +11721,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key in ("params", "progress", "results"):
             self._sidebar.lock_item(key)
         self._panel_batch_sweep.set_dataset_loaded(False)
+        self._panel_batch_sweep.set_live_mode(False)
 
         self._switch_panel("setup")
 
@@ -12247,7 +12250,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Show route in output field (internal reference)
-        self._panel_compare._outdir_edit.setText(outdir)
+        self._panel_compare.set_outdir(outdir)
 
         self._panel_compare._result_lbl.setText(_tr("ComparePanel", "Comparison in progress…"))
         self._panel_compare._comp_bar.setRange(0, 0)

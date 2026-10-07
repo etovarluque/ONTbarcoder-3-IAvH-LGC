@@ -13,6 +13,48 @@ from .shared import _get_base_dir, _tr
 # Excel caps a worksheet at 1,048,576 rows (one is the header).
 _XLSX_MAX_DATA_ROWS = 1048575
 
+# "Split by header field" asks for confirmation above this many files.
+_SPLIT_FILE_WARN = 100
+
+
+def header_field_value(header: str, sep: str, field) -> Optional[str]:
+    """Value of one header field, or None when the header does not have it.
+
+    `field` is a 1-based position (int) or the key of a "key=value" field
+    (str), found wherever it sits in the header. A "key=value" field yields
+    its value part. With a separator set, a header that does not contain it
+    has no fields at all. Shared by Filter, Split and their previews."""
+    if sep and sep not in header:
+        return None
+    parts = header.split(sep) if sep else [header]
+    if isinstance(field, str):
+        for part in parts:
+            key, eq, val = part.partition("=")
+            if eq and key.strip() == field:
+                return val.strip()
+        return None
+    if not 1 <= field <= len(parts):
+        return None
+    raw = parts[field - 1].strip()
+    return raw.split("=", 1)[1].strip() if "=" in raw else raw
+
+
+def header_keys(headers, sep: str) -> list:
+    """Keys of the "key=value" fields found in the headers, in order."""
+    keys = {}
+    for h in headers:
+        if sep and sep not in h:
+            continue
+        for part in (h.split(sep) if sep else [h]):
+            key, eq, _v = part.partition("=")
+            if eq and key.strip():
+                keys[key.strip()] = None
+    return list(keys)
+
+
+def field_label(field) -> str:
+    return f"field {field}" if isinstance(field, int) else f'key "{field}"'
+
 
 def extract_id(header: str, rule: Optional[dict] = None) -> str:
     """Sequence ID of a FASTA header (without '>') under an ID rule:
@@ -251,6 +293,7 @@ class _FastaToolsWorker(QtCore.QThread):
         pattern_file = self._params.get("pattern_file", "")
         use_regex    = self._params.get("use_regex", False)
         exact_rule   = self._params.get("exact_id")   # ID rule dict, or None
+        ignore_case  = self._params.get("ignore_case", False)
 
         patterns = []
         if pattern_file:
@@ -268,17 +311,26 @@ class _FastaToolsWorker(QtCore.QThread):
 
         mode_str = ("exact ID" if exact_rule is not None else
                     "regex" if use_regex else "plain text")
+        if ignore_case:
+            mode_str += ", ignore case"
         pat_summary = patterns[0] if len(patterns) == 1 else f"{len(patterns)} patterns from file"
 
         if exact_rule is not None:
             # Whole-ID match: "DNS-1" selects DNS-1 only, never DNS-10/DNS-11.
-            wanted = set(patterns)
+            wanted = {p.lower() for p in patterns} if ignore_case else set(patterns)
             def matches(hdr):
-                return extract_id(hdr, exact_rule) in wanted
+                sid = extract_id(hdr, exact_rule)
+                return (sid.lower() if ignore_case else sid) in wanted
         elif use_regex:
-            compiled = [re.compile(p) for p in patterns]
+            flags = re.IGNORECASE if ignore_case else 0
+            compiled = [re.compile(p, flags) for p in patterns]
             def matches(hdr):
                 return any(rx.search(hdr) for rx in compiled)
+        elif ignore_case:
+            lowered = [p.lower() for p in patterns]
+            def matches(hdr):
+                h = hdr.lower()
+                return any(p in h for p in lowered)
         else:
             def matches(hdr):
                 return any(p in hdr for p in patterns)
@@ -497,7 +549,7 @@ class _FastaToolsWorker(QtCore.QThread):
         # Operators: =, !=, >=, <=, >, <, contains, not contains
         parsed = []
         for c in criteria:
-            idx = c.get("field", 1) - 1   # 0-based
+            field = c.get("field", 1)     # 1-based position (int) or key (str)
             op  = c.get("op", "=")
             raw = c.get("value", "").strip()
             # Text operators must always compare as strings, even when the value
@@ -514,46 +566,34 @@ class _FastaToolsWorker(QtCore.QThread):
                 except ValueError:
                     val     = raw.lower()
                     numeric = False
-            parsed.append((idx, op, val, numeric))
+            parsed.append((field, op, val, numeric))
 
-        def _field_value(header, idx):
-            parts = header.split(separator) if separator else [header]
-            if idx >= len(parts):
-                return None
-            raw = parts[idx].strip()
-            # For key=value fields (e.g. "coverage=24"), return the value part.
-            if "=" in raw:
-                raw = raw.split("=", 1)[1].strip()
-            return raw
+        def _ok(header, field, op, val, numeric):
+            raw_v = header_field_value(header, separator, field)
+            if raw_v is None:
+                return False
+            if numeric:
+                try:
+                    fv = float(raw_v)
+                except ValueError:
+                    return False
+                return {">=": fv >= val, "<=": fv <= val, ">": fv > val,
+                        "<": fv < val, "=": fv == val, "!=": fv != val}[op]
+            sv = raw_v.lower()
+            return {"=": sv == val, "!=": sv != val, "contains": val in sv,
+                    "not contains": val not in sv}[op]
+
+        match_any = self._params.get("match", "all") == "any"
+        combine   = any if match_any else all
 
         def _passes(header):
-            for idx, op, val, numeric in parsed:
-                raw_v = _field_value(header, idx)
-                if raw_v is None:
-                    return False
-                if numeric:
-                    try:
-                        fv = float(raw_v)
-                    except ValueError:
-                        return False
-                    if op == ">="          and not (fv >= val): return False
-                    if op == "<="          and not (fv <= val): return False
-                    if op == ">"           and not (fv >  val): return False
-                    if op == "<"           and not (fv <  val): return False
-                    if op == "="           and not (fv == val): return False
-                    if op == "!="          and not (fv != val): return False
-                else:
-                    sv = raw_v.lower()
-                    if op == "="           and sv != val:          return False
-                    if op == "!="          and sv == val:          return False
-                    if op == "contains"    and val not in sv:      return False
-                    if op == "not contains" and val in sv:         return False
-            return True
+            return combine(_ok(header, f, op, v, num) for f, op, v, num in parsed)
 
         sep_desc  = f'"{separator}"' if separator else "none (whole header)"
-        crit_desc = "  AND  ".join(
-            f"field {i + 1} {o} {v}" for i, o, v, _ in parsed
+        crit_desc = ("  OR  " if match_any else "  AND  ").join(
+            f"{field_label(f)} {o} {v}" for f, o, v, _ in parsed
         )
+        crit_label = "Criteria (OR)" if match_any else "Criteria (AND)"
         outputs = []
         for display_name, stem, records in self._iter_inputs():
             if self._stop:
@@ -565,7 +605,7 @@ class _FastaToolsWorker(QtCore.QThread):
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Separator        :  {sep_desc}\n"
-                f"  Criteria (AND)   :  {crit_desc}\n"
+                f"  {crit_label:<17}:  {crit_desc}\n"
                 f"  Total sequences  :  {len(records)}\n"
                 f"  Passed           :  {len(matched)}\n"
                 f"  Excluded         :  {unmatched}\n"
@@ -578,7 +618,9 @@ class _FastaToolsWorker(QtCore.QThread):
         """A header field value made safe as part of a file name on Windows,
         macOS and Linux."""
         import re as _re
-        s = _re.sub(r'[<>:"/\\|?*\s]+', "_", value.strip()).strip("._")
+        # Keep letters, digits, "." and "-"; anything else (";", "=", spaces,
+        # reserved characters...) becomes "_".
+        s = _re.sub(r'[^\w.\-]+', "_", value.strip()).strip("._")
         return s[:80] or "empty"
 
     def _run_split(self):
@@ -593,24 +635,16 @@ class _FastaToolsWorker(QtCore.QThread):
         mode  = self._params.get("mode", "count")
         value = int(self._params.get("value", 1))
         separator = self._params.get("separator", "|")
-        field_idx = int(self._params.get("field", 1)) - 1
+        field = self._params.get("field", 1)    # position (int) or key (str)
 
         def _field_value(header):
-            parts = header.split(separator) if separator else [header]
-            if field_idx >= len(parts):
-                return None
-            raw = parts[field_idx].strip()
-            # For key=value fields (e.g. "sample=DNS-1"), use the value part,
-            # as Filter sequences by header fields does.
-            if "=" in raw:
-                raw = raw.split("=", 1)[1].strip()
-            return raw
+            return header_field_value(header, separator, field)
 
         mode_desc = {
             "count": f"{value} sequences per file",
             "files": f"into {value} files",
             "bases": f"at most {value:,} bases per file",
-            "field": f'one file per value of field {field_idx + 1} '
+            "field": f'one file per value of {field_label(field)} '
                      f'(separator "{separator}")',
         }[mode]
 
@@ -692,7 +726,7 @@ class _FastaToolsWorker(QtCore.QThread):
             if mode == "field":
                 missing = sum(len(r) for n, r in named_groups if n == "no_field")
                 if missing:
-                    lines.append(f"  Without field {field_idx + 1}  :  {missing} sequence(s) "
+                    lines.append(f"  Without {field_label(field)}  :  {missing} sequence(s) "
                                  f"→ {stem}_no_field.fasta")
                 shown = named_groups[:20]
                 lines.append("  Values           :  " + ", ".join(
@@ -1106,6 +1140,149 @@ class _IdRuleWidget(QtWidgets.QWidget):
         self._preview.setText(html)
 
 
+class _SeparatorPicker(QtWidgets.QWidget):
+    """Field-separator choice shared by Filter, Sort and Split: a drop-down of
+    common separators (optionally "None (whole header)"), whose last entry,
+    Custom, enables a text box."""
+    changed = QtCore.pyqtSignal()
+    _CUSTOM = "__custom__"
+
+    def __init__(self, allow_none: bool = False, stretch: bool = True, parent=None):
+        super().__init__(parent)
+        self.row = QtWidgets.QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(12)
+        self.row.addWidget(make_label("Field separator:", color=TEXT_SEC))
+        self._combo = QtWidgets.QComboBox()
+        if allow_none:
+            self._combo.addItem("None (whole header)", "")
+        for label, sep in (('"|"  pipe', "|"), ('";"  semicolon', ";"),
+                           ('","  comma', ","), ("␣  space", " "),
+                           ("⇥  tab", "\t"), ('"_"  underscore', "_"),
+                           ('"-"  hyphen', "-")):
+            self._combo.addItem(label, sep)
+        self._combo.addItem("Custom…", self._CUSTOM)
+        self._combo.setMinimumWidth(190)
+        self.row.addWidget(self._combo)
+        self._edit = QtWidgets.QLineEdit()
+        self._edit.setFixedWidth(64)
+        self._edit.setPlaceholderText("e.g. :")
+        self._edit.setMaxLength(5)
+        # Enabled (Custom chosen): white with a blue border; disabled: greyed out.
+        self._edit.setStyleSheet(
+            f"QLineEdit {{ background: white; color: {TEXT_PRI};"
+            f" border: 1.5px solid {BLUE}; border-radius: 4px; padding: 2px 4px; }}"
+            f"QLineEdit:disabled {{ background: {GRAY_BG}; color: {TEXT_HINT};"
+            f" border: 1px solid {GRAY_LINE}; }}")
+        self.row.addWidget(self._edit)
+        if stretch:
+            self.row.addStretch()
+        self._combo.currentIndexChanged.connect(self._on_choice)
+        self._edit.textChanged.connect(self.changed)
+        self.reset()
+
+    def _is_custom(self) -> bool:
+        return self._combo.currentData() == self._CUSTOM
+
+    def _on_choice(self, _i):
+        self._edit.setEnabled(self._is_custom())
+        self.changed.emit()
+
+    def separator(self) -> str:
+        """The chosen separator, the custom text (may be empty) or "" for None."""
+        return self._edit.text() if self._is_custom() else self._combo.currentData()
+
+    def custom_empty(self) -> bool:
+        return self._is_custom() and not self._edit.text()
+
+    def reset(self):
+        """First entry: "None" where allowed (Sort), otherwise the pipe."""
+        self._combo.setCurrentIndex(0)
+        self._edit.clear()
+        self._edit.setEnabled(False)
+
+
+class _FieldSelector(QtWidgets.QWidget):
+    """Picks a header field by position or, for "key=value" fields, by key
+    name (found wherever it sits in the header)."""
+    changed = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        row = QtWidgets.QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self._mode = QtWidgets.QComboBox()
+        self._mode.addItems(["Position", "Key name"])
+        self._mode.setFixedWidth(175)
+        self._mode.setToolTip(
+            "Position: the Nth field after splitting by the separator.\n"
+            "Key name: a \"key=value\" field (e.g. ambs=0), found wherever it\n"
+            "sits in the header — robust when headers differ in structure.")
+        row.addWidget(self._mode)
+        self._spin = QtWidgets.QSpinBox()
+        self._spin.setRange(1, 99)
+        self._spin.setFixedWidth(70)
+        row.addWidget(self._spin)
+        self._key = QtWidgets.QComboBox()
+        self._key.setEditable(True)
+        self._key.setFixedWidth(150)
+        self._key.lineEdit().setPlaceholderText("key, e.g. ambs")
+        self._key.hide()
+        row.addWidget(self._key)
+        self._mode.currentIndexChanged.connect(self._on_mode)
+        self._spin.valueChanged.connect(self.changed)
+        self._key.currentTextChanged.connect(self.changed)
+
+    def _on_mode(self, _i):
+        by_key = self.by_key()
+        self._spin.setVisible(not by_key)
+        self._key.setVisible(by_key)
+        self.changed.emit()
+
+    def by_key(self) -> bool:
+        return self._mode.currentIndex() == 1
+
+    def value(self):
+        """1-based position (int) or key name (str)."""
+        return self._key.currentText().strip() if self.by_key() else self._spin.value()
+
+    def set_position(self, n: int):
+        self._spin.setValue(n)
+
+    def set_max(self, n: int, quiet: bool = False):
+        if quiet:
+            self._spin.blockSignals(True)
+        self._spin.setMaximum(max(1, n))
+        if quiet:
+            self._spin.blockSignals(False)
+
+    def set_keys(self, keys: list):
+        """Offer the keys found in the headers; keep what is already typed."""
+        cur = self._key.currentText()
+        self._key.blockSignals(True)
+        self._key.clear()
+        self._key.addItems(keys)
+        self._key.setCurrentText(cur or (keys[0] if keys else ""))
+        self._key.blockSignals(False)
+
+    def reset(self):
+        self._mode.setCurrentIndex(0)
+        self._spin.setValue(1)
+        self._key.setCurrentText("")
+
+
+def _first_header(path: str) -> str:
+    """First header of a FASTA file (without '>'), "" if none. Raises OSError."""
+    import gzip as _gz
+    opener = _gz.open if path.lower().endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                return line[1:].rstrip()
+    return ""
+
+
 class FastaToolsPanel(QtWidgets.QWidget):
     _FASTA_GCODES = list(_FastaToolsWorker._STOPS)
 
@@ -1150,11 +1327,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         )
         self._layout.addWidget(self._merge_chk)
 
-        self._layout.addWidget(self._make_section_lbl("Operation"))
-
-        ops_box = QtWidgets.QWidget()
+        ops_box = QtWidgets.QGroupBox("Operation")
+        ops_box.setStyleSheet(group_box_style())
         ops_layout = QtWidgets.QVBoxLayout(ops_box)
-        ops_layout.setContentsMargins(0, 0, 0, 0)
+        ops_layout.setContentsMargins(16, 16, 16, 16)
         ops_layout.setSpacing(2)
 
         self._radio_stats     = QtWidgets.QRadioButton("FASTA stats")
@@ -1168,8 +1344,12 @@ class FastaToolsPanel(QtWidgets.QWidget):
             "Also reports A/C/G/T composition, longest homopolymer, a length histogram\n"
             "sheet with chart and, optionally, stop codons (best of 6 frames)."
         )
-        self._radio_unique    = QtWidgets.QRadioButton("Extract unique sequences")
-        self._radio_identical = QtWidgets.QRadioButton("Extract identical sequences (duplicates)")
+        self._radio_extract   = QtWidgets.QRadioButton("Extract sequences")
+        self._radio_extract.setToolTip(
+            "Extract a subset of sequences: unique ones, duplicated ones, or those\n"
+            "whose header matches a pattern.")
+        self._radio_unique    = QtWidgets.QRadioButton("Unique sequences")
+        self._radio_identical = QtWidgets.QRadioButton("Identical sequences (duplicates)")
         self._radio_identical.setToolTip(
             "Extracts sequences that appear more than once.\n"
             "Generates two output files:\n"
@@ -1178,8 +1358,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
             "    · Sheet 'IDs': list of IDs per group\n"
             "    · Sheet 'Groups': group number, ID count and sequence"
         )
-        self._radio_grep         = QtWidgets.QRadioButton("Extract sequences by pattern (grep)")
-        self._radio_filter_fields = QtWidgets.QRadioButton("Filter sequences by header fields")
+        self._radio_grep         = QtWidgets.QRadioButton("By pattern (grep)")
+        self._radio_filter_fields = QtWidgets.QRadioButton("By header fields")
         self._radio_append       = QtWidgets.QRadioButton("Append info to headers from .xlsx file")
         self._radio_reformat     = QtWidgets.QRadioButton("Reformat sequence lines")
         self._radio_sort         = QtWidgets.QRadioButton("Sort sequences")
@@ -1199,11 +1379,18 @@ class FastaToolsPanel(QtWidgets.QWidget):
         )
 
         self._op_group = QtWidgets.QButtonGroup(self)
-        for rb in (self._radio_stats, self._radio_unique, self._radio_identical,
-                   self._radio_grep, self._radio_filter_fields,
+        for rb in (self._radio_stats, self._radio_extract,
                    self._radio_append, self._radio_reformat, self._radio_orf,
                    self._radio_sort, self._radio_split):
             self._op_group.addButton(rb)
+
+        # Sub-options of "Extract sequences"
+        self._extract_group = QtWidgets.QButtonGroup(self)
+        for rb in (self._radio_unique, self._radio_identical, self._radio_grep,
+                   self._radio_filter_fields):
+            self._extract_group.addButton(rb)
+        self._radio_unique.setChecked(True)
+        self._extract_group.buttonClicked.connect(self._on_operation_changed)
 
         self._radio_stats.setChecked(True)
         self._op_group.buttonClicked.connect(self._on_operation_changed)
@@ -1232,11 +1419,16 @@ class FastaToolsPanel(QtWidgets.QWidget):
         stl.addStretch(1)
         ops_layout.addWidget(self._stats_widget)
         ops_layout.addSpacing(4)
-        ops_layout.addWidget(self._radio_unique)
-        ops_layout.addWidget(self._radio_identical)
-
-        ops_layout.addSpacing(4)
-        ops_layout.addWidget(self._radio_grep)
+        ops_layout.addWidget(self._radio_extract)
+        self._extract_widget = QtWidgets.QWidget()
+        exl = QtWidgets.QVBoxLayout(self._extract_widget)
+        exl.setContentsMargins(20, 4, 0, 4)
+        exl.setSpacing(4)
+        exl.addWidget(self._radio_unique)
+        exl.addWidget(self._radio_identical)
+        exl.addWidget(self._radio_grep)
+        self._extract_widget.hide()
+        ops_layout.addWidget(self._extract_widget)
         self._grep_widget = QtWidgets.QWidget()
         gl = QtWidgets.QVBoxLayout(self._grep_widget)
         gl.setContentsMargins(20, 4, 0, 4)
@@ -1305,6 +1497,11 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         self._grep_regex_chk = QtWidgets.QCheckBox("Use regex (regular expression)")
         gl.addWidget(self._grep_regex_chk)
+        self._grep_case_chk = QtWidgets.QCheckBox("Ignore case")
+        self._grep_case_chk.setToolTip(
+            "Match upper and lower case alike (e.g. 'dns-1' finds DNS-1).\n"
+            "Applies to plain text, regex and whole-ID matching.")
+        gl.addWidget(self._grep_case_chk)
         self._grep_exact_chk = QtWidgets.QCheckBox(
             "Match whole ID (exact, not substring) — for lists of IDs")
         self._grep_exact_chk.setToolTip(
@@ -1318,49 +1515,32 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._grep_exact_chk.toggled.connect(self._on_grep_exact_toggled)
         self._grep_regex_chk.toggled.connect(self._on_grep_exact_toggled)
         self._grep_id_rule.changed.connect(self._update_grep_preview)
+        self._grep_case_chk.toggled.connect(self._update_grep_preview)
         self._grep_pattern_edit.textChanged.connect(self._update_grep_preview)
         self._grep_file_edit.textChanged.connect(self._update_grep_preview)
         self._grep_widget.hide()
-        ops_layout.addWidget(self._grep_widget)
+        exl.addWidget(self._grep_widget)
 
-        ops_layout.addSpacing(4)
-        ops_layout.addWidget(self._radio_filter_fields)
+        exl.addWidget(self._radio_filter_fields)
         self._filter_widget = QtWidgets.QWidget()
         ffw = QtWidgets.QVBoxLayout(self._filter_widget)
         ffw.setContentsMargins(20, 4, 0, 4)
         ffw.setSpacing(10)
 
         ff_note = make_label(
-            "Split each header by a separator and filter by field position. "
-            "All criteria must be satisfied (AND). "
-            "Numeric operators: >=  <=  >  <  =  !=   ·   Text operators: =  !=  contains  not contains",
+            "Split each header by a separator and filter by field position or, for "
+            "key=value fields, by key name. Combine the criteria with AND or OR. "
+            "Numeric operators: >=  <=  >  <  =  !=   ·   Text operators (ignore case): "
+            "=  !=  contains  not contains",
             color=TEXT_SEC, size=15,
         )
         ff_note.setWordWrap(True)
         ffw.addWidget(ff_note)
 
         # ── Separator row ────────────────────────────────────────────────────
-        ff_sep_row = QtWidgets.QHBoxLayout()
-        ff_sep_row.setSpacing(12)
-        ff_sep_row.addWidget(make_label("Field separator:", color=TEXT_SEC))
-        self._ff_sep_group = QtWidgets.QButtonGroup(self)
-        self._ff_sep_pipe   = QtWidgets.QRadioButton('"|"  pipe')
-        self._ff_sep_semi   = QtWidgets.QRadioButton('";"  semicolon')
-        self._ff_sep_custom = QtWidgets.QRadioButton("Custom:")
-        self._ff_sep_pipe.setChecked(True)
-        for rb in (self._ff_sep_pipe, self._ff_sep_semi, self._ff_sep_custom):
-            self._ff_sep_group.addButton(rb)
-            ff_sep_row.addWidget(rb)
-        self._ff_sep_custom_edit = QtWidgets.QLineEdit()
-        self._ff_sep_custom_edit.setFixedWidth(64)
-        self._ff_sep_custom_edit.setPlaceholderText("e.g. _")
-        self._ff_sep_custom_edit.setMaxLength(5)
-        self._ff_sep_custom_edit.hide()
-        ff_sep_row.addWidget(self._ff_sep_custom_edit)
-        ff_sep_row.addStretch()
-        ffw.addLayout(ff_sep_row)
-        self._ff_sep_group.buttonClicked.connect(self._on_ff_sep_changed)
-        self._ff_sep_custom_edit.textChanged.connect(self._update_ff_preview)
+        self._ff_sep = _SeparatorPicker()
+        ffw.addWidget(self._ff_sep)
+        self._ff_sep.changed.connect(self._update_ff_preview)
 
         # ── Field preview ────────────────────────────────────────────────────
         self._ff_preview_frame = QtWidgets.QFrame()
@@ -1386,7 +1566,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         ffw.addWidget(self._ff_preview_frame)
 
         # ── Criteria rows ────────────────────────────────────────────────────
-        ffw.addWidget(make_label("Criteria (all must match):", color=TEXT_SEC))
+        ffw.addWidget(make_label("Criteria:", color=TEXT_SEC))
 
         self._filter_criteria_container = QtWidgets.QWidget()
         self._filter_criteria_layout = QtWidgets.QVBoxLayout(self._filter_criteria_container)
@@ -1396,16 +1576,26 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         self._filter_criterion_rows: list = []
         self._ff_field_count: int = 99
+        self._ff_keys: list = []
         self._add_filter_criterion()
 
         add_crit_btn = QtWidgets.QPushButton("+ Add criterion")
         add_crit_btn.setObjectName("secondary_btn")
         add_crit_btn.setFixedWidth(180)
         add_crit_btn.clicked.connect(self._add_filter_criterion)
-        ffw.addWidget(add_crit_btn)
+        add_row = QtWidgets.QHBoxLayout()
+        add_row.setSpacing(12)
+        add_row.addWidget(add_crit_btn)
+        add_row.addWidget(make_label("Combine criteria with:", color=TEXT_SEC))
+        self._ff_match_combo = QtWidgets.QComboBox()
+        self._ff_match_combo.addItem("AND — all must match", "all")
+        self._ff_match_combo.addItem("OR — any can match", "any")
+        add_row.addWidget(self._ff_match_combo)
+        add_row.addStretch()
+        ffw.addLayout(add_row)
 
         self._filter_widget.hide()
-        ops_layout.addWidget(self._filter_widget)
+        exl.addWidget(self._filter_widget)
 
         ops_layout.addSpacing(4)
         ops_layout.addWidget(self._radio_append)
@@ -1550,28 +1740,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         sep_note.setWordWrap(True)
         svl.addWidget(sep_note)
 
-        sort_sep_row = QtWidgets.QHBoxLayout()
-        sort_sep_row.setSpacing(12)
-        sort_sep_row.addWidget(make_label("Field separator:", color=TEXT_SEC))
-        self._sort_sep_group = QtWidgets.QButtonGroup(self)
-        self._sort_sep_none = QtWidgets.QRadioButton("None (whole header)")
-        self._sort_sep_pipe = QtWidgets.QRadioButton('"|"  pipe')
-        self._sort_sep_semi = QtWidgets.QRadioButton('";"  semicolon')
-        self._sort_sep_custom = QtWidgets.QRadioButton("Custom:")
-        self._sort_sep_none.setChecked(True)
-        for rb in (self._sort_sep_none, self._sort_sep_pipe, self._sort_sep_semi, self._sort_sep_custom):
-            self._sort_sep_group.addButton(rb)
-            sort_sep_row.addWidget(rb)
-        self._sort_sep_custom_edit = QtWidgets.QLineEdit()
-        self._sort_sep_custom_edit.setFixedWidth(64)
-        self._sort_sep_custom_edit.setPlaceholderText("e.g. _")
-        self._sort_sep_custom_edit.setMaxLength(5)
-        self._sort_sep_custom_edit.hide()
-        sort_sep_row.addWidget(self._sort_sep_custom_edit)
-        sort_sep_row.addStretch()
-        svl.addLayout(sort_sep_row)
-        self._sort_sep_group.buttonClicked.connect(self._on_sort_sep_changed)
-        self._sort_sep_custom_edit.textChanged.connect(self._update_sort_preview)
+        self._sort_sep = _SeparatorPicker(allow_none=True)
+        svl.addWidget(self._sort_sep)
+        self._sort_sep.changed.connect(self._update_sort_preview)
 
         self._sort_preview_frame = QtWidgets.QFrame()
         self._sort_preview_frame.setObjectName("sort_preview_card")
@@ -1679,7 +1850,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._split_by_field = _mode_row(
             "By header field — one file per distinct value", None, "",
             "One file per distinct value of the chosen header field, named after it\n"
-            "(e.g. one file per sample or per species). Unlike Extract or Filter, you\n"
+            "(e.g. one file per sample or per species). Unlike Extract, you\n"
             "do not need to know or type the values, and no sequence is left out:\n"
             "headers without that field go to <name>_no_field.fasta.")
         self._split_by_count.setChecked(True)
@@ -1689,31 +1860,14 @@ class FastaToolsPanel(QtWidgets.QWidget):
         sfl = QtWidgets.QVBoxLayout(self._split_field_box)
         sfl.setContentsMargins(24, 0, 0, 0)
         sfl.setSpacing(6)
-        sf_row = QtWidgets.QHBoxLayout()
-        sf_row.setSpacing(12)
-        sf_row.addWidget(make_label("Field separator:", color=TEXT_SEC))
-        self._split_sep_group = QtWidgets.QButtonGroup(self)
-        self._split_sep_pipe   = QtWidgets.QRadioButton('"|"  pipe')
-        self._split_sep_semi   = QtWidgets.QRadioButton('";"  semicolon')
-        self._split_sep_custom = QtWidgets.QRadioButton("Custom:")
-        self._split_sep_pipe.setChecked(True)
-        for rb in (self._split_sep_pipe, self._split_sep_semi, self._split_sep_custom):
-            self._split_sep_group.addButton(rb)
-            sf_row.addWidget(rb)
-        self._split_sep_custom_edit = QtWidgets.QLineEdit()
-        self._split_sep_custom_edit.setFixedWidth(64)
-        self._split_sep_custom_edit.setPlaceholderText("e.g. _")
-        self._split_sep_custom_edit.setMaxLength(5)
-        self._split_sep_custom_edit.hide()
-        sf_row.addWidget(self._split_sep_custom_edit)
+        self._split_sep = _SeparatorPicker(stretch=False)
+        sf_row = self._split_sep.row
         sf_row.addSpacing(12)
         sf_row.addWidget(make_label("Field:", color=TEXT_SEC))
-        self._split_field_spin = QtWidgets.QSpinBox()
-        self._split_field_spin.setRange(1, 99)
-        self._split_field_spin.setFixedWidth(70)
-        sf_row.addWidget(self._split_field_spin)
+        self._split_field = _FieldSelector()
+        sf_row.addWidget(self._split_field)
         sf_row.addStretch()
-        sfl.addLayout(sf_row)
+        sfl.addWidget(self._split_sep)
         self._split_field_preview = make_label("", size=14, color=TEXT_HINT)
         self._split_field_preview.setWordWrap(True)
         sfl.addWidget(self._split_field_preview)
@@ -1721,9 +1875,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
         spl.addWidget(self._split_field_box)
 
         self._split_mode_group.buttonClicked.connect(self._on_split_mode_changed)
-        self._split_sep_group.buttonClicked.connect(self._on_split_sep_changed)
-        self._split_sep_custom_edit.textChanged.connect(self._update_split_preview)
-        self._split_field_spin.valueChanged.connect(self._update_split_preview)
+        self._split_sep.changed.connect(self._update_split_preview)
+        self._split_field.changed.connect(self._update_split_preview)
 
         self._split_widget.hide()
         ops_layout.addWidget(self._split_widget)
@@ -1778,7 +1931,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._clear)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
@@ -1802,6 +1955,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._hdr_cache: dict = {}     # path -> (stamp, headers) for ID previews
         self._excel_cache: dict = {}   # path -> (stamp, lookup) for ID previews
         self._files: list = []
+        self._split_blocked = False
+        self._split_distinct = 0
+        self._split_truncated = False
+        self._running = False
         self._last_outputs: list = []
 
     @staticmethod
@@ -1839,9 +1996,16 @@ class FastaToolsPanel(QtWidgets.QWidget):
                 f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
             )
 
+    def _refresh_run_state(self):
+        """Run is enabled when files are loaded, unless "By header field"
+        would not split anything (see _update_split_preview)."""
+        self._set_run_enabled(bool(self._files) and not self._split_blocked
+                              and not self._running)
+
     def _on_files(self, files: list):
         self._files = files
-        self._set_run_enabled(bool(files))
+        self._split_blocked = False
+        self._refresh_run_state()
         self._status_lbl.setText("")
         self._status_lbl.setStyleSheet("")
         self._update_sort_preview()
@@ -1852,18 +2016,19 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
     def _on_operation_changed(self, _btn):
         self._stats_widget.setVisible(self._radio_stats.isChecked())
-        self._grep_widget.setVisible(self._radio_grep.isChecked())
-        self._filter_widget.setVisible(self._radio_filter_fields.isChecked())
+        extract = self._radio_extract.isChecked()
+        self._extract_widget.setVisible(extract)
+        self._grep_widget.setVisible(extract and self._radio_grep.isChecked())
+        self._filter_widget.setVisible(extract and self._radio_filter_fields.isChecked())
         self._append_widget.setVisible(self._radio_append.isChecked())
         self._reformat_widget.setVisible(self._radio_reformat.isChecked())
         self._orf_widget.setVisible(self._radio_orf.isChecked())
         self._sort_widget.setVisible(self._radio_sort.isChecked())
         self._split_widget.setVisible(self._radio_split.isChecked())
-        if self._radio_split.isChecked():
-            self._update_split_preview()
+        self._update_split_preview()
         if self._radio_sort.isChecked():
             self._update_sort_preview()
-        if self._radio_filter_fields.isChecked():
+        if extract and self._radio_filter_fields.isChecked():
             self._update_ff_preview()
         self._log_edit.clear()
         self._log_edit.hide()
@@ -1871,26 +2036,18 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._status_lbl.setStyleSheet("")
         self._open_folder_btn.hide()
 
-    def _split_separator(self) -> str:
-        if self._split_sep_semi.isChecked():
-            return ";"
-        if self._split_sep_custom.isChecked():
-            return self._split_sep_custom_edit.text()
-        return "|"
-
     def _on_split_mode_changed(self, _btn):
         self._split_field_box.setVisible(self._split_by_field.isChecked())
-        self._update_split_preview()
-
-    def _on_split_sep_changed(self, _btn):
-        self._split_sep_custom_edit.setVisible(self._split_sep_custom.isChecked())
         self._update_split_preview()
 
     def _update_split_preview(self, *_):
         """Under the field options: how many files "By header field" would
         write, with a few of the values. Uses the cached headers of the other
         previews, so changing the field never re-reads a large file."""
+        self._split_blocked = False
+        self._split_distinct, self._split_truncated = 0, False
         if not (self._radio_split.isChecked() and self._split_by_field.isChecked()):
+            self._refresh_run_state()
             return
         if not self._files:
             self._split_field_preview.setText("—  no files loaded")
@@ -1899,24 +2056,51 @@ class FastaToolsPanel(QtWidgets.QWidget):
         if not headers:
             self._split_field_preview.setText("—  no sequences found")
             return
-        sep = self._split_separator()
-        idx = self._split_field_spin.value() - 1
+        sep = self._split_sep.separator()
+        # Cap the field box at the largest field count found with this separator.
+        with_sep = [h for h in headers if not sep or sep in h]
+        max_fields = max((len(h.split(sep)) if sep else 1 for h in with_sep),
+                         default=1)
+        sel = self._split_field
+        if not with_sep:
+            self._split_blocked = True
+            self._refresh_run_state()
+            self._split_field_preview.setText(
+                f'—  separator "{sep}" not found in the headers → nothing to split by')
+            return
+        if sel.by_key():
+            keys = header_keys(with_sep, sep)
+            sel.set_keys(keys)
+            if not keys:
+                self._split_blocked = True
+                self._refresh_run_state()
+                self._split_field_preview.setText(
+                    "—  no key=value fields found in the headers → use Position")
+                return
+        else:
+            sel.set_max(max_fields, quiet=True)
+        field = sel.value()
         values, missing = [], 0
         for hdr in headers:
-            parts = hdr.split(sep) if sep else [hdr]
-            if idx >= len(parts):
+            v = header_field_value(hdr, sep, field)
+            if v is None:
                 missing += 1
-                continue
-            v = parts[idx].strip()
-            values.append(v.split("=", 1)[1].strip() if "=" in v else v)
+            else:
+                values.append(v)
+        # Nothing to split by (no header has this separator / field): block Run.
+        self._split_blocked = not values
+        self._refresh_run_state()
         distinct = list(dict.fromkeys(values))
+        self._split_distinct, self._split_truncated = len(distinct), truncated
         example = ", ".join(distinct[:5]) + (" …" if len(distinct) > 5 else "")
         scope = (f"first {len(headers):,} headers" if truncated
                  else os.path.basename(self._files[0]) if len(self._files) == 1
                  else f"{len(self._files)} files")
-        text = (f"{scope}: field {idx + 1} has "
+        text = (f"{scope}: {field_label(field)} has "
                 f"{len(distinct)} distinct value(s) → {len(distinct)} file(s)"
                 + (f"  ·  e.g. {example}" if distinct else ""))
+        if len(distinct) > _SPLIT_FILE_WARN:
+            text += f"  ·  ⚠ more than {_SPLIT_FILE_WARN} files"
         if missing:
             text += f"  ·  {missing} header(s) without this field → _no_field file"
         self._split_field_preview.setText(text)
@@ -1924,34 +2108,19 @@ class FastaToolsPanel(QtWidgets.QWidget):
     def _on_reformat_mode_changed(self, _btn):
         self._wrap_cols_row.setVisible(self._rf_radio_wrap.isChecked())
 
-    def _on_sort_sep_changed(self, *_):
-        self._sort_sep_custom_edit.setVisible(self._sort_sep_custom.isChecked())
-        self._update_sort_preview()
-
     def _update_sort_preview(self, *_):
         if not self._files:
             self._sort_preview_lbl.setText("—  no files loaded")
             return
-        path = self._files[0]
         try:
-            import gzip as _gz
-            opener = _gz.open if path.lower().endswith(".gz") else open
-            header = ""
-            with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if line.startswith(">"):
-                        header = line[1:].rstrip()
-                        break
+            header = _first_header(self._files[0])
         except Exception:
             self._sort_preview_lbl.setText("—  could not read file")
             return
         if not header:
             self._sort_preview_lbl.setText("—  no sequences found")
             return
-        sep = ("|" if self._sort_sep_pipe.isChecked()
-               else ";" if self._sort_sep_semi.isChecked()
-               else self._sort_sep_custom_edit.text() if self._sort_sep_custom.isChecked()
-               else "")
+        sep = self._sort_sep.separator()
         # Match the worker's split (unconditional when a separator is set), so the
         # field numbering in the preview always lines up with the actual sort.
         parts = header.split(sep) if sep else [header]
@@ -2025,37 +2194,28 @@ class FastaToolsPanel(QtWidgets.QWidget):
             if isinstance(lbl, QtWidgets.QLabel):
                 lbl.setText(f"Level {i + 1}:")
 
-    def _on_ff_sep_changed(self, *_):
-        self._ff_sep_custom_edit.setVisible(self._ff_sep_custom.isChecked())
-        self._update_ff_preview()
-
     def _update_ff_preview(self, *_):
         if not self._files:
             self._ff_preview_lbl.setText("—  no files loaded")
             return
-        path = self._files[0]
         try:
-            import gzip as _gz
-            opener = _gz.open if path.lower().endswith(".gz") else open
-            header = ""
-            with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if line.startswith(">"):
-                        header = line[1:].rstrip()
-                        break
+            header = _first_header(self._files[0])
         except Exception:
             self._ff_preview_lbl.setText("—  could not read file")
             return
         if not header:
             self._ff_preview_lbl.setText("—  no sequences found")
             return
-        sep = ("|" if self._ff_sep_pipe.isChecked()
-               else ";" if self._ff_sep_semi.isChecked()
-               else self._ff_sep_custom_edit.text() if self._ff_sep_custom.isChecked()
-               else "|")
-        # Match the worker's split (unconditional when a separator is set), so the
-        # field numbering in the preview always lines up with the actual filter.
-        parts = header.split(sep) if sep else [header]
+        sep = self._ff_sep.separator() or "|"
+        self._ff_keys = header_keys(self._headers()[0] or [header], sep)
+        if sep not in header:
+            # The run treats such headers as having no fields at all.
+            self._ff_preview_lbl.setText(
+                f'—  separator "{sep}" not found in the first header')
+            self._ff_field_count = 1
+            self._update_ff_spin_limits()
+            return
+        parts = header.split(sep)
         self._ff_preview_lbl.setText(
             "\n".join(f"Field {i:>2}:  {p.strip()}" for i, p in enumerate(parts, 1))
         )
@@ -2064,9 +2224,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
     def _update_ff_spin_limits(self):
         for _w, fs, _oc, _ve in self._filter_criterion_rows:
-            fs.setMaximum(self._ff_field_count)
-            if fs.value() > self._ff_field_count:
-                fs.setValue(self._ff_field_count)
+            fs.set_max(self._ff_field_count)
+            fs.set_keys(self._ff_keys)
 
     def _add_filter_criterion(self):
         _REMOVE_STYLE = (
@@ -2081,10 +2240,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         rl.setSpacing(6)
 
         rl.addWidget(make_label("Field:", color=TEXT_SEC))
-        field_spin = QtWidgets.QSpinBox()
-        field_spin.setRange(1, self._ff_field_count)
-        field_spin.setValue(min(n, self._ff_field_count))
-        field_spin.setFixedWidth(70)
+        field_spin = _FieldSelector()
+        field_spin.set_max(self._ff_field_count)
+        field_spin.set_position(min(n, self._ff_field_count))
+        field_spin.set_keys(self._ff_keys)
         rl.addWidget(field_spin)
 
         op_combo = QtWidgets.QComboBox()
@@ -2218,11 +2377,13 @@ class FastaToolsPanel(QtWidgets.QWidget):
             return
         rule = w.rule()
         head = f"First header → ID: <b>{extract_id(headers[0], rule) or '(empty)'}</b>"
-        wanted = set(self._grep_patterns_preview())
+        ic = self._grep_case_chk.isChecked()
+        norm = (lambda t: t.lower()) if ic else (lambda t: t)
+        wanted = {norm(w) for w in self._grep_patterns_preview()}
         if not wanted:
             w.set_preview(head + " · enter a pattern or load a pattern file")
             return
-        n = sum(1 for h in headers if extract_id(h, rule) in wanted)
+        n = sum(1 for h in headers if norm(extract_id(h, rule)) in wanted)
         w.set_preview(head + " · " + self._count_line(headers, truncated, n,
                                                       "match the list"), n > 0)
 
@@ -2264,6 +2425,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             if not self._worker.wait(500):
                 self._retired_workers.append(self._worker)
             self._worker = None
+        self._running = False
 
         self._drop.clear()
         self._files = []
@@ -2281,6 +2443,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._stats_widget.show()
         self._stats_stops_chk.setChecked(False)
         self._stats_gcode_combo.setCurrentText("Invertebrate mitochondrial")
+        self._extract_widget.hide()
+        self._radio_unique.setChecked(True)
         self._grep_widget.hide()
         self._filter_widget.hide()
         self._append_widget.hide()
@@ -2294,16 +2458,15 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._split_count_spin.setValue(50)
         self._split_files_spin.setValue(4)
         self._split_bases_spin.setValue(1_000_000)
-        self._split_sep_pipe.setChecked(True)
-        self._split_sep_custom_edit.clear()
-        self._split_sep_custom_edit.hide()
-        self._split_field_spin.setValue(1)
+        self._split_sep.reset()
+        self._split_field.reset()
         self._split_field_box.hide()
 
         self._grep_use_file_chk.setChecked(False)
         self._grep_pattern_edit.clear()
         self._grep_file_edit.clear()
         self._grep_regex_chk.setChecked(False)
+        self._grep_case_chk.setChecked(False)
         self._grep_exact_chk.setChecked(False)
         self._grep_id_rule.reset()
         self._grep_id_rule.hide()
@@ -2321,9 +2484,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._wrap_cols_spin.setValue(80)
         self._wrap_cols_row.hide()
 
-        self._sort_sep_none.setChecked(True)
-        self._sort_sep_custom_edit.clear()
-        self._sort_sep_custom_edit.hide()
+        self._sort_sep.reset()
         while len(self._sort_level_rows) > 1:
             w, _fs, _oc = self._sort_level_rows[-1]
             self._sort_level_rows.pop()
@@ -2335,9 +2496,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
             oc.setCurrentIndex(0)
         self._update_sort_preview()
 
-        self._ff_sep_pipe.setChecked(True)
-        self._ff_sep_custom_edit.clear()
-        self._ff_sep_custom_edit.hide()
+        self._ff_sep.reset()
+        self._ff_match_combo.setCurrentIndex(0)
+        self._ff_keys = []
         while self._filter_criterion_rows:
             w, _fs, _oc, _ve = self._filter_criterion_rows.pop()
             self._filter_criteria_layout.removeWidget(w)
@@ -2358,10 +2519,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
         operation = (
             "stats"          if self._radio_stats.isChecked()          else
-            "unique"         if self._radio_unique.isChecked()         else
-            "identical"      if self._radio_identical.isChecked()      else
-            "grep"           if self._radio_grep.isChecked()           else
-            "filter_fields"  if self._radio_filter_fields.isChecked()  else
+            ("unique"        if self._radio_unique.isChecked()        else
+             "identical"     if self._radio_identical.isChecked()     else
+             "filter_fields" if self._radio_filter_fields.isChecked() else
+             "grep")         if self._radio_extract.isChecked()       else
             "append"         if self._radio_append.isChecked()         else
             "reformat"       if self._radio_reformat.isChecked()       else
             "orf_trim"       if self._radio_orf.isChecked()            else
@@ -2375,6 +2536,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
                 params["genetic_code"] = self._stats_gcode_combo.currentText()
         elif operation == "grep":
             params["use_regex"] = self._grep_regex_chk.isChecked()
+            params["ignore_case"] = self._grep_case_chk.isChecked()
             if self._grep_use_file_chk.isChecked():
                 params["pattern_file"] = self._grep_file_edit.text().strip()
             else:
@@ -2382,20 +2544,15 @@ class FastaToolsPanel(QtWidgets.QWidget):
             if self._grep_exact_chk.isChecked() and not params["use_regex"]:
                 params["exact_id"] = self._grep_id_rule.rule()
         elif operation == "filter_fields":
-            if self._ff_sep_semi.isChecked():
-                params["separator"] = ";"
-            elif self._ff_sep_custom.isChecked():
-                custom_sep = self._ff_sep_custom_edit.text()
-                if not custom_sep:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Filter configuration",
-                        "Custom separator is empty.\n"
-                        "Please enter a separator character or choose a different option."
-                    )
-                    return
-                params["separator"] = custom_sep
-            else:
-                params["separator"] = "|"
+            if self._ff_sep.custom_empty():
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter configuration",
+                    "Custom separator is empty.\n"
+                    "Please enter a separator character or choose a different option."
+                )
+                return
+            params["separator"] = self._ff_sep.separator()
+            params["match"] = self._ff_match_combo.currentData()
             criteria = [
                 {"field": fs.value(), "op": oc.currentText(), "value": ve.text().strip()}
                 for _w, fs, oc, ve in self._filter_criterion_rows
@@ -2408,6 +2565,13 @@ class FastaToolsPanel(QtWidgets.QWidget):
                     "Please fill in at least one value."
                 )
                 return
+            if any(c["field"] == "" for c in criteria):
+                QtWidgets.QMessageBox.warning(
+                    self, "Filter configuration",
+                    "A criterion selects its field by key name, but the key is empty.\n"
+                    "Type a key (e.g. ambs) or switch to Position."
+                )
+                return
             # Numeric operators need a numeric value; otherwise the criterion
             # would fall into the text branch (which has no case for them) and
             # silently pass every sequence.
@@ -2418,7 +2582,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
                     except ValueError:
                         QtWidgets.QMessageBox.warning(
                             self, "Filter configuration",
-                            f"Operator '{c['op']}' (field {c['field']}) requires a "
+                            f"Operator '{c['op']}' ({field_label(c['field'])}) requires a "
                             f"numeric value, but got “{c['value']}”.\n\n"
                             "Enter a number or use a text operator "
                             "(=, !=, contains, not contains)."
@@ -2434,7 +2598,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             params["wrap_cols"] = self._wrap_cols_spin.value()
         elif operation == "split":
             if self._split_by_field.isChecked():
-                sep = self._split_separator()
+                sep = self._split_sep.separator()
                 if not sep:
                     QtWidgets.QMessageBox.warning(
                         self, "Split configuration",
@@ -2442,8 +2606,28 @@ class FastaToolsPanel(QtWidgets.QWidget):
                         "Please enter a separator character or choose a different option."
                     )
                     return
-                params.update(mode="field", separator=sep,
-                              field=self._split_field_spin.value())
+                field = self._split_field.value()
+                if field == "":
+                    QtWidgets.QMessageBox.warning(
+                        self, "Split configuration",
+                        "The field is selected by key name, but the key is empty.\n"
+                        "Type a key (e.g. ambs) or switch to Position."
+                    )
+                    return
+                n = self._split_distinct
+                if n > _SPLIT_FILE_WARN:
+                    many = len(self._files) > 1
+                    ans = QtWidgets.QMessageBox.question(
+                        self, "Split configuration",
+                        f"The chosen field has {'at least ' if self._split_truncated else ''}"
+                        f"{n:,} distinct values{' across the input files' if many else ''}, "
+                        f"so this split will write up to {n:,} files"
+                        f"{' per input file' if many else ''}.\n\nContinue?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                        QtWidgets.QMessageBox.No)
+                    if ans != QtWidgets.QMessageBox.Yes:
+                        return
+                params.update(mode="field", separator=sep, field=field)
             elif self._split_by_files.isChecked():
                 params.update(mode="files", value=self._split_files_spin.value())
             elif self._split_by_bases.isChecked():
@@ -2454,22 +2638,14 @@ class FastaToolsPanel(QtWidgets.QWidget):
             params["genetic_code"] = self._orf_gcode_combo.currentText()
             params["min_coverage"] = self._orf_cov_spin.value() / 100.0
         elif operation == "sort":
-            if self._sort_sep_pipe.isChecked():
-                params["separator"] = "|"
-            elif self._sort_sep_semi.isChecked():
-                params["separator"] = ";"
-            elif self._sort_sep_custom.isChecked():
-                custom_sep = self._sort_sep_custom_edit.text()
-                if not custom_sep:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Sort configuration",
-                        "Custom separator is empty.\n"
-                        "Please enter a separator character or choose a different option."
-                    )
-                    return
-                params["separator"] = custom_sep
-            else:
-                params["separator"] = ""
+            if self._sort_sep.custom_empty():
+                QtWidgets.QMessageBox.warning(
+                    self, "Sort configuration",
+                    "Custom separator is empty.\n"
+                    "Please enter a separator character or choose a different option."
+                )
+                return
+            params["separator"] = self._sort_sep.separator()
             params["levels"] = [
                 {"field": fs.value(), "order": oc.currentData()}
                 for _, fs, oc in self._sort_level_rows
@@ -2488,6 +2664,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._progress_bar.show()
         self._status_lbl.setStyleSheet("")
         self._status_lbl.setText("Running…")
+        self._running = True
         self._set_run_enabled(False)
         self._log_edit.clear()
         self._log_edit.show()
@@ -2578,7 +2755,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
     def _on_finished(self, outputs: list):
         self._progress_bar.hide()
-        self._set_run_enabled(True)
+        self._running = False
+        self._refresh_run_state()
         self._last_outputs = outputs
         self._status_lbl.setStyleSheet(f"color:{GREEN};")
         self._status_lbl.setText(f"Done — {len(outputs)} file(s) saved.")
@@ -2591,7 +2769,8 @@ class FastaToolsPanel(QtWidgets.QWidget):
 
     def _on_error(self, msg: str):
         self._progress_bar.hide()
-        self._set_run_enabled(True)
+        self._running = False
+        self._refresh_run_state()
         self._status_lbl.setStyleSheet(f"color:{RED};")
         self._status_lbl.setText(f"Error: {error_summary(msg)}")
         self._log_edit.appendPlainText(f"ERROR: {msg}")

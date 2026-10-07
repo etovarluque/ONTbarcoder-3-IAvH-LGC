@@ -19,6 +19,70 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 
 ---
 
+## [3.7.0] — 2026-10-07
+
+### Added
+- **FASTA Tools: header fields by key name and with OR.** *By header fields*
+  and *Split by header field* can pick a field by position or, for
+  `key=value` fields, by key name (e.g. `ambs`), wherever it sits in the
+  header. Filter criteria combine with AND or OR. *By pattern (grep)* gains
+  *Ignore case*.
+- **FASTA Compare: Ignore length differences at the ends.** Compares only the
+  region two barcodes share, so a barcode trimmed differently (with/without
+  primers) is not reported as different; the length difference stays in the
+  `Length` column.
+- **FASTA Compare: ID match summary** under the ID preview, before running:
+  IDs per file, repeated IDs, headers without the delimiter, and IDs shared by
+  all files (or found in the reference).
+- **Reference check** (Best Sequence, both BLAST tabs, *Apply reference
+  taxonomy*, BOLD Formatter): how many sample IDs of the input the
+  query-taxonomy reference knows, green / amber / red, pointing out IDs that
+  differ only in `-` / `_` / `.` / spaces. A run matching none asks first.
+- **Best Sequence:** per-run count of FASTA sequences found in the BLAST
+  table; sample-ID preview next to the suffix; a *Review* line with the flags
+  worth a manual look; new flag `no_query_taxonomy` and decision
+  `only_one_run`.
+- **Parameter Sweep:** table of the combinations, Phase 1 run count, and
+  warnings for repeated combinations, a line order that re-runs
+  demultiplexing, and swept keys that cannot change the result. *Resume
+  sweep…* lists the interrupted sweeps found in `output/`. *Create example*
+  offers to load the file and open it in the text editor.
+
+### Changed
+- **FASTA Tools:** *Extract sequences* groups Unique, Identical, By pattern
+  and By header fields. Field separators are a drop-down (`|`, `;`, `,`,
+  space, tab, `_`, `-`, Custom…); the field box is capped at the headers'
+  field count. *Split by header field* blocks Run when nothing would be
+  split, asks above 100 files, and writes safe file names.
+- **FASTA Compare:** labelled delimiter drop-down with Custom…; *Delimiter is
+  a set of characters* moved to Advanced; *No reference* renamed *Not in
+  reference*; state legend under the results; shorter mode labels.
+- **Best Sequence:** file area above the settings; the `Query_*` note shows
+  only when needed; *Classify sequences* / *Select best sequences* button;
+  "Runs" instead of "Comparisons".
+- **BLAST:** file area above the settings in both tabs.
+- **Parameter Sweep:** sweep folders are named `…_sweep` (older `…_batch`
+  folders still work). One-line drop field for the `.cfg`; *Resume sweep…*
+  in the footer; *Compare two runs* and *Coverage report* use two drop fields
+  each; drop zones turn blue while dragging and green once loaded; the reason
+  *Start sweep* is disabled is shown next to it; in Real-Time mode Start and
+  Resume are disabled and a note says why.
+- Settings boxes of every panel share one rounded style.
+- No emojis on footer buttons nor in the BLAST tab titles.
+
+### Fixed
+- Compare: a delimiter occurring fewer times than the chosen occurrence made
+  the whole header the ID, so every sample came out *Unique*.
+- Best Sequence: sequences differing only in letter case were not taken as
+  identical; a sample present in one run only counted as identical across
+  runs; a sample without expected taxonomy was flagged `tax_mismatch`.
+- FASTA Tools: Split by header field counted files for a separator absent
+  from the headers; Run could become enabled while a job was running.
+- Parameter Sweep: a key listed twice in a `.cfg` silently replaced the
+  first one.
+
+---
+
 ## [3.6.5] — 2026-10-06
 
 ### Added

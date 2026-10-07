@@ -452,6 +452,17 @@ QDialog QDialogButtonBox QPushButton[default="true"]:hover {{
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
+def group_box_style(titled: bool = True) -> str:
+    """Style of the settings boxes of every panel: thin border, rounded
+    corners and the title set into the top border."""
+    return (
+        f"QGroupBox {{ font-weight:600; color:#1A1A2E; border:1px solid {GRAY_LINE};"
+        f" border-radius:10px; margin-top:{'12px' if titled else '0px'}; }}"
+        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;"
+        " left:14px; padding:0 6px; }"
+    )
+
+
 def make_label(text, size=19, bold=False, color=TEXT_PRI):
     lbl = QtWidgets.QLabel(text)
     weight = "600" if bold else "400"

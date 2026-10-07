@@ -24,7 +24,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         "Compatible (IUPAC)":  "#E6F1FB",
         "Different":           "#FCEBEB",
         "Only in reference":      "#FAEEDA",
-        "No reference":        "#F5F5F3",
+        "Not in reference":        "#F5F5F3",
         "Unique":              "#EBEBEB",
     }
     # Status pad colors
@@ -33,7 +33,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         "Compatible (IUPAC)":  ("#185FA5", "#E6F1FB"),
         "Different":           ("#A32D2D", "#FCEBEB"),
         "Only in reference":      ("#854F0B", "#FAEEDA"),
-        "No reference":        ("#5A5A5A", "#EBEBEB"),
+        "Not in reference":        ("#5A5A5A", "#EBEBEB"),
         "Unique":              ("#4A4A4A", "#DCDCDC"),
     }
 
@@ -61,7 +61,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         n_diff      = sum(1 for r in rows if r.get("State") == "Different")
         n_only      = sum(1 for r in rows if r.get("State", "").startswith("Unique"))
         n_only_ref  = sum(1 for r in rows if r.get("State") == "Only in reference")
-        n_no_ref    = sum(1 for r in rows if r.get("State") == "No reference")
+        n_no_ref    = sum(1 for r in rows if r.get("State") == "Not in reference")
 
         def _stat_pill(label, count, bg, fg):
             w = QtWidgets.QLabel(f"{label}: <b>{count}</b>")
@@ -91,7 +91,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         if n_only_ref:
             tb_layout.addWidget(_stat_pill("Only ref", n_only_ref, "#6B3D0A", "#F5D9A8"))
         if n_no_ref:
-            tb_layout.addWidget(_stat_pill("No ref", n_no_ref, "#3A3A3A", "#DDDDDD"))
+            tb_layout.addWidget(_stat_pill("Not in ref", n_no_ref, "#3A3A3A", "#DDDDDD"))
         tb_layout.addStretch()
         layout.addWidget(topbar)
 
@@ -102,7 +102,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
             path_bar.setFixedHeight(30)
             pb_layout = QtWidgets.QHBoxLayout(path_bar)
             pb_layout.setContentsMargins(20, 0, 16, 0)
-            path_lbl = QtWidgets.QLabel(f"<span style='color:{TEXT_HINT};'>📁 Output:</span>"
+            path_lbl = QtWidgets.QLabel(f"<span style='color:{TEXT_HINT};'>Output:</span>"
                                          f" <span style='color:{TEXT_SEC};'>{outdir}</span>")
             path_lbl.setTextFormat(QtCore.Qt.RichText)
             path_lbl.setStyleSheet("font-size: 11px;")
@@ -230,7 +230,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
             "Compatible (IUPAC)":  QtGui.QColor("#E6F1FB"),
             "Different":           QtGui.QColor("#FCEBEB"),
             "Only in reference":      QtGui.QColor("#FAEEDA"),
-            "No reference":        QtGui.QColor("#F0F0EE"),
+            "Not in reference":        QtGui.QColor("#F0F0EE"),
         }
 
         # "Status" column receives widget with color pill
@@ -291,7 +291,7 @@ class _CompareResultsWindow(QtWidgets.QDialog):
         fl.setContentsMargins(20, 8, 20, 8)
         fl.addStretch()
         if outdir:
-            open_btn = QtWidgets.QPushButton("Open folder  📂")
+            open_btn = QtWidgets.QPushButton("Open folder")
             open_btn.setFixedHeight(36)
             open_btn.setStyleSheet(
                 f"QPushButton {{ background:{BLUE_LIGHT}; color:{BLUE}; border:1px solid #B8D4F0;"
@@ -322,6 +322,18 @@ class ComparePanel(QtWidgets.QWidget):
     # files, mode ("sets"|"ref"), ref_basename, outdir, extract_cfg (dict)
     # extract_cfg = {"id_patterns": [...], "regex_patterns": [...], "normalize": {...}}
     compareRequested = QtCore.pyqtSignal(list, str, str, str, dict)
+
+    # (label, delimiter) of the ID delimiter drop-down; Custom… comes last
+    _DELIMS = ((";  semicolon", ";"), ("|  pipe", "|"), ("_  underscore", "_"),
+               ("-  hyphen", "-"), (".  dot", "."), (",  comma", ","),
+               ("␣  space", " "))
+    _DELIM_CUSTOM = "__custom__"
+
+    _LEGEND = (
+        "Identical: same sequence  ·  Compatible (IUPAC): differ only at ambiguous "
+        "bases (R, Y, N…)  ·  Different: at least one real base difference "
+        "(Diff_bases)  ·  Unique: found in only one file  ·  Only in reference / "
+        "Not in reference: present only in the reference / missing from it")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -363,10 +375,14 @@ class ComparePanel(QtWidgets.QWidget):
         self._drop.filesDropped.connect(self._on_files)
         self._layout.addWidget(self._drop)
 
+        self._id_box = QtWidgets.QGroupBox("Sample ID extraction")
+        self._id_box.setStyleSheet(group_box_style())
+        id_box_layout = QtWidgets.QVBoxLayout(self._id_box)
+        id_box_layout.setContentsMargins(16, 16, 16, 16)
+        id_box_layout.setSpacing(8)
         self._lbl_id_section = make_label(
-            "Sample ID extraction — check the preview once files are loaded",
-            size=17, bold=True, color=TEXT_PRI)
-        self._layout.addWidget(self._lbl_id_section)
+            "Check the preview once files are loaded.", size=15, color=TEXT_HINT)
+        id_box_layout.addWidget(self._lbl_id_section)
 
         # ── ID extraction block ─────────────────────────────────────────────
         id_block = QtWidgets.QFrame()
@@ -384,17 +400,29 @@ class ComparePanel(QtWidgets.QWidget):
         simple_layout.addWidget(self._lbl_id_delim, 0, QtCore.Qt.AlignVCenter)
 
         self._id_delim_combo = QtWidgets.QComboBox()
-        self._id_delim_combo.setEditable(True)
-        self._id_delim_combo.setFixedWidth(90)
+        self._id_delim_combo.setMinimumWidth(170)
         self._id_delim_combo.setToolTip(
-            "Character (or string) that separates the sample ID from the rest of the header.\n"
+            "Character that separates the sample ID from the rest of the header.\n"
             "Common choices: ';' for ONTbarcoder outputs, '|' for BOLD/GenBank.\n"
-            "Multi-character delimiters are also accepted (e.g. '_all.fa')."
+            "Choose Custom… for anything else, including several characters\n"
+            "(e.g. '_all.fa')."
         )
-        for ch in [";", "_", "|", " ", ".", "-"]:
-            self._id_delim_combo.addItem(ch)
-        self._id_delim_combo.setCurrentText(";")
+        for label, ch in self._DELIMS:
+            self._id_delim_combo.addItem(label, ch)
+        self._id_delim_combo.addItem("Custom…", self._DELIM_CUSTOM)
         simple_layout.addWidget(self._id_delim_combo)
+        self._id_delim_edit = QtWidgets.QLineEdit()
+        self._id_delim_edit.setFixedWidth(90)
+        self._id_delim_edit.setMaxLength(20)
+        self._id_delim_edit.setPlaceholderText("e.g. _all.fa")
+        self._id_delim_edit.setEnabled(False)
+        # Enabled (Custom chosen): white with a blue border; disabled: greyed out.
+        self._id_delim_edit.setStyleSheet(
+            f"QLineEdit {{ background: white; color: {TEXT_PRI};"
+            f" border: 1.5px solid {BLUE}; border-radius: 4px; padding: 2px 4px; }}"
+            f"QLineEdit:disabled {{ background: {GRAY_BG}; color: {TEXT_HINT};"
+            f" border: 1px solid {GRAY_LINE}; }}")
+        simple_layout.addWidget(self._id_delim_edit)
 
         self._lbl_id_occ = make_label("before occurrence:", color=TEXT_SEC)
         simple_layout.addWidget(self._lbl_id_occ, 0, QtCore.Qt.AlignVCenter)
@@ -408,16 +436,6 @@ class ComparePanel(QtWidgets.QWidget):
         for suffix in ["1st", "2nd", "3rd", "4th", "5th"]:
             self._id_occ_combo.addItem(suffix)
         simple_layout.addWidget(self._id_occ_combo)
-
-        self._id_delim_anyset_chk = QtWidgets.QCheckBox("any of these")
-        self._id_delim_anyset_chk.setToolTip(
-            "Treat the delimiter field as a SET of single characters and cut at\n"
-            "whichever one appears first, instead of matching it literally.\n"
-            "Use it when the same ID is followed by different separators across\n"
-            "files, e.g. delimiter '_-' makes both 'BIOUG00045_all.fa' and\n"
-            "'BIOUG00045-all.fa' yield 'BIOUG00045'."
-        )
-        simple_layout.addWidget(self._id_delim_anyset_chk)
 
         simple_layout.addSpacing(6)
         _arr = make_label("→", color=TEXT_SEC)
@@ -465,6 +483,15 @@ class ComparePanel(QtWidgets.QWidget):
         self._raw_header_frame.hide()
         id_block_layout.addWidget(self._raw_header_frame)
 
+        # Row 2b: how the IDs match across all loaded files
+        self._lbl_match_summary = QtWidgets.QLabel("")
+        self._lbl_match_summary.setTextFormat(QtCore.Qt.RichText)
+        self._lbl_match_summary.setWordWrap(True)
+        self._lbl_match_summary.setStyleSheet(
+            f"font-size:15px; color:{TEXT_SEC}; background:transparent; padding-top:6px;")
+        self._lbl_match_summary.hide()
+        id_block_layout.addWidget(self._lbl_match_summary)
+
         # Row 3: Advanced (Regex) toggle
         adv_toggle_row = QtWidgets.QWidget()
         adv_toggle_layout = QtWidgets.QHBoxLayout(adv_toggle_row)
@@ -486,7 +513,18 @@ class ComparePanel(QtWidgets.QWidget):
         adv_layout.setContentsMargins(20, 0, 0, 0)
         adv_layout.setSpacing(8)
 
-        # ── Multi-regex (Option B): one regex per line, tried in order ──
+        self._id_delim_anyset_chk = QtWidgets.QCheckBox(
+            "Delimiter is a set of characters — cut at whichever appears first")
+        self._id_delim_anyset_chk.setToolTip(
+            "Treat a Custom delimiter as a SET of single characters and cut at\n"
+            "whichever one appears first, instead of matching it literally.\n"
+            "Use it when the same ID is followed by different separators across\n"
+            "files, e.g. Custom delimiter '_-' makes both 'BIOUG00045_all.fa' and\n"
+            "'BIOUG00045-all.fa' yield 'BIOUG00045'."
+        )
+        adv_layout.addWidget(self._id_delim_anyset_chk)
+
+        # ── Multi-regex: one regex per line, tried in order ──
         regex_row = QtWidgets.QWidget()
         regex_layout = QtWidgets.QHBoxLayout(regex_row)
         regex_layout.setContentsMargins(0, 0, 0, 0)
@@ -504,7 +542,7 @@ class ComparePanel(QtWidgets.QWidget):
         self._regex_edit.setToolTip(
             "One regular expression per line. Each FASTA header is tried against\n"
             "every line in order until one matches, so files with different header\n"
-            "conventions can share a single config (Option B).\n"
+            "conventions can share a single configuration.\n"
             "If a regex has a capturing group, group 1 is used as the ID;\n"
             "otherwise the full match is used.\n"
             "Leave empty to use the positional mode above."
@@ -517,7 +555,7 @@ class ComparePanel(QtWidgets.QWidget):
         regex_layout.addStretch()
         adv_layout.addWidget(regex_row)
 
-        # ── Normalization (Option C) ──
+        # ── Normalization ──
         norm_row = QtWidgets.QWidget()
         norm_layout = QtWidgets.QHBoxLayout(norm_row)
         norm_layout.setContentsMargins(0, 0, 0, 0)
@@ -540,7 +578,7 @@ class ComparePanel(QtWidgets.QWidget):
         self._norm_strip_edit.setToolTip(
             "Substrings matching this regex are removed from the ID after\n"
             "extraction — useful to drop run/replicate suffixes so the same\n"
-            "sample collides across files (Option C). Leave empty to disable."
+            "sample matches across files. Leave empty to disable."
         )
         norm_layout.addWidget(self._norm_strip_edit)
         norm_layout.addStretch()
@@ -549,10 +587,12 @@ class ComparePanel(QtWidgets.QWidget):
         self._advanced_widget.hide()
         id_block_layout.addWidget(self._advanced_widget)
 
-        self._layout.addWidget(id_block)
+        id_box_layout.addWidget(id_block)
+        self._layout.addWidget(self._id_box)
 
         # Connect ID extraction signals
-        self._id_delim_combo.currentTextChanged.connect(self._update_id_preview)
+        self._id_delim_combo.currentIndexChanged.connect(self._on_delim_changed)
+        self._id_delim_edit.textChanged.connect(self._update_id_preview)
         self._id_occ_combo.currentIndexChanged.connect(self._update_id_preview)
         self._id_delim_anyset_chk.toggled.connect(self._update_id_preview)
         self._advanced_toggle_btn.toggled.connect(self._on_advanced_toggled)
@@ -562,20 +602,26 @@ class ComparePanel(QtWidgets.QWidget):
         self._norm_strip_edit.textChanged.connect(self._update_id_preview)
 
         self._mode_box = QtWidgets.QGroupBox("Comparison mode")
-        self._mode_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._mode_box.setStyleSheet(group_box_style())
         mb_layout = QtWidgets.QVBoxLayout(self._mode_box)
-        self._radio_sets = QtWidgets.QRadioButton(
-            "Compare sets with each other — identical /IUPAC compatible /different /unique"
-        )
-        self._radio_sets_src = "Compare sets with each other — identical /IUPAC compatible /different /unique"
+        mb_layout.setContentsMargins(16, 16, 16, 16)
+        mb_layout.setSpacing(8)
+        self._radio_sets_src = "Compare all files with each other"
+        self._radio_sets = QtWidgets.QRadioButton(self._radio_sets_src)
         self._radio_sets.setChecked(True)
-        self._radio_ref = QtWidgets.QRadioButton(
-            "Compare against reference — a file acts as a reference"
-        )
-        self._radio_ref_src = "Compare against reference — a file acts as a reference"
+        self._radio_ref_src = "Compare each file against a reference file"
+        self._radio_ref = QtWidgets.QRadioButton(self._radio_ref_src)
         mb_layout.addWidget(self._radio_sets)
         mb_layout.addWidget(self._radio_ref)
-        self._layout.addWidget(self._mode_box)
+        self._ignore_ends_src = "Ignore length differences at the ends"
+        self._ignore_ends_chk = QtWidgets.QCheckBox(self._ignore_ends_src)
+        self._ignore_ends_chk.setToolTip(
+            "Compare only the region the barcodes share. When one barcode is a\n"
+            "trimmed version of the other (e.g. with and without primers), the\n"
+            "extra bases at its ends are not counted as differences.\n"
+            "The length difference is still reported in the Length column.")
+        mb_layout.addSpacing(4)
+        mb_layout.addWidget(self._ignore_ends_chk)
 
         self._ref_widget = QtWidgets.QWidget()
         ref_layout = QtWidgets.QHBoxLayout(self._ref_widget)
@@ -587,29 +633,16 @@ class ComparePanel(QtWidgets.QWidget):
         ref_layout.addWidget(self._ref_combo)
         ref_layout.addStretch()
         self._ref_widget.hide()
-        self._layout.addWidget(self._ref_widget)
+        # The reference picker belongs to the "against a reference" mode
+        mb_layout.insertWidget(2, self._ref_widget)
+        self._layout.addWidget(self._mode_box)
 
         # Connect radio to show/hide selector
         self._radio_ref.toggled.connect(self._on_mode_toggled)
+        self._ref_combo.currentIndexChanged.connect(self._update_match_summary)
 
-        # ── Output folder ──
-        outdir_row = QtWidgets.QWidget()
-        outdir_layout = QtWidgets.QHBoxLayout(outdir_row)
-        outdir_layout.setContentsMargins(0, 0, 0, 0)
-        self._lbl_outdir = make_label("Output folder:", color=TEXT_SEC)
-        outdir_layout.addWidget(self._lbl_outdir)
-        self._outdir_edit = QtWidgets.QLineEdit()
-        self._outdir_edit.setPlaceholderText("It will be automatically generated in …/output/ont-barcoder_<timestamp>_comp")
-        self._outdir_edit.setReadOnly(True)
-        outdir_layout.addWidget(self._outdir_edit, 1)
-        self._outdir_btn = QtWidgets.QPushButton("Change…")
-        self._outdir_btn.setObjectName("secondary_btn")
-        self._outdir_btn.setFixedWidth(120)
-        self._outdir_btn.clicked.connect(self._pick_outdir)
-        outdir_layout.addWidget(self._outdir_btn)
-        self._layout.addWidget(outdir_row)
-        outdir_row.hide()          # The folder is chosen in the dialog at startup
-        self._custom_outdir = ""   # empty = use automatic default
+        self._outdir = ""          # folder of the last run (set by MainWindow)
+        self._custom_outdir = ""   # always empty: the folder is asked at start
 
         # ── Progress bar ──
         self._comp_bar = QtWidgets.QProgressBar()
@@ -623,8 +656,14 @@ class ComparePanel(QtWidgets.QWidget):
         self._result_lbl.setWordWrap(True)
         self._layout.addWidget(self._result_lbl)
 
+        self._lbl_legend = make_label(self._LEGEND, size=14, color=TEXT_HINT)
+        self._lbl_legend.setWordWrap(True)
+        self._lbl_legend.hide()
+        self._layout.addWidget(self._lbl_legend)
+
         self._layout.addStretch()
         self._results_win = None   # reference to the last results window
+        self._hdr_cache: dict = {}   # path -> (mtime, headers) for the match summary
 
         # ── Footer ──
         footer = QtWidgets.QWidget()
@@ -653,14 +692,14 @@ class ComparePanel(QtWidgets.QWidget):
         self._view_btn.clicked.connect(self._open_results_win)
         fl.addWidget(self._view_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
         self._open_folder_btn.clicked.connect(self._open_output_folder)
         fl.addWidget(self._open_folder_btn)
 
-        self._open_excel_btn = QtWidgets.QPushButton("Open Excel  📊")
+        self._open_excel_btn = QtWidgets.QPushButton("Open Excel")
         self._open_excel_btn.setObjectName("secondary_btn")
         self._open_excel_btn.setFixedHeight(44)
         self._open_excel_btn.hide()
@@ -694,7 +733,8 @@ class ComparePanel(QtWidgets.QWidget):
             "(tried in order) and normalize the result so the same sample collides across files."))
         self._lbl_id_delim.setText(_tr(ctx, "ID delimiter:"))
         self._lbl_id_occ.setText(_tr(ctx, "before occurrence:"))
-        self._id_delim_anyset_chk.setText(_tr(ctx, "any of these"))
+        self._id_delim_anyset_chk.setText(_tr(
+            ctx, "Delimiter is a set of characters — cut at whichever appears first"))
         self._lbl_id_preview_head.setText(_tr(ctx, "Preview:"))
         arrow = "▼  " if self._advanced_toggle_btn.isChecked() else "▶  "
         self._advanced_toggle_btn.setText(arrow + _tr(ctx, "Advanced (Regex)"))
@@ -706,14 +746,13 @@ class ComparePanel(QtWidgets.QWidget):
         self._mode_box.setTitle(_tr(ctx, "Comparison mode"))
         self._radio_sets.setText(_tr(ctx, self._radio_sets_src))
         self._radio_ref.setText(_tr(ctx, self._radio_ref_src))
+        self._ignore_ends_chk.setText(_tr(ctx, self._ignore_ends_src))
         self._lbl_ref_file.setText(_tr(ctx, "Reference file:"))
-        self._lbl_outdir.setText(_tr(ctx, "Output folder:"))
-        self._outdir_edit.setPlaceholderText(_tr(ctx, "It will be automatically generated in …/output/ont-barcoder_<timestamp>_comp"))
-        self._outdir_btn.setText(_tr(ctx, "Change…"))
+        self._lbl_legend.setText(_tr(ctx, self._LEGEND))
         self._clear_btn.setText(_tr(ctx, "Clear"))
         self._view_btn.setText(_tr(ctx, "Show table  ↗"))
-        self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._open_excel_btn.setText(_tr(ctx, "Open Excel  📊"))
+        self._open_folder_btn.setText(_tr(ctx, "Open folder"))
+        self._open_excel_btn.setText(_tr(ctx, "Open Excel"))
         self._compare_btn.setText(_tr(ctx, "Start comparison  →"))
         self._drop.retranslateUi()
 
@@ -724,6 +763,21 @@ class ComparePanel(QtWidgets.QWidget):
 
     def _on_mode_toggled(self, ref_active):
         self._ref_widget.setVisible(ref_active)
+        self._update_match_summary()
+
+    def _on_delim_changed(self, *_):
+        self._id_delim_edit.setEnabled(
+            self._id_delim_combo.currentData() == self._DELIM_CUSTOM)
+        self._update_id_preview()
+
+    def _id_delim(self) -> str:
+        """The chosen ID delimiter (Custom: the typed text, may be empty)."""
+        data = self._id_delim_combo.currentData()
+        return self._id_delim_edit.text() if data == self._DELIM_CUSTOM else data
+
+    def set_outdir(self, outdir: str):
+        """Folder of the current run (shown with the results)."""
+        self._outdir = outdir
 
     def _on_advanced_toggled(self, checked: bool):
         self._advanced_widget.setVisible(checked)
@@ -762,17 +816,18 @@ class ComparePanel(QtWidgets.QWidget):
         regex lines (Option B) are tried first, then the positional pattern.
         Normalization (Option C) is applied to whichever ID is extracted.
         """
-        delim = self._id_delim_combo.currentText()
+        delim = self._id_delim()
         occ = self._id_occ_combo.currentIndex() + 1
+        advanced = self._advanced_toggle_btn.isChecked()
         if delim:
-            kind = "posany" if self._id_delim_anyset_chk.isChecked() else "pos"
+            kind = "posany" if advanced and self._id_delim_anyset_chk.isChecked() else "pos"
             id_patterns = [f"{kind}:{delim}:{occ}"]
         else:
             id_patterns = []
 
         regex_patterns: list = []
         normalize: dict = {}
-        if self._advanced_toggle_btn.isChecked():
+        if advanced:
             regex_patterns = [ln.strip()
                               for ln in self._regex_edit.toPlainText().splitlines()
                               if ln.strip()]
@@ -789,6 +844,7 @@ class ComparePanel(QtWidgets.QWidget):
 
     def _update_id_preview(self, *_):
         """Update the live ID preview from the first header of the first loaded file."""
+        self._update_match_summary()
         files = getattr(self._drop, 'files', [])
         if not files:
             self._lbl_id_preview.setText("—")
@@ -820,21 +876,77 @@ class ComparePanel(QtWidgets.QWidget):
         except Exception:
             self._lbl_id_preview.setText("—")
 
+    def _file_headers(self, path: str) -> List[str]:
+        """Headers of a FASTA file, cached by modification time."""
+        try:
+            stamp = os.path.getmtime(path)
+        except OSError:
+            return []
+        hit = self._hdr_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        hdrs = []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                hdrs = [ln.strip() for ln in fh if ln.startswith(">")]
+        except OSError:
+            pass
+        self._hdr_cache[path] = (stamp, hdrs)
+        return hdrs
+
+    def _update_match_summary(self, *_):
+        """Under the ID preview: IDs found per file and how many the files
+        share, so a wrong delimiter shows up before running the comparison."""
+        files = list(getattr(self._drop, 'files', []))
+        if len(files) < 1:
+            self._lbl_match_summary.hide()
+            return
+        id_patterns, regex_patterns, normalize = _split_extract_cfg(
+            self._get_extract_cfg())
+        labels = _make_unique_labels(files)
+        ids_by_file, lines = {}, []
+        warn = "color:#B45309"
+        for path, lbl in zip(files, labels):
+            ids, unmatched, headers = set(), 0, self._file_headers(path)
+            for h in headers:
+                sid, ok = _extract_sample_id_ex(h.lstrip(">"), id_patterns, regex_patterns)
+                ids.add(_normalize_id(sid, normalize))
+                unmatched += not ok
+            ids_by_file[path] = ids
+            txt = f"<b>{lbl}</b>: {len(ids)} IDs"
+            if len(headers) > len(ids):
+                txt += f", {len(headers) - len(ids)} repeated"
+            if unmatched:
+                txt += (f", <span style='{warn}'>{unmatched} header(s) without the "
+                        f"delimiter (ID taken before the first ';')</span>")
+            lines.append(txt)
+        if len(lines) > 8:
+            lines = lines[:8] + [f"… and {len(lines) - 8} more files"]
+        if len(files) >= 2:
+            sets = list(ids_by_file.values())
+            if self._radio_ref.isChecked() and self._ref_combo.currentData() in ids_by_file:
+                ref = ids_by_file[self._ref_combo.currentData()]
+                others = set().union(*(v for k, v in ids_by_file.items()
+                                       if k != self._ref_combo.currentData()))
+                shared, what = len(ref & others), f"of {len(ref)} reference IDs found in the other files"
+            else:
+                shared, what = len(set.intersection(*sets)), "IDs present in all files"
+            if shared:
+                lines.append(f"<b>{shared}</b> {what}")
+            else:
+                lines.append(f"<span style='color:#B91C1C'><b>No IDs in common</b> — check "
+                             f"the ID delimiter and occurrence</span>")
+        self._lbl_match_summary.setText("<br>".join(lines))
+        self._lbl_match_summary.show()
+
     def _emit_compare(self):
         mode = "ref" if self._radio_ref.isChecked() else "sets"
         ref_path = (self._ref_combo.currentData() or "") if mode == "ref" else ""
         extract_cfg = self._get_extract_cfg()
+        extract_cfg["ignore_ends"] = self._ignore_ends_chk.isChecked()
         self.compareRequested.emit(
             self._drop.files, mode, ref_path, self._custom_outdir, extract_cfg
         )
-
-    def _pick_outdir(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, _tr("ComparePanel", "Select output folder"), self._custom_outdir or ""
-        )
-        if path:
-            self._custom_outdir = path
-            self._outdir_edit.setText(path)
 
     def _on_files(self, paths):
         # Update reference combo with unique tags
@@ -885,35 +997,35 @@ class ComparePanel(QtWidgets.QWidget):
         n_diff      = sum(1 for r in rows if r.get("State") == "Different")
         n_only      = sum(1 for r in rows if r.get("State", "").startswith("Unique"))
         n_only_ref  = sum(1 for r in rows if r.get("State") == "Only in reference")
-        n_no_ref    = sum(1 for r in rows if r.get("State") == "No reference")
+        n_no_ref    = sum(1 for r in rows if r.get("State") == "Not in reference")
 
         ctx = "ComparePanel"
         summary = (
             f"<b>{_tr(ctx, 'Comparison completed.')}</b> {_tr(ctx, 'Total IDs')}: {len(rows)} &nbsp;|&nbsp; "
-            f"🟢 {_tr(ctx, 'Identical')}: {n_identical}"
+            f"<span style='color:#2D6A0A'><b>{_tr(ctx, 'Identical')}</b></span>: {n_identical}"
         )
-        if n_compat:
-            summary += f" &nbsp;|&nbsp; 🔵 {_tr(ctx, 'Compatibles (IUPAC)')}: {n_compat}"
-        if n_diff:
-            summary += f" &nbsp;|&nbsp; 🔴 {_tr(ctx, 'Different')}: {n_diff}"
-        if n_only:
-            summary += f" &nbsp;|&nbsp; ⚪ {_tr(ctx, 'Unique')}: {n_only}"
-        if n_only_ref:
-            summary += f" &nbsp;|&nbsp; 📌 {_tr(ctx, 'Only in reference')}: {n_only_ref}"
-        if n_no_ref:
-            summary += f" &nbsp;|&nbsp; ❓ {_tr(ctx, 'No reference')}: {n_no_ref}"
+        for n, label, col in ((n_compat, 'Compatible (IUPAC)', '#0D4D8A'),
+                              (n_diff, 'Different', '#8B1A1A'),
+                              (n_only, 'Unique', '#444444'),
+                              (n_only_ref, 'Only in reference', '#6B3D0A'),
+                              (n_no_ref, 'Not in reference', '#3A3A3A')):
+            if n:
+                summary += (f" &nbsp;|&nbsp; <span style='color:{col}'>"
+                            f"<b>{_tr(ctx, label)}</b></span>: {n}")
 
         dups = [f"{inf['alias']} ({inf['ndups']})" for inf in (runs_info or [])
                 if inf.get("ndups")]
         if dups:
-            summary += (f"<br>⚠ {_tr(ctx, 'Repeated IDs merged (best quality kept)')}: "
+            summary += (f"<br><span style='color:#B45309'><b>{_tr(ctx, 'Warning')}:</b></span> "
+                        f"{_tr(ctx, 'Repeated IDs merged (best quality kept)')}: "
                         + ", ".join(dups)
                         + f" — {_tr(ctx, 'check the ID extraction pattern')}")
 
-        outdir_shown = self._outdir_edit.text()
+        outdir_shown = self._outdir
         if outdir_shown:
-            summary += f"<br>📁 {_tr(ctx, 'Output in')}: <i>{outdir_shown}</i>"
+            summary += f"<br>{_tr(ctx, 'Output in')}: <i>{outdir_shown}</i>"
         self._result_lbl.setText(summary)
+        self._lbl_legend.show()
 
         self._compare_btn_ref.setEnabled(True)
         self._open_folder_btn.show()
@@ -938,6 +1050,7 @@ class ComparePanel(QtWidgets.QWidget):
         self._comp_bar.setRange(0, 100)
         self._comp_bar.setValue(0)
         self._result_lbl.setText(f"Comparison failed: {error_summary(msg)}")
+        self._lbl_legend.hide()
         self._compare_btn_ref.setEnabled(len(self._drop.files) >= 2)
         show_error_dialog(self, "Compare error", msg)
 
@@ -947,12 +1060,12 @@ class ComparePanel(QtWidgets.QWidget):
             self._results_win.raise_()
 
     def _open_output_folder(self):
-        path = self._outdir_edit.text()
+        path = self._outdir
         if path and os.path.isdir(path):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
 
     def _open_summary_excel(self):
-        path = self._outdir_edit.text()
+        path = self._outdir
         if path:
             xlsx = os.path.join(path, "summary.xlsx")
             if os.path.isfile(xlsx):
@@ -978,10 +1091,10 @@ class ComparePanel(QtWidgets.QWidget):
 
         # Clear result label
         self._result_lbl.setText("")
+        self._lbl_legend.hide()
 
         # Reset output folder
-        self._outdir_edit.setText("")
-        self._custom_outdir = ""
+        self._outdir = ""
 
         # Reset buttons
         self._view_btn.hide()
@@ -994,7 +1107,8 @@ class ComparePanel(QtWidgets.QWidget):
         )
 
         # Reset ID extraction controls
-        self._id_delim_combo.setCurrentText(";")
+        self._id_delim_combo.setCurrentIndex(0)
+        self._id_delim_edit.clear()
         self._id_occ_combo.setCurrentIndex(0)
         self._id_delim_anyset_chk.setChecked(False)
         self._advanced_toggle_btn.setChecked(False)
@@ -1007,6 +1121,8 @@ class ComparePanel(QtWidgets.QWidget):
         self._lbl_id_preview.setText("—")
         self._lbl_raw_header.setText("")
         self._raw_header_frame.hide()
+        self._lbl_match_summary.hide()
+        self._ignore_ends_chk.setChecked(False)
 
         # Reset radios to initial state
         self._radio_sets.setChecked(True)
@@ -1070,8 +1186,15 @@ def _split_extract_cfg(cfg) -> Tuple[List[str], List[str], dict]:
 
 def _extract_sample_id(raw: str, id_patterns: List[str],
                        regex_patterns: List[str]) -> str:
+    """The sample ID of a header (see _extract_sample_id_ex)."""
+    return _extract_sample_id_ex(raw, id_patterns, regex_patterns)[0]
+
+
+def _extract_sample_id_ex(raw: str, id_patterns: List[str],
+                          regex_patterns: List[str]) -> Tuple[str, bool]:
     """
-    Option B — try each candidate pattern *in order* until one yields an ID.
+    (sample ID, matched?) — try each candidate pattern *in order* until one
+    yields an ID; matched is False when none did and the fallback was used.
 
     Order: regex candidates first (group 1 if present, else full match), then
     positional/substring candidates. A pattern that does not match is skipped so
@@ -1102,7 +1225,7 @@ def _extract_sample_id(raw: str, id_patterns: List[str],
             # matched). Skip empty results so the next candidate gets a chance.
             cand = m.group(1) if (m.lastindex and m.group(1) is not None) else m.group(0)
             if cand:
-                return cand
+                return cand, True
 
     for pat in id_patterns:
         if not pat:
@@ -1117,7 +1240,7 @@ def _extract_sample_id(raw: str, id_patterns: List[str],
                 if chars:
                     positions = [i for i, c in enumerate(raw) if c in chars]
                     if len(positions) >= n:
-                        return raw[:positions[n - 1]]
+                        return raw[:positions[n - 1]], True
             except Exception:
                 continue
         elif pat.startswith("pos:"):
@@ -1127,14 +1250,16 @@ def _extract_sample_id(raw: str, id_patterns: List[str],
             try:
                 sep, _, n_str = pat[len("pos:"):].rpartition(":")
                 n = int(n_str)
-                if sep and sep in raw:
-                    return sep.join(raw.split(sep)[:n])
+                # Fewer delimiters than N: skip, as "posany" does (joining all
+                # parts would return the whole header, which never matches).
+                if sep and raw.count(sep) >= n:
+                    return sep.join(raw.split(sep)[:n]), True
             except Exception:
                 continue
         elif pat in raw:
-            return raw.split(pat)[0]
+            return raw.split(pat)[0], True
 
-    return raw.split(";")[0]
+    return raw.split(";")[0], False
 
 
 def _normalize_id(sample_id: str, normalize: dict) -> str:
@@ -1477,7 +1602,7 @@ def _parse_fasta_file(path: str, cfg=None) -> Tuple[Dict[str, Tuple[str, int, in
 # Sequence comparison (core)
 # ---------------------------------------------------------------------------
 
-def _align_pair(seq1: str, seq2: str):
+def _align_pair(seq1: str, seq2: str, ignore_ends: bool = False):
     """
     Compare seq1 vs seq2 using edlib in NW (global alignment) mode.
     Retorna (d_noamb, d_amb):
@@ -1485,15 +1610,24 @@ def _align_pair(seq1: str, seq2: str):
       d_amb – edit distance with IUPAC ambiguities
     NW ensures that the difference in length is reflected in the distance,
     which is correct for both Coding (same length) and non-Coding (variable length).
+    With ignore_ends the shorter sequence is aligned inside the longer one
+    (edlib HW: end gaps in the longer one are free), so a barcode trimmed
+    differently at the ends is not counted as different.
     """
+    mode = 'NW'
+    if ignore_ends:
+        mode = 'HW'
+        if len(seq1) > len(seq2):
+            seq1, seq2 = seq2, seq1
     # Only the distance is used: task='distance' skips the traceback.
-    d_noamb = edlib.align(seq1, seq2, mode='NW', task='distance')['editDistance']
-    d_amb   = edlib.align(seq1, seq2, mode='NW', task='distance',
+    d_noamb = edlib.align(seq1, seq2, mode=mode, task='distance')['editDistance']
+    d_amb   = edlib.align(seq1, seq2, mode=mode, task='distance',
                           additionalEqualities=_EDLIB_AMBIGUITY)['editDistance']
     return d_noamb, d_amb
 
 
-def _compare_sequences(seq1: str, seq2: str) -> Tuple[str, int, int, bool]:
+def _compare_sequences(seq1: str, seq2: str,
+                       ignore_ends: bool = False) -> Tuple[str, int, int, bool]:
     """
     Compares two sequences and returns (state, d_amb, d_noamb, rc_used).
 
@@ -1505,12 +1639,12 @@ def _compare_sequences(seq1: str, seq2: str) -> Tuple[str, int, int, bool]:
     d_noamb: unambiguous edit distance (for compatible = IUPAC position count)
     rc_used: True if the match was found with the reverse complement
     """
-    d_noamb, d_amb = _align_pair(seq1, seq2)
+    d_noamb, d_amb = _align_pair(seq1, seq2, ignore_ends)
     if d_amb == 0:
         estado = 'identical' if d_noamb == 0 else 'compatible'
         return estado, 0, d_noamb, False
     rc1 = _revcomp(seq1)
-    rc_noamb, rc_amb = _align_pair(rc1, seq2)
+    rc_noamb, rc_amb = _align_pair(rc1, seq2, ignore_ends)
     if rc_amb == 0:
         estado = 'identical' if rc_noamb == 0 else 'compatible'
         return estado, 0, rc_noamb, True
@@ -1523,7 +1657,8 @@ def _compare_sequences(seq1: str, seq2: str) -> Tuple[str, int, int, bool]:
 _IDENTICAL_RESULT = ('identical', 0, 0, False)
 
 
-def _compare_cached(seq1: str, seq2: str, cache: dict) -> Tuple[str, int, int, bool]:
+def _compare_cached(seq1: str, seq2: str, cache: dict,
+                    ignore_ends: bool = False) -> Tuple[str, int, int, bool]:
     """_compare_sequences with two shortcuts that leave the result unchanged:
     equal strings are 'identical' without aligning, and each unordered pair of
     distinct sequences is aligned once (the distances are symmetric). With
@@ -1534,7 +1669,7 @@ def _compare_cached(seq1: str, seq2: str, cache: dict) -> Tuple[str, int, int, b
     key = (seq1, seq2) if seq1 <= seq2 else (seq2, seq1)
     res = cache.get(key)
     if res is None:
-        res = cache[key] = _compare_sequences(*key)
+        res = cache[key] = _compare_sequences(*key, ignore_ends=ignore_ends)
     return res
 
 
@@ -1584,7 +1719,7 @@ _COLOR_MAP_HEX = {
     "Compatible (IUPAC)": "#E6F1FB",
     "Different":          "#FCEBEB",
     "Only in reference": "#FAEEDA",
-    "No reference":     "#F5F5F3",
+    "Not in reference":     "#F5F5F3",
 }
 
 
@@ -1830,7 +1965,7 @@ def _write_outputs(
                 r = get_seq(ref_bn, sid)
                 if r:
                     only_ref_entries.append((sid, r[0]))
-        elif estado == "No reference":
+        elif estado == "Not in reference":
             for bn in all_bns:
                 if bn == ref_bn:
                     continue
@@ -1915,6 +2050,7 @@ class _CompareWorker(_CompareWorkerBase):
         self.file_list   = file_list
         self.outdir      = outdir
         self.extract_cfg = extract_cfg
+        self.ignore_ends = isinstance(extract_cfg, dict) and bool(extract_cfg.get("ignore_ends"))
 
     def _run(self):
         file_list = self.file_list
@@ -1986,7 +2122,8 @@ class _CompareWorker(_CompareWorkerBase):
                     continue
                 s1 = seqs[bn1][sid][0]
                 s2 = seqs[bn2][sid][0]
-                pair_results[(bn1, bn2)] = _compare_cached(s1, s2, align_cache)
+                pair_results[(bn1, bn2)] = _compare_cached(s1, s2, align_cache,
+                                                           self.ignore_ends)
 
             # Length column: show when any pair has different lengths
             lens = {bn: len(seqs[bn][sid][0]) for bn in present_in}
@@ -2116,6 +2253,7 @@ class _PairCompareWorker(_CompareWorkerBase):
         self.ref_path    = ref_path
         self.outdir      = outdir
         self.extract_cfg = extract_cfg
+        self.ignore_ends = isinstance(extract_cfg, dict) and bool(extract_cfg.get("ignore_ends"))
 
     def _run(self):
         file_list = self.file_list
@@ -2204,7 +2342,7 @@ class _PairCompareWorker(_CompareWorkerBase):
             # ── No reference ──────────────────────────────────────────────
             if ref_seq is None:
                 present_bns = [bn for bn in comp_bns if sid in seqs.get(bn, {})]
-                row["State"]      = "No reference"
+                row["State"]      = "Not in reference"
                 row["Best_run"]   = ""
                 row["Diff_bases"] = ""
                 row["Note"]       = "Only in " + _compress_aliases(
@@ -2234,7 +2372,7 @@ class _PairCompareWorker(_CompareWorkerBase):
 
                 comp_seq = seqs[bn][sid][0]
                 estado_raw, d_amb, d_noamb, rc_used = _compare_cached(
-                    ref_seq, comp_seq, align_cache)
+                    ref_seq, comp_seq, align_cache, self.ignore_ends)
 
                 estados_por_bn[bn] = estado_raw
                 dists_por_bn[bn]   = d_amb
