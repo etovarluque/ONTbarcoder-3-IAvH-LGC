@@ -19,6 +19,39 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 
 ---
 
+## [3.6.5] — 2026-10-06
+
+### Added
+- **BLAST: resume a stopped run.** Each run keeps `blast-<ts>.state.json`
+  (sequences already answered, including no-hit ones, and the run's
+  parameters). **Resume run…** searches only the missing sequences, always as
+  new searches, appends them to the same `.tsv`, and rebuilds the `.xlsx`,
+  query taxonomy, `nohit_seqs`, `missing_seqs` and the run log for the whole
+  run. Hits per sequence and sequences per search may be changed on resume,
+  after confirmation; the change is logged per session.
+- **FASTA Tools: Split FASTA file**, by number of sequences, into a number of
+  files, by total bases per file, or one file per header field value. Output
+  goes to `<name>_split/`; every sequence lands in exactly one file and is
+  never cut.
+
+### Changed
+- The mouse wheel no longer changes numeric fields, drop-down lists or
+  sliders anywhere in the app; it scrolls the page instead.
+- BLAST panel: the two tabs are card-style, with an icon and a one-line
+  subtitle, so *BLAST web results* is not overlooked. The *Open results*
+  button was removed (use *Open folder*); *Run BLAST* narrows on small
+  windows instead of being clipped.
+- BLAST: the Manual batch size defaults to 50 sequences per search (was 100).
+- Top bar: "barcoder" in the app name is shown in the accent blue.
+
+### Fixed
+- BLAST log: the *Output* line's separator is aligned with the others.
+- A harmless Qt warning about tooltip geometry
+  (`QWindowsWindow::setGeometry: Unable to set geometry …`) is no longer
+  printed to the console.
+
+---
+
 ## [3.6.0] — 2026-10-06
 
 ### Added

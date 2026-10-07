@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ONTbarcoder 3.6.0 — User Manual</title>
+<title>ONTbarcoder 3.6.5 — User Manual</title>
 <style>
   :root{
     --blue:#185FA5; --blue-mid:#378ADD; --blue-lt:#E6F1FB;
@@ -113,7 +113,7 @@
 <aside id="sidebar">
   <div class="brand">
     <h1>ONTbarcoder</h1>
-    <span class="ver">v3.6.0 — User Manual</span>
+    <span class="ver">v3.6.5 — User Manual</span>
   </div>
   <nav>
     <div class="sec">Getting started</div>
@@ -285,7 +285,10 @@ version</b> or <b>Remind me later</b>; untick <i>Check for updates at start-up</
 pipeline) and <b>Utilities</b> (standalone tools). The tab follows whichever panel is open,
 and every item carries a monochrome icon that changes colour with its state. The
 <b>Dark</b>/<b>Light</b> button in the top bar switches the colour theme; the choice is
-remembered between sessions. A typical run moves through the workflow panels in order:</p>
+remembered between sessions. The mouse wheel scrolls the page and never changes a value:
+numeric fields, drop-down lists and sliders ignore it, so scrolling past a parameter cannot
+edit it by accident (use the keyboard, the field's arrows or a click instead). A typical run
+moves through the workflow panels in order:</p>
 
 <div class="phase-flow">
   <div class="step"><div class="n">PANEL 1</div><div class="t">Input files</div>
@@ -1094,7 +1097,8 @@ processing</b> to treat them as a single dataset, or process each file individua
 
 <figure class="">
   <img src="images/util-tools.png" alt="FASTA Tools utility">
-  <figcaption><b>Figure 8.</b> The FASTA Tools utility.</figcaption>
+  <figcaption><b>Figure 8.</b> The FASTA Tools utility, here with the <b>Split FASTA
+  file</b> operation selected.</figcaption>
 </figure>
 <table>
   <tr><th>Operation</th><th>Description</th></tr>
@@ -1167,6 +1171,22 @@ processing</b> to treat them as a single dataset, or process each file individua
           barcodes (e.g. CytB 1 062&nbsp;bp with stop) to the coding region produced in
           coding mode (1 032&nbsp;bp) before comparing them in Compare.</td></tr>
   <tr><td><b>Sort sequences</b></td><td>Reorder records by a chosen field.</td></tr>
+  <tr><td><b>Split FASTA file</b></td>
+      <td>Split each file (or the merged set) into several FASTA files, written to a
+          <code>&lt;name&gt;_split</code> folder. Every sequence goes to exactly one file
+          and sequences are never cut. Four ways:
+          <b>By number of sequences</b> — files of <i>N</i> sequences
+          (<code>&lt;name&gt;_part01.fasta</code>, <code>_part02</code>…; the last may hold
+          fewer), e.g. batches for BLAST on the NCBI website;
+          <b>Into a number of files</b> — <i>N</i> files of near-equal size;
+          <b>By total length</b> — consecutive files of at most <i>N</i> bases
+          (1&nbsp;000&nbsp;000 is NCBI's limit per blastn query; a single longer sequence
+          gets a file of its own);
+          <b>By header field</b> — one file per distinct value of a header field, named
+          after it (e.g. one file per sample or species). Unlike <b>Extract</b> or
+          <b>Filter</b>, which write one file with the sequences matching a value you
+          type, this needs no values and leaves no sequence out: headers without the
+          field go to <code>&lt;name&gt;_no_field.fasta</code>.</td></tr>
 </table>
 
 <h4>Matching sequence IDs (Append info · Match whole ID)</h4>
@@ -1250,7 +1270,8 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
 
 <figure class="">
   <img src="images/util-blast.png" alt="BLAST utility">
-  <figcaption><b>Figure 10.</b> BLAST API Search: batch submission and taxonomy options.</figcaption>
+  <figcaption><b>Figure 10.</b> BLAST API Search: batch submission and taxonomy options;
+  <b>Resume run…</b> next to <b>Run BLAST</b> continues a stopped run.</figcaption>
 </figure>
 <ul>
   <li>Configurable: BLAST program (<code>blastn + MEGABLAST</code> &mdash; recommended,
@@ -1273,7 +1294,9 @@ and its hits written incrementally to a timestamped <code>.tsv</code> (and an
       <code>missing_seqs_&lt;ts&gt;.fa</code> — including a batch whose search finished
       but whose results could not be downloaded (the log gives its RID), so a network
       failure is never reported as "no hit". Both counts, and the names of the
-      no-match queries, are recorded in <code>blast_run_log_&lt;ts&gt;.txt</code>.</li>
+      no-match queries, are recorded in <code>blast_run_log_&lt;ts&gt;.txt</code>.
+      The missing sequences do not need to be re-run by hand: <b>Resume run…</b> finishes
+      them into the same table (see <i>Stopping and resuming a run</i> below).</li>
 </ul>
 <h4>Batch size &mdash; Automatic and Manual</h4>
 <p>Every batch is submitted to NCBI as <b>one BLAST search</b>, so the way the run is split
@@ -1297,8 +1320,9 @@ most users expect:</p>
 still lighter on that quota. But in practice, testing a real run against <code>core_nt</code>
 with MEGABLAST showed batches of 500 and even 250 sequences silently rejected by the
 undocumented CPU-time limit, while <b>100 sequences per search</b> worked reliably &mdash; so
-that is both the ceiling Automatic mode uses and the default Manual starts from, well under
-the base-length or daily-searches limits. A second API key does not lift either NCBI limit:
+that is the ceiling Automatic mode uses, well under the base-length or daily-searches limits.
+On a busy public queue even 100-sequence searches can take most of the waiting time, which is
+why Manual's own default is half that (50). A second API key does not lift either NCBI limit:
 it applies to the IP, not the account.</p>
 <p>The <b>Sequences per BLAST search</b> row therefore offers two modes:</p>
 <ul>
@@ -1309,8 +1333,8 @@ it applies to the IP, not the account.</p>
       sequences per search, so that one failure never costs the whole run. There is no number
       to set, so the box is hidden; the plan line below states the result.</li>
   <li><b>Manual</b> &mdash; the number box appears and you set it yourself, from 1 to 1000.
-      It starts from the value Automatic had computed (100, by default), so you adjust from a
-      sensible figure rather than from scratch. Raising it well above 100 risks the
+      It starts from the value Automatic had computed for the loaded files (50 when no file
+      is loaded yet), so you adjust from a sensible figure rather than from scratch. Raising it well above 100 risks the
       undocumented CPU-time rejection above, especially against <code>core_nt</code>.</li>
 </ul>
 <p>In both modes a line under the row shows the resulting plan before you run anything, for
@@ -1334,9 +1358,42 @@ server are at least 10&nbsp;s apart, as NCBI's URL API guidelines ask. Only the 
 is downloaded while waiting, not the full result page. A short batch therefore takes at least
 about a minute. <b>Stop</b> takes effect within about 30&nbsp;s even in the middle of a network
 request. If the budget runs
-out, the log reports the <b>RID</b> so the search can still be retrieved by hand at
-<code>blast.ncbi.nlm.nih.gov</code> &mdash; it is usually still running there &mdash; and the
-sequences of that batch go to <code>missing_seqs_&lt;ts&gt;.fa</code>.</p>
+out, the log reports the <b>RID</b> (the search can still be retrieved by hand at
+<code>blast.ncbi.nlm.nih.gov</code>, where it is usually still running) and the batch is
+submitted again as two smaller searches, as for a rejected batch above; only a batch that
+cannot be split further goes to <code>missing_seqs_&lt;ts&gt;.fa</code>. A search can also stay
+in NCBI's queue indefinitely: rather than waiting the whole budget, you can press <b>Stop</b>
+and then <b>Resume run…</b>, which submits that batch again as a new search.</p>
+
+<h4>Stopping and resuming a run</h4>
+<p>Each run keeps a small state file, <code>blast-&lt;ts&gt;.state.json</code>, next to its
+<code>.fa</code> and <code>.tsv</code>. It is updated after every batch with the sequences
+already answered (including those with no hit, which leave no row in the table) and the run's
+parameters. A stopped run &mdash; or one that finished with sequences in
+<code>missing_seqs_&lt;ts&gt;.fa</code> &mdash; can therefore be finished later without
+handling FASTA files or merging tables by hand:</p>
+<ol>
+  <li>Press <b>Resume run…</b> (next to <b>Run BLAST</b>) and pick the run's
+      <code>blast-&lt;ts&gt;.state.json</code>. After a run stopped in this session the
+      dialog opens on it already; this file is the only one to select.</li>
+  <li>Only the sequences not yet in the table are searched, always as <b>new searches</b>
+      (new RIDs): a search the stopped run left waiting at NCBI is never reused, since a RID
+      can stay queued indefinitely and is often the reason the run was stopped.</li>
+  <li>Their hits are appended to the <b>same</b> <code>.tsv</code>. At the end the
+      <code>.xlsx</code>, the query-taxonomy columns and <i>Tax_level_match</i> (§13.3),
+      <code>nohit_seqs</code> and the run log are rebuilt for the whole run, and
+      <code>missing_seqs</code> is deleted once nothing is left. The result is one table, as
+      if the run had never been interrupted; a run can be stopped and resumed any number of
+      times.</li>
+</ol>
+<p>The run keeps its own database, program, taxonomy option and query-taxonomy reference
+file, whatever the panel shows, so every row of the table is comparable &mdash; the reference
+file does not need to be loaded again. The API key is taken from the panel. Two settings may
+change between sessions: <b>Hits per sequence</b> and <b>Sequences per BLAST search</b>
+(Manual mode). When the panel's values differ from the run's, a dialog lists the differences
+and asks which to use (<b>Keep the run's</b> is the default, since after a restart the panel
+may simply show its defaults); the change is logged and saved for later sessions. More hits
+apply only to the sequences searched from then on.</p>
 
 <div class="tip">
 <b>Feeding the Best Sequence utility</b>
@@ -1378,7 +1435,8 @@ dropped at once to combine several jobs.</p>
 
 <figure class="">
   <img src="images/util-blast-file.png" alt="BLAST web results tab">
-  PLACEHOLDER &middot; drop images/util-blast-file.png here
+  <figcaption><b>Figure 11.</b> BLAST web results: parse a Hit Table downloaded from the
+  NCBI website, without a new search.</figcaption>
 </figure>
 <ul>
   <li><b>Hits per sequence to keep</b> caps how many of the file's hits are kept per query,
@@ -1490,7 +1548,7 @@ having to process the library twice.
 
 <figure class="">
   <img src="images/util-best.png" alt="Best Sequence utility">
-  <figcaption><b>Figure 11.</b> The Best Sequence utility: paired FASTA + BLAST inputs and
+  <figcaption><b>Figure 12.</b> The Best Sequence utility: paired FASTA + BLAST inputs and
   the scoring settings.</figcaption>
 </figure>
 
@@ -1795,7 +1853,7 @@ Formatter</b> in the sidebar, just below <b>Best Sequence</b>.</p>
 
 <figure class="">
   <img src="images/util-bold.png" alt="BOLD Formatter utility">
-  PLACEHOLDER &middot; drop images/util-bold.png here
+  <figcaption><b>Figure 13.</b> The BOLD Formatter utility.</figcaption>
 </figure>
 
 <h4>15.1 Input</h4>
@@ -1842,7 +1900,7 @@ from the <b>Notes</b> item in the <b>Utilities</b> tab of the sidebar.</p>
 
 <figure class="">
   <img src="images/util-notes.png" alt="Notes utility">
-  <figcaption><b>Figure 13.</b> The Notes utility: note list on the left, Markdown editor
+  <figcaption><b>Figure 14.</b> The Notes utility: note list on the left, Markdown editor
   and preview on the right.</figcaption>
 </figure>
 
@@ -1904,7 +1962,7 @@ Not available in Real-Time mode.</p>
 
 <figure class="">
   <img src="images/util-batch.png" alt="Parameter Sweep utility">
-  PLACEHOLDER · drop images/util-batch.png here
+  <figcaption><b>Figure 15.</b> The Parameter Sweep utility.</figcaption>
 </figure>
 
 <h4>17.1 The <code>.cfg</code> grid file</h4>
@@ -2204,6 +2262,20 @@ forced to a single internal thread). Optimal concurrency therefore tracks the nu
   <tr><td>"Output file locked" during BLAST</td>
       <td>The result <code>.tsv</code>/<code>.xlsx</code> is open in Excel. Close it; the
           writer resumes automatically.</td></tr>
+  <tr><td>BLAST: "NCBI did not accept the request (connection error: [Errno 11001]
+          getaddrinfo failed)"</td>
+      <td>The computer could not look up NCBI's server name: a DNS problem of the network,
+          not of the program (it happens with any version). Often the router's DNS refuses
+          some names for a while and then recovers. Retry later, restart the router, or set
+          a public DNS on the network adapter (e.g. <code>8.8.8.8</code> and
+          <code>1.1.1.1</code>); on an institutional network ask IT to allow
+          <code>blast.ncbi.nlm.nih.gov</code> and <code>eutils.ncbi.nlm.nih.gov</code>.
+          Meanwhile the <b>BLAST web results</b> tab (§13.2) still works.</td></tr>
+  <tr><td>BLAST waits a long time on the same RID</td>
+      <td>NCBI's queue is busy, or the search is stuck there. Press <b>Stop</b>, then
+          <b>Resume run…</b>: the batch is submitted again as a new search and the rest of the
+          run continues in the same table. Fewer sequences per search (Manual mode) usually
+          return sooner. See §13.1 — <i>Stopping and resuming a run</i>.</td></tr>
   <tr><td>Few reads pass demultiplexing</td>
       <td>Check tag length consistency, primer sequences, and the <i>Minimum length</i> /
           length-window settings against your amplicon. Increase <i>Primer/Tag mismatches
@@ -2265,7 +2337,7 @@ identification with real-time barcoding facilitated by Oxford Nanopore R10.4.
 </main>
 
 <footer>
-ONTbarcoder 3.6.0 — User Manual · Generated for the research community ·
+ONTbarcoder 3.6.5 — User Manual · Generated for the research community ·
 Defaults shown are tuned for the 658&nbsp;bp COI barcode.
 </footer>
 

@@ -278,12 +278,35 @@ class _RoundTooltips(QtCore.QObject):
 _TOOLTIP_FILTER = []
 
 
+class _NoWheelEdits(QtCore.QObject):
+    """Stops the mouse wheel from changing spin boxes, combo boxes and
+    sliders, so scrolling a parameter page never edits the field under the
+    cursor.  The event is ignored rather than eaten, so Qt passes it on to
+    the parent scroll area and the page still scrolls."""
+
+    _TYPES = (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QAbstractSlider)
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.Wheel
+                and isinstance(obj, self._TYPES)
+                and not isinstance(obj, QtWidgets.QScrollBar)):
+            event.ignore()
+            return True
+        return False
+
+
+_WHEEL_FILTER = []
+
+
 def install_hooks():
     """Must run after QApplication exists and before any panel is built."""
     app = QtWidgets.QApplication.instance()
     if app is not None and not _TOOLTIP_FILTER:
         _TOOLTIP_FILTER.append(_RoundTooltips(app))
         app.installEventFilter(_TOOLTIP_FILTER[0])
+    if app is not None and not _WHEEL_FILTER:
+        _WHEEL_FILTER.append(_NoWheelEdits(app))
+        app.installEventFilter(_WHEEL_FILTER[0])
     QtWidgets.QWidget.setStyleSheet = _themed_set_ss
     QtWidgets.QTableWidgetItem.setBackground = _themed_set_bg
     QtWidgets.QTableWidgetItem.setForeground = _themed_set_fg

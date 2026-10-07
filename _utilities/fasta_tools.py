@@ -573,6 +573,134 @@ class _FastaToolsWorker(QtCore.QThread):
             outputs.append(out_path)
         return outputs
 
+    @staticmethod
+    def _safe_filename(value: str) -> str:
+        """A header field value made safe as part of a file name on Windows,
+        macOS and Linux."""
+        import re as _re
+        s = _re.sub(r'[<>:"/\\|?*\s]+', "_", value.strip()).strip("._")
+        return s[:80] or "empty"
+
+    def _run_split(self):
+        """Split each input into several FASTA files, written to <stem>_split/.
+
+        Modes: "count" (N sequences per file), "files" (N files of near-equal
+        size), "bases" (at most N bases per file; a longer single sequence
+        still gets a file of its own — a sequence is never cut) and "field"
+        (one file per distinct value of a header field, in order of first
+        appearance). Every sequence ends up in exactly one file.
+        """
+        mode  = self._params.get("mode", "count")
+        value = int(self._params.get("value", 1))
+        separator = self._params.get("separator", "|")
+        field_idx = int(self._params.get("field", 1)) - 1
+
+        def _field_value(header):
+            parts = header.split(separator) if separator else [header]
+            if field_idx >= len(parts):
+                return None
+            raw = parts[field_idx].strip()
+            # For key=value fields (e.g. "sample=DNS-1"), use the value part,
+            # as Filter sequences by header fields does.
+            if "=" in raw:
+                raw = raw.split("=", 1)[1].strip()
+            return raw
+
+        mode_desc = {
+            "count": f"{value} sequences per file",
+            "files": f"into {value} files",
+            "bases": f"at most {value:,} bases per file",
+            "field": f'one file per value of field {field_idx + 1} '
+                     f'(separator "{separator}")',
+        }[mode]
+
+        outputs = []
+        for display_name, stem, records in self._iter_inputs():
+            if self._stop:
+                break
+            if not records:
+                self.log_line.emit(f"{display_name}\n  No sequences — nothing to split.\n")
+                continue
+
+            # ── Group the records (order kept) ──
+            named_groups = []          # (file name suffix, records)
+            if mode == "field":
+                by_value: dict = {}
+                for rec in records:
+                    v = _field_value(rec[0])
+                    key = "no_field" if v is None else self._safe_filename(v)
+                    by_value.setdefault(key, []).append(rec)
+                # Different values can map to the same safe name, and Windows
+                # file names ignore case: keep every file name distinct.
+                used: set = set()
+                for key, recs in by_value.items():
+                    name, n = key, 2
+                    while name.lower() in used:
+                        name, n = f"{key}_{n}", n + 1
+                    used.add(name.lower())
+                    named_groups.append((name, recs))
+            else:
+                if mode == "count":
+                    groups = [records[i:i + value] for i in range(0, len(records), value)]
+                elif mode == "files":
+                    k = min(value, len(records))
+                    size, extra = divmod(len(records), k)
+                    groups, pos = [], 0
+                    for i in range(k):
+                        n = size + (1 if i < extra else 0)
+                        groups.append(records[pos:pos + n])
+                        pos += n
+                else:  # bases
+                    groups, cur, cur_bases = [], [], 0
+                    for rec in records:
+                        n = len(rec[1])
+                        if cur and cur_bases + n > value:
+                            groups.append(cur)
+                            cur, cur_bases = [], 0
+                        cur.append(rec)
+                        cur_bases += n
+                    if cur:
+                        groups.append(cur)
+                width = max(2, len(str(len(groups))))
+                named_groups = [(f"part{i:0{width}d}", g) for i, g in enumerate(groups, 1)]
+
+            # ── Write ──
+            split_dir = os.path.join(self._out_dir, f"{stem}_split")
+            for suffix, recs in named_groups:
+                if self._stop:
+                    break
+                path = os.path.join(split_dir, f"{stem}_{suffix}.fasta")
+                self._write_fasta(recs, path)
+                outputs.append(path)
+
+            sizes = [len(r) for _s, r in named_groups]
+            lines = [
+                display_name,
+                f"  Split            :  {mode_desc}",
+                f"  Total sequences  :  {len(records)}",
+                f"  Files written    :  {len(named_groups)}  →  {os.path.basename(split_dir)}/",
+                f"  Sequences / file :  {min(sizes)}–{max(sizes)}" if len(set(sizes)) > 1
+                else f"  Sequences / file :  {sizes[0]}",
+            ]
+            if mode == "bases":
+                bases = [sum(len(s) for _h, s in r) for _n, r in named_groups]
+                lines.append(f"  Bases / file     :  {min(bases):,}–{max(bases):,}")
+                over = sum(1 for b in bases if b > value)
+                if over:
+                    lines.append(f"  Note             :  {over} file(s) hold a single sequence "
+                                 f"longer than {value:,} bases (sequences are never cut)")
+            if mode == "field":
+                missing = sum(len(r) for n, r in named_groups if n == "no_field")
+                if missing:
+                    lines.append(f"  Without field {field_idx + 1}  :  {missing} sequence(s) "
+                                 f"→ {stem}_no_field.fasta")
+                shown = named_groups[:20]
+                lines.append("  Values           :  " + ", ".join(
+                    f"{n} ({len(r)})" for n, r in shown)
+                    + (f", … +{len(named_groups) - 20} more" if len(named_groups) > 20 else ""))
+            self.log_line.emit("\n".join(lines) + "\n")
+        return outputs
+
     # Stop codons per genetic code (NCBI tables 1, 2, 5 and 11; DNA alphabet)
     _STOPS = {
         "Standard":                   {"TAA", "TAG", "TGA"},
@@ -826,6 +954,8 @@ class _FastaToolsWorker(QtCore.QThread):
                 outputs = self._run_sort()
             elif self._operation == "filter_fields":
                 outputs = self._run_filter_fields()
+            elif self._operation == "split":
+                outputs = self._run_split()
             else:
                 raise ValueError(f"Unknown operation: {self._operation}")
             if not self._stop:
@@ -1053,6 +1183,10 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._radio_append       = QtWidgets.QRadioButton("Append info to headers from .xlsx file")
         self._radio_reformat     = QtWidgets.QRadioButton("Reformat sequence lines")
         self._radio_sort         = QtWidgets.QRadioButton("Sort sequences")
+        self._radio_split        = QtWidgets.QRadioButton("Split FASTA file")
+        self._radio_split.setToolTip(
+            "Split into several FASTA files: by number of sequences, into a number\n"
+            "of files, by total bases per file, or one file per header field value.")
         self._radio_orf          = QtWidgets.QRadioButton(
             "Trim to coding ORF (remove stop codon and 3′ tail)")
         self._radio_orf.setToolTip(
@@ -1068,7 +1202,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         for rb in (self._radio_stats, self._radio_unique, self._radio_identical,
                    self._radio_grep, self._radio_filter_fields,
                    self._radio_append, self._radio_reformat, self._radio_orf,
-                   self._radio_sort):
+                   self._radio_sort, self._radio_split):
             self._op_group.addButton(rb)
 
         self._radio_stats.setChecked(True)
@@ -1481,6 +1615,119 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._sort_widget.hide()
         ops_layout.addWidget(self._sort_widget)
 
+        ops_layout.addSpacing(4)
+        ops_layout.addWidget(self._radio_split)
+
+        self._split_widget = QtWidgets.QWidget()
+        spl = QtWidgets.QVBoxLayout(self._split_widget)
+        spl.setContentsMargins(20, 4, 0, 4)
+        spl.setSpacing(8)
+
+        split_note = make_label(
+            "Every sequence goes to exactly one file; sequences are never cut. "
+            "Files are written to a <name>_split folder.",
+            color=TEXT_SEC, size=15,
+        )
+        split_note.setWordWrap(True)
+        spl.addWidget(split_note)
+
+        self._split_mode_group = QtWidgets.QButtonGroup(self)
+
+        def _mode_row(label, spin, unit, tip):
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(8)
+            rb = QtWidgets.QRadioButton(label)
+            rb.setToolTip(tip)
+            self._split_mode_group.addButton(rb)
+            row.addWidget(rb)
+            if spin is not None:
+                rb.setMinimumWidth(250)   # line the number boxes up
+                spin.setFixedWidth(130)
+                spin.setGroupSeparatorShown(True)
+                row.addWidget(spin)
+                row.addWidget(make_label(unit, color=TEXT_SEC))
+            row.addStretch()
+            spl.addLayout(row)
+            return rb
+
+        self._split_count_spin = QtWidgets.QSpinBox()
+        self._split_count_spin.setRange(1, 10_000_000)
+        self._split_count_spin.setValue(50)
+        self._split_by_count = _mode_row(
+            "By number of sequences:", self._split_count_spin, "sequences per file",
+            "Consecutive files of this many sequences (the last one may hold fewer).\n"
+            "E.g. batches for BLAST on the NCBI website.")
+
+        self._split_files_spin = QtWidgets.QSpinBox()
+        self._split_files_spin.setRange(2, 10_000)
+        self._split_files_spin.setValue(4)
+        self._split_by_files = _mode_row(
+            "Into a number of files:", self._split_files_spin, "files",
+            "Sequences shared out in order into this many files of near-equal size\n"
+            "(sizes differ by one at most).")
+
+        self._split_bases_spin = QtWidgets.QSpinBox()
+        self._split_bases_spin.setRange(1_000, 2_000_000_000)
+        self._split_bases_spin.setSingleStep(100_000)
+        self._split_bases_spin.setValue(1_000_000)
+        self._split_by_bases = _mode_row(
+            "By total length:", self._split_bases_spin, "bases per file at most",
+            "Consecutive files whose sequences add up to at most this many bases.\n"
+            "1,000,000 is NCBI BLAST's limit per blastn query. A single sequence\n"
+            "longer than the limit gets a file of its own.")
+
+        self._split_by_field = _mode_row(
+            "By header field — one file per distinct value", None, "",
+            "One file per distinct value of the chosen header field, named after it\n"
+            "(e.g. one file per sample or per species). Unlike Extract or Filter, you\n"
+            "do not need to know or type the values, and no sequence is left out:\n"
+            "headers without that field go to <name>_no_field.fasta.")
+        self._split_by_count.setChecked(True)
+
+        # Field options, shown only for "By header field"
+        self._split_field_box = QtWidgets.QWidget()
+        sfl = QtWidgets.QVBoxLayout(self._split_field_box)
+        sfl.setContentsMargins(24, 0, 0, 0)
+        sfl.setSpacing(6)
+        sf_row = QtWidgets.QHBoxLayout()
+        sf_row.setSpacing(12)
+        sf_row.addWidget(make_label("Field separator:", color=TEXT_SEC))
+        self._split_sep_group = QtWidgets.QButtonGroup(self)
+        self._split_sep_pipe   = QtWidgets.QRadioButton('"|"  pipe')
+        self._split_sep_semi   = QtWidgets.QRadioButton('";"  semicolon')
+        self._split_sep_custom = QtWidgets.QRadioButton("Custom:")
+        self._split_sep_pipe.setChecked(True)
+        for rb in (self._split_sep_pipe, self._split_sep_semi, self._split_sep_custom):
+            self._split_sep_group.addButton(rb)
+            sf_row.addWidget(rb)
+        self._split_sep_custom_edit = QtWidgets.QLineEdit()
+        self._split_sep_custom_edit.setFixedWidth(64)
+        self._split_sep_custom_edit.setPlaceholderText("e.g. _")
+        self._split_sep_custom_edit.setMaxLength(5)
+        self._split_sep_custom_edit.hide()
+        sf_row.addWidget(self._split_sep_custom_edit)
+        sf_row.addSpacing(12)
+        sf_row.addWidget(make_label("Field:", color=TEXT_SEC))
+        self._split_field_spin = QtWidgets.QSpinBox()
+        self._split_field_spin.setRange(1, 99)
+        self._split_field_spin.setFixedWidth(70)
+        sf_row.addWidget(self._split_field_spin)
+        sf_row.addStretch()
+        sfl.addLayout(sf_row)
+        self._split_field_preview = make_label("", size=14, color=TEXT_HINT)
+        self._split_field_preview.setWordWrap(True)
+        sfl.addWidget(self._split_field_preview)
+        self._split_field_box.hide()
+        spl.addWidget(self._split_field_box)
+
+        self._split_mode_group.buttonClicked.connect(self._on_split_mode_changed)
+        self._split_sep_group.buttonClicked.connect(self._on_split_sep_changed)
+        self._split_sep_custom_edit.textChanged.connect(self._update_split_preview)
+        self._split_field_spin.valueChanged.connect(self._update_split_preview)
+
+        self._split_widget.hide()
+        ops_layout.addWidget(self._split_widget)
+
         self._layout.addWidget(ops_box)
 
         self._status_lbl = make_label("", color=TEXT_SEC)
@@ -1601,6 +1848,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._update_ff_preview()
         self._update_append_preview()
         self._update_grep_preview()
+        self._update_split_preview()
 
     def _on_operation_changed(self, _btn):
         self._stats_widget.setVisible(self._radio_stats.isChecked())
@@ -1610,6 +1858,9 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._reformat_widget.setVisible(self._radio_reformat.isChecked())
         self._orf_widget.setVisible(self._radio_orf.isChecked())
         self._sort_widget.setVisible(self._radio_sort.isChecked())
+        self._split_widget.setVisible(self._radio_split.isChecked())
+        if self._radio_split.isChecked():
+            self._update_split_preview()
         if self._radio_sort.isChecked():
             self._update_sort_preview()
         if self._radio_filter_fields.isChecked():
@@ -1619,6 +1870,56 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._status_lbl.setText("")
         self._status_lbl.setStyleSheet("")
         self._open_folder_btn.hide()
+
+    def _split_separator(self) -> str:
+        if self._split_sep_semi.isChecked():
+            return ";"
+        if self._split_sep_custom.isChecked():
+            return self._split_sep_custom_edit.text()
+        return "|"
+
+    def _on_split_mode_changed(self, _btn):
+        self._split_field_box.setVisible(self._split_by_field.isChecked())
+        self._update_split_preview()
+
+    def _on_split_sep_changed(self, _btn):
+        self._split_sep_custom_edit.setVisible(self._split_sep_custom.isChecked())
+        self._update_split_preview()
+
+    def _update_split_preview(self, *_):
+        """Under the field options: how many files "By header field" would
+        write, with a few of the values. Uses the cached headers of the other
+        previews, so changing the field never re-reads a large file."""
+        if not (self._radio_split.isChecked() and self._split_by_field.isChecked()):
+            return
+        if not self._files:
+            self._split_field_preview.setText("—  no files loaded")
+            return
+        headers, truncated = self._headers()
+        if not headers:
+            self._split_field_preview.setText("—  no sequences found")
+            return
+        sep = self._split_separator()
+        idx = self._split_field_spin.value() - 1
+        values, missing = [], 0
+        for hdr in headers:
+            parts = hdr.split(sep) if sep else [hdr]
+            if idx >= len(parts):
+                missing += 1
+                continue
+            v = parts[idx].strip()
+            values.append(v.split("=", 1)[1].strip() if "=" in v else v)
+        distinct = list(dict.fromkeys(values))
+        example = ", ".join(distinct[:5]) + (" …" if len(distinct) > 5 else "")
+        scope = (f"first {len(headers):,} headers" if truncated
+                 else os.path.basename(self._files[0]) if len(self._files) == 1
+                 else f"{len(self._files)} files")
+        text = (f"{scope}: field {idx + 1} has "
+                f"{len(distinct)} distinct value(s) → {len(distinct)} file(s)"
+                + (f"  ·  e.g. {example}" if distinct else ""))
+        if missing:
+            text += f"  ·  {missing} header(s) without this field → _no_field file"
+        self._split_field_preview.setText(text)
 
     def _on_reformat_mode_changed(self, _btn):
         self._wrap_cols_row.setVisible(self._rf_radio_wrap.isChecked())
@@ -1988,6 +2289,16 @@ class FastaToolsPanel(QtWidgets.QWidget):
         self._orf_gcode_combo.setCurrentText("Invertebrate mitochondrial")
         self._orf_cov_spin.setValue(95)
         self._sort_widget.hide()
+        self._split_widget.hide()
+        self._split_by_count.setChecked(True)
+        self._split_count_spin.setValue(50)
+        self._split_files_spin.setValue(4)
+        self._split_bases_spin.setValue(1_000_000)
+        self._split_sep_pipe.setChecked(True)
+        self._split_sep_custom_edit.clear()
+        self._split_sep_custom_edit.hide()
+        self._split_field_spin.setValue(1)
+        self._split_field_box.hide()
 
         self._grep_use_file_chk.setChecked(False)
         self._grep_pattern_edit.clear()
@@ -2054,6 +2365,7 @@ class FastaToolsPanel(QtWidgets.QWidget):
             "append"         if self._radio_append.isChecked()         else
             "reformat"       if self._radio_reformat.isChecked()       else
             "orf_trim"       if self._radio_orf.isChecked()            else
+            "split"          if self._radio_split.isChecked()          else
             "sort"
         )
 
@@ -2120,6 +2432,24 @@ class FastaToolsPanel(QtWidgets.QWidget):
         elif operation == "reformat":
             params["mode"]      = "wrap" if self._rf_radio_wrap.isChecked() else "linearize"
             params["wrap_cols"] = self._wrap_cols_spin.value()
+        elif operation == "split":
+            if self._split_by_field.isChecked():
+                sep = self._split_separator()
+                if not sep:
+                    QtWidgets.QMessageBox.warning(
+                        self, "Split configuration",
+                        "Custom separator is empty.\n"
+                        "Please enter a separator character or choose a different option."
+                    )
+                    return
+                params.update(mode="field", separator=sep,
+                              field=self._split_field_spin.value())
+            elif self._split_by_files.isChecked():
+                params.update(mode="files", value=self._split_files_spin.value())
+            elif self._split_by_bases.isChecked():
+                params.update(mode="bases", value=self._split_bases_spin.value())
+            else:
+                params.update(mode="count", value=self._split_count_spin.value())
         elif operation == "orf_trim":
             params["genetic_code"] = self._orf_gcode_combo.currentText()
             params["min_coverage"] = self._orf_cov_spin.value() / 100.0

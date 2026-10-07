@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
+import re
 import csv
+import json
 import time
 import datetime
 import threading
@@ -929,6 +931,52 @@ class _FullWidthTabBar(QtWidgets.QTabBar):
         return QtCore.QSize(bar_width // count, size.height())
 
 
+class _TwoLineTabBar(_FullWidthTabBar):
+    """Tabs whose text is "title\nsubtitle", with the title TITLE_GROW
+    px larger than the subtitle.
+
+    A tab's text has one font, and the style sheet's ::tab font-size wins over
+    any font set on the painter. So both lines are drawn through the style at
+    the sheet's size (SUB_PX) — which keeps their colour following the tab
+    states (selected, hover) — and the title is drawn scaled up. The sheet
+    must give ::tab font-size: SUB_PX and no vertical padding.
+    """
+    SUB_PX     = 15
+    TITLE_GROW = 4
+
+    def paintEvent(self, event):
+        painter = QtWidgets.QStylePainter(self)
+        font = QtGui.QFont(self.font())
+        font.setPixelSize(self.SUB_PX)
+        line_h = QtGui.QFontMetrics(font).height()
+        scale = (self.SUB_PX + self.TITLE_GROW) / self.SUB_PX
+        for i in range(self.count()):
+            opt = QtWidgets.QStyleOptionTab()
+            self.initStyleOption(opt, i)
+            title, _, sub = opt.text.partition("\n")
+            opt.text = ""
+            painter.drawControl(QtWidgets.QStyle.CE_TabBarTabShape, opt)
+            lines = [(title, scale)] + ([(sub, 1.0)] if sub else [])
+            heights = [round(line_h * k) for _t, k in lines]
+            y = opt.rect.center().y() - sum(heights) // 2 + 1
+            cx = opt.rect.center().x()
+            for (text, k), h in zip(lines, heights):
+                cy = y + h // 2
+                line = QtWidgets.QStyleOptionTab(opt)
+                line.text = text
+                # The style sheet stretches the label rect back to the tab's
+                # min-height and centres the text in it, so pass a full-height
+                # rect centred on this line (in the scaled coordinates).
+                line.rect = opt.rect.translated(0, cy - opt.rect.center().y())
+                painter.save()
+                painter.translate(cx, cy)
+                painter.scale(k, k)
+                painter.translate(-cx, -cy)
+                painter.drawControl(QtWidgets.QStyle.CE_TabBarTabLabel, line)
+                painter.restore()
+                y += h
+
+
 class _FullWidthTabWidget(QtWidgets.QTabWidget):
     """QTabWidget whose tab bar is forced to the widget's own width on every
     resize, so _FullWidthTabBar has the full width to split across tabs
@@ -947,9 +995,20 @@ class _FullWidthTabWidget(QtWidgets.QTabWidget):
 class BlastPanel(QtWidgets.QWidget):
     blastRequested     = QtCore.pyqtSignal(list, dict)   # files, config dict
     stopRequested      = QtCore.pyqtSignal()             # user clicked Stop (tab 1)
+    resumeRequested    = QtCore.pyqtSignal(str, dict)    # run's .state.json, config (API key, param_changes)
     blastFileRequested = QtCore.pyqtSignal(list, dict)   # result files, config dict (tab 2)
     stopFileRequested  = QtCore.pyqtSignal()             # user clicked Stop (tab 2)
     sendToBestSeq      = QtCore.pyqtSignal(list)         # [fasta, results] pair of the last run
+
+    # (icon, title, subtitle) of each tab
+    _TAB_TEXTS = (
+        ("🔎", "BLAST API Search", "Send your FASTA to NCBI from here"),
+        ("🌐", "BLAST web results", "Use a Hit Table downloaded from the NCBI website"),
+    )
+
+    def _tab_text(self, index: int, ctx: str = "BlastPanel") -> str:
+        icon, title, sub = self._TAB_TEXTS[index]
+        return f"{icon}  {_tr(ctx, title)}\n{_tr(ctx, sub)}"
 
     _DATABASES        = ["core_nt", "nt", "refseq_rna", "16S_ribosomal_RNA"]
     _PROGRAMS         = ["blastn&MEGABLAST=on", "blastn", "megablast"]
@@ -1106,11 +1165,13 @@ class BlastPanel(QtWidgets.QWidget):
         # NCBI's documented limit is total query length (1,000,000 bases for
         # blastn), not a sequence count — but in practice its undocumented
         # CPU-time budget for a MEGABLAST job against core_nt rejects a batch
-        # well before that: 500 and 250 sequences/batch both failed in testing,
-        # 100 was the first size that worked reliably, hence the default below.
+        # well before that: 500 and 250 sequences/batch both failed in testing
+        # and 100 was the first size that worked reliably. The default below
+        # is half that: on a busy public queue 100-sequence searches can still
+        # wait for most of the poll budget, and smaller ones return sooner.
         # The worker also auto-splits a batch NCBI still rejects at run time.
         self._batch_spin.setRange(1, 1000)
-        self._batch_spin.setValue(100)
+        self._batch_spin.setValue(50)
         self._batch_spin.setFixedWidth(80)
         self._batch_spin.valueChanged.connect(self._update_batch_plan)
         bl2.addWidget(self._batch_spin)
@@ -1211,13 +1272,6 @@ class BlastPanel(QtWidgets.QWidget):
         self._open_folder_btn.clicked.connect(self._open_output_folder)
         fl.addWidget(self._open_folder_btn)
 
-        self._open_results_btn = QtWidgets.QPushButton("Open results  📄")
-        self._open_results_btn.setObjectName("secondary_btn")
-        self._open_results_btn.setFixedHeight(44)
-        self._open_results_btn.hide()
-        self._open_results_btn.clicked.connect(self._open_results_file)
-        fl.addWidget(self._open_results_btn)
-
         # Hands the queried FASTA + its results table to Best Sequence as a
         # ready-made pair (same base name), so nothing has to be re-selected.
         self._send_best_btn = QtWidgets.QPushButton("Open in Best Sequence  →")
@@ -1241,17 +1295,34 @@ class BlastPanel(QtWidgets.QWidget):
 
         fl.addStretch()
 
+        # Continues a stopped or incomplete run in its own files (see
+        # _BlastWorker._load_resume), so its results end up in one table.
+        self._resume_btn = QtWidgets.QPushButton("Resume run…")
+        self._resume_btn.setObjectName("secondary_btn")
+        self._resume_btn.setFixedHeight(44)
+        self._resume_btn.setToolTip(
+            "Continue a stopped or incomplete BLAST run: only its missing sequences\n"
+            "are searched and their hits are added to the same results table.\n"
+            "Pick the blast-<date>.state.json in the run's folder.")
+        self._resume_btn.clicked.connect(self._emit_resume)
+        fl.addWidget(self._resume_btn)
+        fl.addSpacing(8)
+
         self._blast_btn = QtWidgets.QPushButton("Run BLAST  →")
         self._blast_btn.setObjectName("primary_btn")
         self._blast_btn.setFixedHeight(44)
-        self._blast_btn.setFixedWidth(300)
+        # Up to 300 px, but gives way down to 200 px so a narrow window
+        # does not clip it once the after-run buttons are shown.
+        self._blast_btn.setMinimumWidth(200)
+        self._blast_btn.setMaximumWidth(300)
+        self._blast_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self._blast_btn.setEnabled(False)
         self._blast_btn.clicked.connect(self._emit_blast)
         self._blast_btn.setStyleSheet(
             f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
             f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
         )
-        fl.addWidget(self._blast_btn)
+        fl.addWidget(self._blast_btn, 1)   # takes free space first, up to its 300 px
         outer_layout.addWidget(footer)
 
         # path -> ((mtime, size), [lengths]) so the plan refreshes only when
@@ -1266,9 +1337,27 @@ class BlastPanel(QtWidgets.QWidget):
         self._page2 = self._build_file_tab()
 
         self._tabs = _FullWidthTabWidget()
-        self._tabs.setTabBar(_FullWidthTabBar())
-        self._tabs.addTab(self._page1, "BLAST API Search")
-        self._tabs.addTab(self._page2, "BLAST web results")
+        self._tabs.setTabBar(_TwoLineTabBar())
+        self._tabs.addTab(self._page1, self._tab_text(0))
+        self._tabs.addTab(self._page2, self._tab_text(1))
+        # Card-style tabs with a one-line subtitle: a plain text tab next to
+        # the active one was easy to miss, and with it the whole second way
+        # of getting results (the NCBI website's Hit Table).
+        self._tabs.tabBar().setStyleSheet(f"""
+            QTabBar::tab {{
+                background: #EDEDED; color: {TEXT_SEC};
+                font-size: {_TwoLineTabBar.SUB_PX}px; font-weight: 600;
+                min-height: 65px; padding: 0 14px; margin: 0 6px 0 0;
+                border: 1px solid {GRAY_LINE}; border-bottom: none;
+                border-top-left-radius: 10px; border-top-right-radius: 10px;
+            }}
+            QTabBar::tab:last {{ margin-right: 0; }}
+            QTabBar::tab:selected {{
+                background: {BLUE}; color: white; border-color: {BLUE};
+            }}
+            QTabBar::tab:!selected:hover {{ background: {BLUE_LIGHT}; color: {BLUE}; }}
+        """)
+        self._tabs.setStyleSheet(f"QTabWidget::pane {{ border-top: 3px solid {BLUE}; }}")
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -1503,12 +1592,11 @@ class BlastPanel(QtWidgets.QWidget):
         self._ref_group.retranslateUi(ctx)
         self._clear_btn.setText(_tr(ctx, "Clear"))
         self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._open_results_btn.setText(_tr(ctx, "Open results  📄"))
         self._blast_btn.setText(_tr(ctx, "Run BLAST  →"))
         self._drop.retranslateUi()
 
-        self._tabs.setTabText(0, _tr(ctx, "BLAST API Search"))
-        self._tabs.setTabText(1, _tr(ctx, "BLAST web results"))
+        for i in range(len(self._TAB_TEXTS)):
+            self._tabs.setTabText(i, self._tab_text(i, ctx))
 
         self._file_lbl_title.setText(_tr(ctx, "BLAST Web Results"))
         self._file_lbl_desc.setText(_tr(ctx,
@@ -1575,13 +1663,62 @@ class BlastPanel(QtWidgets.QWidget):
         }
         self.blastRequested.emit(list(self._drop.files), cfg)
 
+    def _emit_resume(self):
+        # Open on the last run's state file when there is one, so resuming
+        # the run just stopped is a single click.
+        start = os.path.join(_get_base_dir(), "output")
+        if self._last_outdir and os.path.isdir(self._last_outdir):
+            start = self._last_outdir
+            states = sorted(
+                (os.path.join(start, f) for f in os.listdir(start)
+                 if f.startswith("blast-") and f.endswith(".state.json")),
+                key=os.path.getmtime, reverse=True)
+            if states:
+                start = states[0]
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Resume a BLAST run — pick its state file",
+            start,
+            "BLAST run state (blast-*.state.json)")
+        if not path:
+            return
+        # The run keeps its own parameters (saved in the state file) and the
+        # API key comes from the panel. Hits per sequence and sequences per
+        # batch may change between sessions without making the table
+        # inconsistent — but only when the user confirms it, since the panel
+        # may simply hold its defaults after a restart.
+        cfg = {"api_key": self._api_key_edit.text().strip()}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                params = json.load(fh).get("params") or {}
+        except Exception:
+            params = {}   # the worker reports an unreadable state file
+        panel = {"nhits": self._hits_spin.value()}
+        if self._batch_mode.currentIndex() != 0:      # Manual: a number the user chose
+            panel["nseq"] = self._batch_spin.value()
+        changed = {k: v for k, v in panel.items() if params.get(k) and params[k] != v}
+        if changed:
+            names = {"nhits": "Hits per sequence", "nseq": "Sequences per BLAST search"}
+            diff = "\n".join(f"   {names[k]}: {params[k]} → {v}" for k, v in changed.items())
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Question)
+            box.setWindowTitle("Resume BLAST run")
+            box.setText("The panel's settings differ from the ones this run used:\n\n"
+                        f"{diff}\n\nWhich ones should the rest of the run use?")
+            box.setInformativeText("Database, program and taxonomy always stay as in the run.")
+            use_new  = box.addButton("Use the panel's", QtWidgets.QMessageBox.AcceptRole)
+            keep_old = box.addButton("Keep the run's", QtWidgets.QMessageBox.RejectRole)
+            box.addButton(QtWidgets.QMessageBox.Cancel)
+            box.setDefaultButton(keep_old)
+            box.exec_()
+            if box.clickedButton() not in (use_new, keep_old):
+                return
+            if box.clickedButton() is use_new:
+                cfg["param_changes"] = changed
+        self.resumeRequested.emit(path, cfg)
+
     def _open_output_folder(self):
         if self._last_outdir and os.path.isdir(self._last_outdir):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_outdir))
-
-    def _open_results_file(self):
-        if self._last_tsv and os.path.isfile(self._last_tsv):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_tsv))
 
     def _reset(self):
         self._drop.clear()
@@ -1592,7 +1729,6 @@ class BlastPanel(QtWidgets.QWidget):
         self._log.clear()
         self._log.hide()
         self._open_folder_btn.hide()
-        self._open_results_btn.hide()
         self._send_best_btn.hide()
         self._best_seq_pair = []
         self._stop_btn.hide()
@@ -1643,6 +1779,7 @@ class BlastPanel(QtWidgets.QWidget):
 
     def set_running(self, running: bool):
         self._blast_btn.setVisible(not running)
+        self._resume_btn.setVisible(not running)
         self._stop_btn.setVisible(running)
         self._clear_btn.setEnabled(not running)
         if running:
@@ -1681,7 +1818,6 @@ class BlastPanel(QtWidgets.QWidget):
                 )
                 if matches:
                     self._last_tsv = matches[0]
-                    self._open_results_btn.show()
                     break
             # FASTA saved by the worker with the same base name as the table
             if self._last_tsv:
@@ -2128,8 +2264,57 @@ class _BlastWorker(QtCore.QThread):
         self._rate_limit_count = 0
         self._server_err_count = 0
 
+        # Resumable-run state (blast-<run_id>.state.json), see _save_state.
+        self._state: Optional[dict] = None
+        self._state_path = ""
+        self._processed: set = set()   # Query_names answered and written to the TSV
+        self._session: dict = {}
+        self._session_t0 = 0.0
+
     def stop(self):
         self._stop = True
+
+    # ── Resumable-run state ───────────────────────────────────────────────
+    # blast-<run_id>.state.json sits next to the run's .fa and .tsv and is
+    # rewritten after every batch. It records which sequences already reached
+    # the TSV — including those BLAST found no match for, which leave no row —
+    # and the run's parameters, so a stopped run can be resumed into the same
+    # files (see _load_resume).
+
+    _STATE_VERSION = 1
+
+    def _save_state(self, status: str = ""):
+        """Write the state file atomically. Never raises: losing the ability
+        to resume must not abort the run itself."""
+        st = self._state
+        if st is None or not self._state_path:
+            return
+        if status:
+            st["status"] = status
+            self._session["status"] = status
+        self._session["elapsed_s"] = int(time.monotonic() - self._session_t0)
+        st["processed"] = sorted(self._processed)
+        tmp = self._state_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(st, fh, indent=1)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _changes_text(changes: dict) -> str:
+        names = {"nhits": "hits/seq", "nseq": "seqs/batch"}
+        return ", ".join(f"{names.get(k, k)} {old} → {new}"
+                         for k, (old, new) in changes.items())
+
+    @staticmethod
+    def _remove_stale(path: str):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _rate_acquire(self, url: str = ""):
         """Block until the next NCBI request slot is available: one Blast.cgi
@@ -2353,21 +2538,13 @@ class _BlastWorker(QtCore.QThread):
             out.append("".join(seq_parts))
         return "\n".join(out)
 
-    def _split_batches(self, fasta_text, nseq):
-        """Return (batches, batch_pairs_list).
-        batches[i]       – FASTA text string for batch i
-        batch_pairs_list[i] – list of (header, seq) tuples for batch i
-
-        A batch is capped both by `nseq` and by _MAX_QUERY_BASES: NCBI rejects
-        a blastn query longer than 1,000,000 bases, and that length — not a
-        sequence count — is its real per-search limit. A single sequence above
-        the cap is still sent on its own: letting NCBI reject it is better than
-        dropping it silently.
-        """
-        # `fasta_text` comes from _to_single_line_fasta(): each header is followed by
-        # exactly one sequence line (possibly empty). Do NOT drop blank lines here —
-        # filtering an empty sequence line would shift the next header into its place
-        # and desync every header/seq pair from that point on.
+    @staticmethod
+    def _fasta_pairs(fasta_text):
+        """(header, seq) pairs of a FASTA from _to_single_line_fasta()."""
+        # Each header is followed by exactly one sequence line (possibly
+        # empty). Do NOT drop blank lines here — filtering an empty sequence
+        # line would shift the next header into its place and desync every
+        # header/seq pair from that point on.
         lines = fasta_text.splitlines()
         pairs = []
         i = 0
@@ -2379,17 +2556,24 @@ class _BlastWorker(QtCore.QThread):
                 i += 2
             else:
                 i += 1
-        batches = []
-        batch_pairs_list = []
+        return pairs
+
+    def _plan_batches(self, pairs, nseq):
+        """Split (header, seq) pairs into batches (lists of pairs).
+
+        A batch is capped both by `nseq` and by _MAX_QUERY_BASES: NCBI rejects
+        a blastn query longer than 1,000,000 bases, and that length — not a
+        sequence count — is its real per-search limit. A single sequence above
+        the cap is still sent on its own: letting NCBI reject it is better than
+        dropping it silently.
+        """
         sizes = plan_batch_sizes([len(s) for _, s in pairs], nseq,
                                  self._MAX_QUERY_BASES)
-        pos = 0
+        out, pos = [], 0
         for size in sizes:
-            chunk = pairs[pos:pos + size]
+            out.append(pairs[pos:pos + size])
             pos += size
-            batches.append("\n".join(a + "\n" + b for a, b in chunk))
-            batch_pairs_list.append(chunk)
-        return batches, batch_pairs_list
+        return out
 
     # ── BLAST API ─────────────────────────────────────────────────────────
 
@@ -2980,67 +3164,39 @@ class _BlastWorker(QtCore.QThread):
             import traceback
             self.taskError.emit(f"{e}\n{traceback.format_exc()}")
 
-    def _run_blast(self):
-        cfg       = self.cfg
-        nhits     = cfg["nhits"]
-        nseq      = cfg["nseq"]
-        run_start = datetime.datetime.now()
-        mydate    = run_start.strftime("%Y%m%d-%H%M%S")
+    _RUN_PARAMS = ("database", "program", "nhits", "nseq", "fetch_taxonomy",
+                   "tax_reference", "strip_suffix")
+
+    def _blast_headings(self, fetch_tax: bool) -> str:
+        cols = (
+            "Query_name\tSubject_accession.ver\tP_identity\tAlignment_length\t"
+            "Num_mismatches\tGap_opens\tQuery_start\tQuery_end\t"
+            "Subject_start\tSubject_end\tEvalue\tBit_score"
+        )
+        if fetch_tax:
+            cols += ("\tSubject_Kingdom\tSubject_Class\tSubject_Order\t"
+                     "Subject_Family\tSubject_Genus\tSubject_organism")
+        # Per-sample hit rank (1 = best hit) as the first column, so results can
+        # be filtered by rank (e.g. Hit_rank == 1 keeps only each sample's top hit).
+        return "Hit_rank\t" + cols
+
+    def _new_run(self, run_start) -> Optional[dict]:
+        """Set up the files of a new run. Returns the run context, or None
+        after reporting the error."""
+        cfg    = self.cfg
+        run_id = run_start.strftime("%Y%m%d-%H%M%S")
 
         # ── Output directory (passed from MainWindow dialog) ──
         output_dir = cfg["outdir"]
         os.makedirs(output_dir, exist_ok=True)
 
-        # ── Cache files stored alongside the output folder ──
-        taxadb_path = os.path.join(output_dir, "taxadb.dbx")
-        accdb_path  = os.path.join(output_dir, "accdb.dbx")
-        fetch_tax = cfg.get("fetch_taxonomy", True)
-        if fetch_tax:
-            self._preload_caches(output_dir)
-
         # ── Merge & normalize FASTA ──
         raw   = self._merge_fasta_files(self.files)
         fasta = self._to_single_line_fasta(raw)
-        seq_count = fasta.count("\n>") + (1 if fasta.startswith(">") else 0)
-
-        if seq_count == 0:
-            self.taskError.emit(
-                "No FASTA sequences found in the provided files."
-            )
-            return
-
-        # ── Split into batches ──
-        batches, batch_pairs_list = self._split_batches(fasta, nseq)
-        n_batches = len(batches)
-        # Query_name (header, no leading '>') of every sequence NCBI actually
-        # answered and whose hits reached the TSV. A batch that gets split on
-        # rejection (see _submit_batch_with_retry) can succeed only partially,
-        # so this is tracked per-sequence rather than per top-level batch index.
-        processed_headers: set = set()
-        # Query_name values with at least one hit written to the TSV. Sequences
-        # in processed_headers but absent here got no match from BLAST.
-        hit_queries: set = set()
-
-        # ── Summary line (fixed slot "info") ──
-        self.statusUpdated.emit(
-            "info",
-            f"Sequences: {seq_count}  │  Batches: {n_batches}"
-            f"  │  Hits/seq: {nhits}  │  DB: {cfg['database']}"
-        )
-
-        _blast_cols = (
-            "Query_name\tSubject_accession.ver\tP_identity\tAlignment_length\t"
-            "Num_mismatches\tGap_opens\tQuery_start\tQuery_end\t"
-            "Subject_start\tSubject_end\tEvalue\tBit_score"
-        )
-        headings = (
-            _blast_cols + "\tSubject_Kingdom\tSubject_Class\tSubject_Order\t"
-            "Subject_Family\tSubject_Genus\tSubject_organism"
-            if fetch_tax else _blast_cols
-        )
-        # Per-sample hit rank (1 = best hit) as the first column, so results can
-        # be filtered by rank (e.g. Hit_rank == 1 keeps only each sample's top hit).
-        headings = "Hit_rank\t" + headings
+        pairs = self._fasta_pairs(fasta)
+        if not pairs:
+            self.taskError.emit("No FASTA sequences found in the provided files.")
+            return None
 
         # ── Save the sequences that were queried ──
         # Same base name as the results, so the pair (FASTA + table) is what the
@@ -3048,8 +3204,8 @@ class _BlastWorker(QtCore.QThread):
         # BLAST table by file name. The text written is the normalised FASTA
         # actually submitted, so its headers are the Query_name values of the
         # table. It is written before the queries start, so it is there even if
-        # the run is stopped half way.
-        fasta_path = os.path.join(output_dir, f"blast-{mydate}.fa")
+        # the run is stopped half way — resuming the run reads it back.
+        fasta_path = os.path.join(output_dir, f"blast-{run_id}.fa")
         try:
             with open(fasta_path, "w", encoding="utf-8") as fa_fh:
                 fa_fh.write(fasta + "\n")
@@ -3060,11 +3216,11 @@ class _BlastWorker(QtCore.QThread):
                 "result", f"FASTA skip │ could not write sequences: {e}")
 
         # ── Open TSV for incremental writing ──
-        tsv_path = os.path.join(output_dir, f"blast-{mydate}.tsv")
+        tsv_path = os.path.join(output_dir, f"blast-{run_id}.tsv")
         for _attempt in range(10):
             try:
                 with open(tsv_path, "w", encoding="utf-8") as tsv_fh:
-                    tsv_fh.write(headings + "\n")
+                    tsv_fh.write(self._blast_headings(cfg.get("fetch_taxonomy", True)) + "\n")
                 break
             except PermissionError:
                 self.statusUpdated.emit(
@@ -3078,16 +3234,173 @@ class _BlastWorker(QtCore.QThread):
             self.taskError.emit(
                 f"Could not write output file (locked/permission denied):\n{tsv_path}"
             )
-            return
+            return None
 
-        total_hits_done: int = 0
+        state = {
+            "version":   self._STATE_VERSION,
+            "run_id":    run_id,
+            "files":     [os.path.abspath(f) for f in self.files],
+            "params":    {k: cfg.get(k) for k in self._RUN_PARAMS},
+            "processed": [],
+            "status":    "running",
+            "sessions":  [],
+        }
+        return {"state": state, "outdir": output_dir, "pairs": pairs,
+                "fasta_path": fasta_path, "tsv_path": tsv_path,
+                "hit_queries": set(), "hits_written": 0}
+
+    def _load_resume(self, path: str) -> Optional[dict]:
+        """Load an interrupted run to continue it in its own files.
+
+        `path` is the run's blast-<run_id>.state.json; the run's .fa and .tsv
+        are read from the same folder. The run's own parameters replace the
+        panel's, so the rows added now match the rest of the table; only the
+        API key is taken from the panel.
+        Returns the run context, or None after reporting the error.
+        """
+        folder = os.path.dirname(os.path.abspath(path))
+        m = re.fullmatch(r"blast-(\d{8}-\d{6})\.state\.json", os.path.basename(path))
+        if not m:
+            self.taskError.emit(
+                f"{os.path.basename(path)} is not the state file of a BLAST run.\n"
+                "Pick the blast-<date>.state.json in the run's folder.")
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except Exception as e:
+            self.taskError.emit(f"Could not read {os.path.basename(path)}: {e}")
+            return None
+
+        run_id     = m.group(1)
+        base       = os.path.join(folder, f"blast-{run_id}")
+        fasta_path = base + ".fa"
+        tsv_path   = base + ".tsv"
+        if not (os.path.isfile(fasta_path) and os.path.isfile(tsv_path)):
+            self.taskError.emit(
+                f"Cannot resume run {run_id}: its sequences "
+                f"({os.path.basename(fasta_path)}) and its table "
+                f"({os.path.basename(tsv_path)}) must still be in\n{folder}")
+            return None
+
+        with open(fasta_path, encoding="utf-8", errors="replace") as fh:
+            pairs = self._fasta_pairs(self._to_single_line_fasta(fh.read()))
+
+        # Queries already in the table, and how many rows it holds.
+        hit_queries, hits_written = set(), 0
+        with open(tsv_path, encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().rstrip("\r\n").split("\t")
+            if "Query_name" not in header:
+                self.taskError.emit(f"{os.path.basename(tsv_path)} has no 'Query_name' column.")
+                return None
+            q_i = header.index("Query_name")
+            for line in fh:
+                fields = line.rstrip("\r\n").split("\t")
+                if len(fields) > q_i and fields[q_i]:
+                    hit_queries.add(fields[q_i])
+                    hits_written += 1
+
+        state.pop("pending", None)   # RID kept by earlier versions; never reused
+        for k, v in (state.get("params") or {}).items():
+            if v is not None:
+                self.cfg[k] = v
+        if not self.cfg.get("nseq"):
+            # Not recorded (a state written while the batch size was on
+            # Automatic): compute it from the run's own sequences.
+            self.cfg["nseq"] = auto_nseq([len(s) for _h, s in pairs])
+            state.setdefault("params", {})["nseq"] = self.cfg["nseq"]
+        # Hits per sequence / sequences per batch the user chose to change for
+        # the rest of the run (confirmed in the panel). Saved as the run's
+        # parameters from now on; the session records what changed.
+        changes = {}
+        for k, v in (self.cfg.pop("param_changes", None) or {}).items():
+            if k in ("nhits", "nseq") and v and v != self.cfg.get(k):
+                changes[k] = [self.cfg.get(k), v]
+                self.cfg[k] = v
+                state.setdefault("params", {})[k] = v
+        self.cfg["outdir"] = folder
+        self.files = list(state.get("files") or [fasta_path])
+        return {"state": state, "outdir": folder, "pairs": pairs,
+                "fasta_path": fasta_path, "tsv_path": tsv_path,
+                "hit_queries": hit_queries, "hits_written": hits_written,
+                "changes": changes}
+
+    def _run_blast(self):
+        cfg       = self.cfg
+        run_start = datetime.datetime.now()
+        resuming  = bool(cfg.get("resume"))
+
+        ctx = self._load_resume(cfg["resume"]) if resuming else self._new_run(run_start)
+        if ctx is None:
+            return
+        nhits      = cfg["nhits"]
+        nseq       = cfg["nseq"]
+        fetch_tax  = cfg.get("fetch_taxonomy", True)
+        state      = ctx["state"]
+        mydate     = state["run_id"]
+        output_dir = ctx["outdir"]
+        fasta_path = ctx["fasta_path"]
+        tsv_path   = ctx["tsv_path"]
+        all_pairs  = ctx["pairs"]
+        seq_count  = len(all_pairs)
+        # Query_name values with at least one hit written to the TSV. Sequences
+        # in self._processed but absent here got no match from BLAST.
+        hit_queries: set = ctx["hit_queries"]
+        total_hits_done: int = ctx["hits_written"]
+
+        # self._processed: Query_name (header, no leading '>') of every sequence
+        # NCBI actually answered and whose hits reached the TSV. A batch that
+        # gets split on rejection (see _submit_batch_with_retry) can succeed
+        # only partially, so this is tracked per sequence, not per batch.
+        self._state      = state
+        self._state_path = os.path.join(output_dir, f"blast-{mydate}.state.json")
+        # Sequences with rows in the table are done even if the state file
+        # missed them (e.g. the app closed between a batch and its save), so
+        # resuming never searches them again and duplicates their rows.
+        self._processed  = set(state.get("processed") or []) | hit_queries
+        self._session_t0 = time.monotonic()
+        self._session    = {"start": run_start.strftime("%Y-%m-%d %H:%M:%S"),
+                            "elapsed_s": 0, "status": "running"}
+        if ctx.get("changes"):
+            self._session["changes"] = ctx["changes"]
+        state.setdefault("sessions", []).append(self._session)
+        self._save_state("running")
+
+        # ── Cache files stored alongside the output folder ──
+        taxadb_path = os.path.join(output_dir, "taxadb.dbx")
+        accdb_path  = os.path.join(output_dir, "accdb.dbx")
+        if fetch_tax:
+            self._preload_caches(output_dir)
+
+        # ── Batches: every sequence not yet in the table ──
+        # On resume these always go out as new searches (new RIDs): a search
+        # left at NCBI by the stopped run is never waited for or reused — a
+        # RID can stay WAITING for good, and a run is often stopped because
+        # one did.
+        to_search = [p for p in all_pairs if p[0][1:] not in self._processed]
+        batch_pairs_list = self._plan_batches(to_search, nseq)
+        n_batches = len(batch_pairs_list)
+
+        # ── Summary line (fixed slot "info") ──
+        seq_info = (f"Resuming: {len(to_search)}/{seq_count} seqs left" if resuming
+                    else f"Sequences: {seq_count}")
+        self.statusUpdated.emit(
+            "info",
+            f"{seq_info}  │  Batches: {n_batches}"
+            f"  │  Hits/seq: {nhits}  │  DB: {cfg['database']}"
+        )
+        if resuming and not batch_pairs_list:
+            self.statusUpdated.emit(
+                "blast", "BLAST       │ Every sequence of this run was already searched.")
+        elif ctx.get("changes"):
+            self.statusUpdated.emit("blast", "BLAST       │ From now on: " + self._changes_text(ctx["changes"]))
+
         total_expected = n_batches * self._BATCH_UNITS
 
-        for batch_idx, batch_fasta in enumerate(batches):
+        for batch_idx, batch_pairs in enumerate(batch_pairs_list):
             if self._stop:
                 break
 
-            batch_pairs = batch_pairs_list[batch_idx]
             batch_seq   = len(batch_pairs)
             batch_label = f"Batch {batch_idx+1}/{n_batches}"
             batch_base  = batch_idx * self._BATCH_UNITS
@@ -3213,24 +3526,24 @@ class _BlastWorker(QtCore.QThread):
             # parcial si _submit_batch_with_retry tuvo que dividir el lote).
             if _batch_written:
                 total_hits_done += len(batch_rows_out)
-                processed_headers.update(h[1:] for h, _s in used_pairs)
+                self._processed.update(h[1:] for h, _s in used_pairs)
                 # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
                 # which is the FASTA header of the query without the leading '>'.
                 for _r in batch_rows_out:
                     _fields = _r.split("\t")
                     if len(_fields) > 1:
                         hit_queries.add(_fields[1])
+                self._save_state()
 
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
-        missing_pairs = []
-        for bp in batch_pairs_list:
-            for h, s in bp:
-                if h[1:] not in processed_headers:
-                    missing_pairs.append((h, s))
+        # Over the whole run, so after a resume it lists what is still left.
+        missing_pairs = [(h, s) for h, s in all_pairs if h[1:] not in self._processed]
 
         miss_msg = ""
-        if missing_pairs:
-            miss_path = os.path.join(output_dir, f"missing_seqs_{mydate}.fa")
+        miss_path = os.path.join(output_dir, f"missing_seqs_{mydate}.fa")
+        if not missing_pairs:
+            self._remove_stale(miss_path)   # left by an earlier session of this run
+        else:
             try:
                 with open(miss_path, "w", encoding="utf-8") as fh:
                     for h, s in missing_pairs:
@@ -3246,15 +3559,14 @@ class _BlastWorker(QtCore.QThread):
         # Only actually-processed sequences are inspected: sequences of a
         # failed or unprocessed (sub-)batch were never really queried and are
         # already reported in the missing FASTA above.
-        nohit_pairs = []
-        for bp in batch_pairs_list:
-            for h, sq in bp:
-                if h[1:] in processed_headers and h[1:] not in hit_queries:
-                    nohit_pairs.append((h, sq))
+        nohit_pairs = [(h, sq) for h, sq in all_pairs
+                       if h[1:] in self._processed and h[1:] not in hit_queries]
 
         nohit_msg  = ""
         nohit_path = ""
-        if nohit_pairs:
+        if not nohit_pairs:
+            self._remove_stale(os.path.join(output_dir, f"nohit_seqs_{mydate}.fa"))
+        else:
             nohit_path = os.path.join(output_dir, f"nohit_seqs_{mydate}.fa")
             try:
                 with open(nohit_path, "w", encoding="utf-8") as fh:
@@ -3296,10 +3608,16 @@ class _BlastWorker(QtCore.QThread):
         if not self._stop and total_hits_done > 0:
             xlsx_path = self._tsv_to_xlsx(tsv_path)
 
+        # ── Final state: whether (and why) this run can still be resumed ──
+        run_status = ("stopped" if self._stop
+                      else "incomplete" if missing_pairs else "completed")
+        self._save_state(run_status)
+        resume_hint = "use Resume run… to finish it" if missing_pairs else ""
+
         extra_msgs = [m for m in (miss_msg, nohit_msg, ref_msg, tax_match_msg) if m]
         if self._stop:
             result_msg = (
-                "Stopped     │ " + "  │  ".join(extra_msgs)
+                "Stopped     │ " + "  │  ".join(extra_msgs + ([resume_hint] if resume_hint else []))
                 if extra_msgs else "Stopped by user."
             )
         else:
@@ -3307,7 +3625,8 @@ class _BlastWorker(QtCore.QThread):
             head = f"{total_hits_done} hits written"
             if not extra_msgs:
                 head += f" → {out_name}"
-            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs)
+            tail = [resume_hint] if resume_hint else []
+            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs + tail)
         self.statusUpdated.emit("result", result_msg)
 
         # ── Write run log ──────────────────────────────────────────────────
@@ -3325,8 +3644,9 @@ class _BlastWorker(QtCore.QThread):
         else:
             api_masked = "(not set)"
 
-        status_str = "Stopped" if self._stop else "Completed"
-        seqs_queried = len(processed_headers)
+        status_str = {"stopped": "Stopped", "incomplete": "Completed with missing sequences",
+                      "completed": "Completed"}[run_status]
+        seqs_queried = len(self._processed)
 
         log_lines = [
             "BLAST Run Log",
@@ -3334,6 +3654,20 @@ class _BlastWorker(QtCore.QThread):
             f"Date/Time  : {run_start.strftime('%Y-%m-%d %H:%M:%S')}",
             f"Status     : {status_str}",
             f"Total time : {elapsed_str}",
+            f"Run ID     : {mydate}",
+        ]
+        sessions = state.get("sessions") or []
+        if len(sessions) > 1:
+            # One line per session of a resumed run (this one included).
+            log_lines.append("Sessions   :")
+            for i, ses in enumerate(sessions, 1):
+                sec = int(ses.get("elapsed_s", 0))
+                line = (f"  {i}. {ses.get('start', '?')}  "
+                        f"{sec // 3600}h {sec % 3600 // 60:02d}m  {ses.get('status', '')}")
+                if ses.get("changes"):
+                    line += "  · " + self._changes_text(ses["changes"])
+                log_lines.append(line)
+        log_lines += [
             "",
             "Input files:",
         ]
@@ -3351,7 +3685,8 @@ class _BlastWorker(QtCore.QThread):
             "",
             "Results:",
             f"  Sequences found   : {seq_count}",
-            f"  Sequences queried : {seqs_queried}/{seq_count} ({n_batches} batch(es) planned)",
+            f"  Sequences queried : {seqs_queried}/{seq_count}"
+            f" ({n_batches} batch(es) planned{' this session' if resuming else ''})",
             f"  Hits written      : {total_hits_done}",
             f"  Seqs with hits    : {len(hit_queries)}",
             f"  Seqs with no hits : {len(nohit_pairs)}",

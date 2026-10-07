@@ -9,7 +9,7 @@ from __future__ import annotations
 # Single source of truth for the program version (MAJOR.MINOR.PATCH).
 # MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
 # PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
-__version__ = "3.6.0"
+__version__ = "3.6.5"
 # GitHub repository queried for newer releases at start-up.
 UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
 
@@ -1294,6 +1294,8 @@ class TopBar(QtWidgets.QWidget):
 
         logo = QtWidgets.QLabel("ONTbarcoder")
         logo.setObjectName("topbar_logo")
+        logo.setTextFormat(QtCore.Qt.RichText)   # "barcoder" in accent blue, see refresh_theme_button
+        self._logo = logo
         badge = QtWidgets.QLabel(f"v{__version__}")
         badge.setObjectName("topbar_badge")
 
@@ -1453,6 +1455,10 @@ class TopBar(QtWidgets.QWidget):
 
     def refresh_theme_button(self):
         dark = ont_ui.current_theme() == "dark"
+        # Rich-text colours are not themed by the style sheet: set the blue
+        # for the current theme (the lighter accent reads on the dark bar).
+        blue = ont_ui.tok("accent_fg" if dark else "accent")
+        self._logo.setText(f'ONT<span style="color:{blue};">barcoder</span>')
         self._theme_btn.setIcon(ont_ui.make_icon("sun" if dark else "moon", ont_ui.tok("text_sec")))
         self._theme_btn.setText(" Light" if dark else " Dark")
         self._theme_btn.setToolTip("Switch to light theme" if dark else "Switch to dark theme")
@@ -5657,6 +5663,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_progress.finalizeRequested.connect(self._finalize_live)
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
+        self._panel_blast.resumeRequested.connect(self._resume_blast)
         self._panel_blast.blastFileRequested.connect(self._start_blast_file)
         self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
         self._panel_blast.sendToBestSeq.connect(self._open_in_best_seq)
@@ -12260,15 +12267,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(list, dict)
     def _start_blast(self, files: list, cfg: dict):
-        # A live search and the file-parsing tab each run their own NCBI rate
-        # limiter; running both at once would double the request rate against
-        # the same IP and risk 429s on both. Block one while the other runs.
-        other = getattr(self, "blast_file_worker", None)
-        if other is not None and other.isRunning():
-            self._panel_blast.on_error(
-                "The 'BLAST web results' tab is still running. Wait for it to "
-                "finish, or click its Stop button, before starting a new BLAST search."
-            )
+        if not self._blast_file_tab_idle():
             return
 
         # ── Output folder dialog (same pattern as _start_comparison) ──
@@ -12352,9 +12351,33 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         cfg["outdir"] = outdir
+        self._launch_blast_worker(files, cfg)
 
+    def _resume_blast(self, path: str, cfg: dict):
+        """Continue a stopped BLAST run in its own folder and files."""
+        if not self._blast_file_tab_idle():
+            return
+        cfg["resume"] = path
+        cfg["outdir"] = os.path.dirname(os.path.abspath(path))
+        self._launch_blast_worker([], cfg)
+
+    def _blast_file_tab_idle(self) -> bool:
+        # A live search and the file-parsing tab each run their own NCBI rate
+        # limiter; running both at once would double the request rate against
+        # the same IP and risk 429s on both. Block one while the other runs.
+        other = getattr(self, "blast_file_worker", None)
+        if other is not None and other.isRunning():
+            self._panel_blast.on_error(
+                "The 'BLAST web results' tab is still running. Wait for it to "
+                "finish, or click its Stop button, before starting a new BLAST search."
+            )
+            return False
+        return True
+
+    def _launch_blast_worker(self, files: list, cfg: dict):
+        outdir = cfg["outdir"]
         self._panel_blast.set_running(True)
-        self._panel_blast.update_status("result", f"Output    │ {outdir}")
+        self._panel_blast.update_status("result", f"Output      │ {outdir}")
 
         # Disconnect any leftover stop/signal connections from a previous run
         try:
@@ -12476,7 +12499,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg["outdir"] = outdir
 
         self._panel_blast.set_file_running(True)
-        self._panel_blast.update_file_status("result", f"Output    │ {outdir}")
+        self._panel_blast.update_file_status("result", f"Output      │ {outdir}")
 
         # Disconnect any leftover stop/signal connections from a previous run
         try:
@@ -12680,6 +12703,17 @@ def main():
             )
         except AttributeError:
             pass
+
+        # Silence a harmless Qt/Windows warning: tooltips are pre-positioned
+        # off-screen (-39998,-39998) to measure them, Windows clamps the
+        # position to -32768 and Qt logs "Unable to set geometry".  Every
+        # other Qt message is still written to stderr.
+        def _qt_message_filter(mode, context, message):
+            if "QWindowsWindow::setGeometry: Unable to set geometry" in message:
+                return
+            if sys.stderr is not None:   # None under pythonw / windowed builds
+                sys.stderr.write(message + "\n")
+        QtCore.qInstallMessageHandler(_qt_message_filter)
 
         app = QtWidgets.QApplication(sys.argv)
         ont_ui.install_hooks()
