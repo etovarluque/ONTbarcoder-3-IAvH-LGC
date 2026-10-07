@@ -1481,8 +1481,8 @@ class BlastPanel(QtWidgets.QWidget):
         auto = index == 0
         # In Automatic the number is the program's decision, so the box has
         # nothing to offer: hide it and let the plan line below state the
-        # result. It keeps holding the computed value, which becomes the
-        # starting point if the user switches to Manual.
+        # result. The box keeps the user's own number (default 50) for Manual;
+        # it is never overwritten with the computed value.
         self._batch_spin.setVisible(not auto)
         self._update_batch_plan()
 
@@ -1498,11 +1498,6 @@ class BlastPanel(QtWidgets.QWidget):
             return
 
         nseq = self._effective_nseq(lengths)
-        if auto:
-            # Reflect the decision in the spin without re-entering this slot.
-            self._batch_spin.blockSignals(True)
-            self._batch_spin.setValue(min(nseq, self._batch_spin.maximum()))
-            self._batch_spin.blockSignals(False)
 
         sizes = plan_batch_sizes(lengths, nseq)
         n = len(sizes)

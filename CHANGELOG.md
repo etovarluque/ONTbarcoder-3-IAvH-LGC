@@ -129,6 +129,8 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   Excel) is reported as an error instead of being lost silently.
 - A small empty window flashed at startup, and the process took seconds to
   exit after closing (crash during Qt teardown).
+- BLAST: switching the batch size to Manual showed the Automatic value (e.g. 99)
+  instead of Manual's own default of 50.
 
 ---
 
