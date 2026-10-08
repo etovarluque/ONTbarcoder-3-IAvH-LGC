@@ -9,7 +9,7 @@ from __future__ import annotations
 # Single source of truth for the program version (MAJOR.MINOR.PATCH).
 # MAJOR: incompatible changes (profiles, .cfg, outputs); MINOR: new features;
 # PATCH: fixes and small adjustments.  Release tags are "v" + __version__.
-__version__ = "3.7.0"
+__version__ = "3.7.1"
 # GitHub repository queried for newer releases at start-up.
 UPDATE_REPO = "etovarluque/ONTbarcoder-3-IAvH-LGC"
 

@@ -14,6 +14,18 @@ Sweep) plus a non-coding marker mode.
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of differences from the
 original.
 
+## What's new in 3.7.1
+
+- **Help icons:** a **?** next to each panel's title opens the matching section
+  of the manual.
+- **BLAST:** *Result checks per search*, a retry/final-retry scheme for searches
+  NCBI never answers, and a redesigned **Summary** sheet (key figures,
+  best-hit identity, sequences to review, run details).
+- **HTML report** works offline (inline SVG charts) and gains an
+  *Intra-sample variants* section, a read funnel and *Status* / *Variants*
+  columns.
+- The sidebar tabs remember their last panel.
+
 ## What's new in 3.7.0
 
 - **BLAST results workbook** with a **Summary** sheet (input files, reference,
