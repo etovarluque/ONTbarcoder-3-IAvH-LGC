@@ -957,6 +957,11 @@ with <code>coverage</code>, <code>fixed_indels</code> and <code>Ns</code>) under
   <tr><td><code>Remaining.fa</code></td>
       <td>Specimens for which no acceptable barcode could be built.</td></tr>
 </table>
+<p><code>Fixed_barcodes_*err.fa</code> and <code>Remaining.fa</code> are written <b>only when
+they hold sequences</b>: a run with no corrected barcode, or none unresolved, leaves no empty
+file. The three main sets (<code>QC_Compliant_…</code>, <code>Filtered_…</code>,
+<code>Allbarcodes.fa</code>) and the <code>consensus_*.fa</code> copies are always written,
+because later steps and the utilities read them to recognise a run folder.</p>
 <p>FASTA headers encode metadata, e.g.
 <code>&gt;SPID01_all.fa;658;142;ambs=0;estgaps=0</code> →
 <i>specimen;length;coverage;ambiguities;estimated&nbsp;indels</i>.</p>
@@ -1056,7 +1061,8 @@ at the 5′ end, the other at the 3′ end) still count as different.</p>
 colour-coded <code>summary.xlsx</code> plus per-category FASTA files
 (<code>identical.fa</code>, <code>compatible_iupac.fa</code>, <code>different.fa</code>,
 <code>only_in_reference.fa</code>, <code>without_reference.fa</code>,
-<code>best_barcodes.fa</code>). When sequences differ, the "best" barcode is chosen by
+<code>best_barcodes.fa</code>; each one is written only when it has sequences). When
+sequences differ, the "best" barcode is chosen by
 fewest ambiguities → fewest gaps → highest coverage. Ambiguities and length are taken from
 the header (<code>ambs=</code>, second field); when a header lacks them — e.g. phase-2a
 <code>consensus_N_barcodes.fa</code> files or FASTA from other tools — they are counted in
@@ -1282,6 +1288,14 @@ pattern list (grep), so a wrong rule shows up before running. In Append, IDs and
 are normalized (spaces, dots and commas → <code>_</code>, accents removed), and the log lists
 a few IDs that were not found.</p>
 
+<h4>Repeated headers and empty results</h4>
+<p>When a file read (or the merge of several) has <b>repeated headers</b>, the log says so
+with a few examples, for example <code>⚠ run1.fa: 2 repeated header(s), e.g. DNS-1 ×2</code>.
+Different sequences under the same header cannot be told apart by the tools that read the
+result later, so give each its own header. An operation whose result has <b>no sequence</b>
+(a grep with no match, a filter that excludes everything) does not write an empty FASTA: the
+log notes <code>No sequences: &lt;name&gt; not written</code>.</p>
+
 <h2 id="util-fastq">12. Utility — FASTQ Inspector</h2>
 <p>Drag one or several FASTQ files, or a whole folder, to get a full descriptive quality
 report (<code>.fastq</code>, <code>.fq</code>, <code>.fastq.gz</code>, <code>.fq.gz</code>;
@@ -1480,6 +1494,16 @@ and asks which to use (<b>Keep the run's</b> is the default, since after a resta
 may simply show its defaults); the change is logged and saved for later sessions. More hits
 apply only to the sequences searched from then on.</p>
 
+<div class="warn">
+<b>Repeated headers</b>
+Under the batch plan, an amber line appears as soon as the loaded FASTA files hold
+<b>repeated headers</b>, within a file or across files (two headers that differ only in spaces
+count as the same, since spaces are sent as <code>_</code>). A repeated header is a single
+<code>Query_name</code> in the results table, so the hits of its copies are mixed in the same
+rows and cannot be told apart. The count is repeated in the summary line and in the run log.
+Give each sequence its own header before searching.
+</div>
+
 <div class="tip">
 <b>Feeding the Best Sequence utility</b>
 The FASTA and the results table share the same base name on purpose
@@ -1487,7 +1511,10 @@ The FASTA and the results table share the same base name on purpose
 <a href="#util-best">§14</a> pairs a run's sequences with its BLAST table. Running BLAST on
 each parameter set therefore leaves the input for that utility ready, with no renaming.
 When a search finishes, the <b>Open in Best Sequence →</b> button loads that FASTA and its
-table as a pair in §14 and switches to it.
+table as a pair in §14 and switches to it. Best Sequence <b>starts clean</b>: files, log
+and result buttons of an earlier selection are cleared, so the pair is classified as a single
+run instead of being compared with them. While Best Sequence is running, a message asks you
+to wait or stop it first.
 Remember that &sect;14 additionally requires the <code>Query_*</code> taxonomy columns — tick
 the reference-file option below (§13.3) and this tab writes them into the table itself, so it
 already satisfies that requirement by the time it reaches Best Sequence.
@@ -1646,8 +1673,16 @@ table to update, then the reference file and suffix exactly as in §13.3. <b>App
 the <code>Query_*</code> columns (and <code>Tax_level_match</code>, if the table already
 carries hit taxonomy) into that file in place, and regenerates its matching
 <code>.xlsx</code> &mdash; overwriting the previous one, so both files reflect the corrected
-taxonomy. Running it more than once on the same table is safe: a rematch reuses the existing
+taxonomy. The <b>Summary</b> and <b>Best hit</b> sheets (§13.5) are rebuilt with it and name
+the reference just applied. Running it more than once on the same table is safe: a rematch reuses the existing
 <code>Tax_level_match</code> column instead of adding another one.</p>
+<p>The <a href="#util-best">Best Sequence</a> utility does the same when it writes a reference
+into a BLAST <code>.xlsx</code> (§14.1): the file's <code>Query_*</code> and
+<code>Tax_level_match</code> columns, its <b>Summary</b> and <b>Best hit</b> sheets are updated
+in place, and the <code>.tsv</code> of the same name, if it sits beside it, receives the same
+reference, so both files agree and an <code>.xlsx</code> rebuilt later from the
+<code>.tsv</code> keeps it. If that <code>.tsv</code> is open in another program, a warning is
+shown and the run continues with the <code>.xlsx</code>.</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h3 id="blastcols">13.5 Reading the BLAST results table</h3>
@@ -1699,6 +1734,44 @@ the one you assigned &mdash; a contamination, an index hop or a mislabelled vouc
 or a short alignment instead means the database simply holds nothing close to your specimen.
 </div>
 
+<h4 id="blastsheets">The Summary and Best hit sheets</h4>
+<p>The results <code>.xlsx</code> has three sheets: <b>Summary</b> (it opens first),
+<b>Best hit</b> and <b>BLAST Results</b>, the table described above. Best Sequence reads the
+<i>BLAST Results</i> sheet by name.</p>
+<p><b>Summary</b> answers &laquo;what was searched and how far did it get&raquo;:</p>
+<ul>
+  <li><b>Input files</b> with the number of sequences of each and the total (on the BLAST web
+      results tab, the result files and their queries).</li>
+  <li><b>Taxonomy reference</b> file and the sample-ID suffix removed, and the
+      <b>parameters</b> (database, program, hits per sequence, sequences per batch,
+      taxonomy fetched).</li>
+  <li><b>Results</b>: hit rows, sequences with hits, without hits and, in an incomplete run,
+      not searched; and how many times the best hit is not BLAST's first one.</li>
+  <li><b>Identification level</b>: how many sequences were identified to organism, genus,
+      family or order (count, % and cumulative %), how many shared no rank with the
+      reference (<code>none</code>), had no expected taxonomy, or got no hit; and the same
+      table per input file when there are several. Without a reference file there is no
+      taxonomic level to count, and the sheet only separates sequences with and without
+      hits.</li>
+</ul>
+<p><b>Best hit</b> has <b>one row per sequence</b>, sorted by name, with two extra columns at
+the left: <code>Identification</code> (coloured) and <code>Hits</code> (how many hits the
+sequence has in the table). The row shown is the hit that agrees with the reference at the
+<b>deepest rank</b> &mdash; not necessarily BLAST's first. Hits at the same rank, and all of them
+when none agrees (<code>none</code>) or no reference was given, are ordered by bit score, then
+identity, then fewest gap openings and mismatches, then BLAST's own order. A sequence without
+hits is listed with an empty row (<code>no_hit</code>), and one that was not searched
+(<code>not_searched</code>), so the sheet adds up to the FASTA that was submitted.</p>
+<table>
+  <tr><th><code>Identification</code></th><th>Meaning</th></tr>
+  <tr><td><code>organism</code> / <code>genus</code> / <code>family</code> / <code>order</code></td>
+      <td>Deepest rank at which the best hit agrees with the reference.</td></tr>
+  <tr><td><code>none</code></td><td>Hits exist, but none shares any rank with the expected taxonomy.</td></tr>
+  <tr><td><code>no_reference</code></td><td>The sample is not in the reference file (empty <code>Query_*</code>).</td></tr>
+  <tr><td><code>blast_hit</code></td><td>No reference applied: the sequence has hits, nothing to compare with.</td></tr>
+  <tr><td><code>no_hit</code> / <code>not_searched</code></td><td>No hit in the table / the run stopped before searching it.</td></tr>
+</table>
+
 <h2 id="util-best">14. Utility — Best Sequence</h2>
 <p>When the same library is processed several times with different parameters, each run
 recovers a slightly different set of consensus sequences — and, for the samples recovered
@@ -1745,6 +1818,17 @@ run_permissive.fa  +  run_permissive.xlsx</pre>
 folders can be dropped here directly. When exactly one FASTA and one table are left
 without a name match (e.g. a <code>blastfile-&lt;ts&gt;.tsv</code> from <b>BLAST web
 results</b>), they are paired anyway; with more files, rename them to share a base name.</p>
+<p>You can also drop <b>folders</b> instead of their files, one or several at once. Only the
+files directly inside each folder are read (subfolders are not), and the same pairing by name
+applies. The files a run writes beside its results are ignored &mdash;
+<code>missing_seqs_*</code>, <code>nohit_seqs_*</code>, the run logs, <code>bestseq-*</code> and
+<code>secondary_variants*</code> &mdash; and so is a <code>.tsv</code> next to an
+<code>.xlsx</code> of the same name (BLAST writes both; the <code>.xlsx</code> is kept). Because
+pairs are matched by name alone, a name that would come from two places (two folders, or a
+folder and a file already loaded) is <b>not loaded</b> and the zone says so in red: click
+<b>Clear</b> if one is already loaded, then drop those folders one at a time. The
+single leftover FASTA and table are not paired by force when they come from a folder. A folder
+with no FASTA or table is reported as well.</p>
 <p>One pair is enough (classification mode); two or more enable the comparison, with no
 upper limit. BLAST tables may be <code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>. Each row of the drop zone shows
 the pair, its sequence count, <b>how many of those sequences the table holds</b> (its
@@ -1752,7 +1836,10 @@ the pair, its sequence count, <b>how many of those sequences the table holds</b>
 validation; a FASTA with no matching table (or a table with no matching FASTA) is listed in
 red and ignored. A pair whose table holds <i>none</i> of the FASTA's sequences blocks the
 run — it usually means the table belongs to another FASTA — and headers missing from a table
-are listed in the run log, since those sequences get no hits.</p>
+are listed in the run log, since those sequences get no hits. A FASTA with <b>repeated
+headers</b> is marked on its row (<code>⚠ N repeated header(s) — only the first record of each
+is used</code>): headers are the key to the table, so only the first record of each repeated
+header takes part, and the run log lists them.</p>
 <p>The file area sits at the top of the panel and the <b>Selection Settings</b> below it. The
 amber note about the required <code>Query_*</code> columns appears only while a loaded table
 lacks them and no usable reference file is set.</p>
@@ -1929,6 +2016,9 @@ by default, or a folder you pick):</p>
       <td>Input pairs, parameters, the scoring formula used, and counts per taxonomic
           level and per flag.</td></tr>
 </table>
+<p>A FASTA file that would hold no sequence is not written (e.g. no
+<code>_tax_mismatch.fasta</code> when every sample was identified); the run log lists it as
+<i>none (0 seqs)</i>.</p>
 <div class="note">
 <b>FASTA format</b>
 All the FASTA files keep the <b>original header verbatim</b> — nothing is appended — and
@@ -2105,7 +2195,9 @@ choice is recorded in the log.</p>
       <td>Optional, the same control as in BLAST (§13.3): adds the <code>Query_*</code>
           columns and <code>Tax_level_match</code> to every row, keyed by the sample ID of
           <code>Query ID</code>. The <a href="#ref-check">reference check</a> reports how many
-          Query IDs the reference knows as soon as both files are loaded.</td></tr>
+          Query IDs the reference knows as soon as both files are loaded; after the run the
+          log names the samples missing from the reference or with empty taxonomy, and warns
+          when the reference is not in the expected layout.</td></tr>
 </table>
 <p>All three options sit in the <b>Options</b> box below the input file.</p>
 
@@ -2358,7 +2450,9 @@ three files, and keeps things readable even for a sweep of 40+ combinations:</p>
   <li><code>unique_secondary_variants.fasta</code> — only for runs with <b>Detect
       intra-sample sequence variants</b> enabled: the <code>secondary_variants.fa</code>
       (raw + corrected) of those runs merged the same way, grouping every variant of a host
-      sample together. Per-sample breakdown in <code>batch_variants_dedup_report.tsv</code>.</li>
+      sample together. Per-sample breakdown in <code>batch_variants_dedup_report.tsv</code>.
+      Neither <code>unique_*.fasta</code> is written when it would hold no sequence (e.g. no
+      run found a secondary variant); the report <code>.tsv</code> is.</li>
   <li><code>batch_dedup_report.tsv</code> — one row per sample: <code>N_variants</code>
       (how many distinct sequences it had across the sweep), <code>N_runs_present</code> /
       <code>N_runs_total</code> (e.g. <code>18</code> and <code>40</code>, as two plain
@@ -2433,11 +2527,12 @@ have turned the batch's merged FASTA into a taxonomically-identified best-sequen
 natural question is whether the sweep was worth it: does any single combination already
 reproduce every identified sequence, or were several combinations each needed to contribute
 their own share? The <b>Coverage report (minimal combination set)</b> section of the Parameter
-Sweep panel answers this. Drop (or <b>Browse…</b> to) the sweep folder on <b>Sweep
+Sweep panel answers this. Drop (or <b>Browse…</b> to) the sweep folder on <b>Sweep/Merge
 folder</b> and the Best Sequence output folder on <b>Best Sequence folder</b>, then click
 <b>Create coverage report</b>. Each field checks what it gets by its content, so renamed
 folders still work: the sweep folder needs its <code>batch_run_summary.tsv</code>, the Best
-Sequence folder a <code>bestseq-*_identified.fasta</code>. A <b>Merge existing runs</b>
+Sequence folder a <code>bestseq-*.tsv</code> report (its <code>_identified.fasta</code>
+is absent when no sequence was identified). A <b>Merge existing runs</b>
 folder (<code>…_merge</code>) works on the sweep side too: the minimal set is then named by
 run folder and no <code>.cfg</code> is written, since those runs record no parameters. If no
 identified sequence appears in any run, the panel warns that the two folders are probably

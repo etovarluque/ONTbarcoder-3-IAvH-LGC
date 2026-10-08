@@ -15,6 +15,8 @@ from .best_seq_panel import (
     sample_id_of, lookup_tax, concordance_level, display_taxon,
     read_tax_reference_cached, reference_match_check, fasta_headers,
     table_column, _cached, reference_format_warning, reference_report_lines,
+    reference_empty_ids, BLAST_RESULTS_SHEET, repeated_headers, repeated_note,
+    
 )
 
 
@@ -207,14 +209,48 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict,
     return n_rows, n_filled, sorted(unknown), (n_match if has_subject_tax else -1)
 
 
+# Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
+# numeric. Writing them as strings makes Excel flag every cell with
+# "Number stored as text", whose background error-checker re-scans the
+# sheet on every sort/filter/scroll → high CPU. Convert these to
+# int/float so openpyxl writes native numeric cells; the rest stay text.
+# Detect them by header name so it is robust to column shifts.
+_NUMERIC_NAMES = frozenset({
+    "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
+    "Gap_opens", "Query_start", "Query_end", "Subject_start",
+    "Subject_end", "Evalue", "Bit_score",
+})
+
+
+def _num(v):
+    if v == "":
+        return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)   # handles decimals and e-notation (Evalue)
+    except ValueError:
+        return v          # leave genuinely non-numeric text as-is
+
+
 class _XlsxBuildError(Exception):
     """openpyxl missing, or the TSV could not be read — not the write itself."""
 
 
-def build_xlsx_from_tsv(tsv_path: str) -> str:
+def build_xlsx_from_tsv(tsv_path: str, run_info: Optional[dict] = None,
+                        params_override: Optional[dict] = None) -> str:
     """Convert *tsv_path* to a formatted .xlsx next to it, overwriting any
     existing file of that name (e.g. from an earlier run, or before the
     reference/Tax_level_match columns were updated by _ApplyReferenceDialog).
+
+    Besides the hit table ("BLAST Results") the workbook gets a "Summary"
+    sheet and a "Best hit" sheet (see _add_summary_sheets). *run_info*
+    describes the run (input files, parameters, ...); when None it is read
+    from the run's state file next to the table, if there is one.
+    *params_override* replaces some of its parameters (e.g. the reference
+    file just applied by _ApplyReferenceDialog).
 
     Module-level (rather than a _BlastWorker method) so both the worker and
     _ApplyReferenceDialog — which runs on the UI thread with no worker
@@ -266,31 +302,8 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
     # new sample block so the hit groups are visually separated.
     border_group_top = Border(left=thin, right=thin, top=medium, bottom=thin)
 
-    # Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
-    # numeric. Writing them as strings makes Excel flag every cell with
-    # "Number stored as text", whose background error-checker re-scans the
-    # sheet on every sort/filter/scroll → high CPU. Convert these to
-    # int/float so openpyxl writes native numeric cells; the rest stay text.
-    # Detect them by header name so it is robust to column shifts.
-    _NUMERIC_NAMES = frozenset({
-        "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
-        "Gap_opens", "Query_start", "Query_end", "Subject_start",
-        "Subject_end", "Evalue", "Bit_score",
-    })
     _numeric_idx = frozenset(
         i for i, h in enumerate(headers) if h in _NUMERIC_NAMES)
-
-    def _num(v):
-        if v == "":
-            return v
-        try:
-            return int(v)
-        except ValueError:
-            pass
-        try:
-            return float(v)   # handles decimals and e-notation (Evalue)
-        except ValueError:
-            return v          # leave genuinely non-numeric text as-is
 
     def _hfill(ci):
         return H1 if ci <= 1 else (H2 if ci <= 12 else H3)
@@ -302,7 +315,7 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "BLAST Results"
+    ws.title = BLAST_RESULTS_SHEET
 
     # Header row
     ws.append(headers)
@@ -371,9 +384,406 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
         width = max((len(str(c.value or "")) for c in col_cells), default=8)
         ws.column_dimensions[get_column_letter(ci + 1)].width = min(width + 2, 55)
 
+    if run_info is None:
+        run_info = load_run_info(tsv_path)
+    if params_override:
+        run_info = dict(run_info)
+        run_info["params"] = {**(run_info.get("params") or {}), **params_override}
+    rows = [(line.split("\t") + [""] * n_cols)[:n_cols] for line in lines[1:]]
+    _add_summary_sheets(wb, headers, rows, tsv_path, run_info)
+
     xlsx_path = tsv_path.rsplit(".", 1)[0] + ".xlsx"
     wb.save(xlsx_path)   # overwrites any existing file of that name
     return xlsx_path
+
+
+# ── Summary and Best hit sheets ─────────────────────────────────────────────
+
+# How far each query was identified, deepest first. The four ranks and "none"
+# are Tax_level_match values (best hit vs. the reference taxonomy); the rest
+# describe queries without a usable comparison.
+_ID_LABELS = {
+    "organism":     "Species (organism)",
+    "genus":        "Genus",
+    "family":       "Family",
+    "order":        "Order",
+    "none":         "No match with the reference (none)",
+    "no_reference": "Sample not in the reference",
+    "blast_hit":    "With BLAST hits",       # no reference applied to the table
+    "no_hit":       "No BLAST hit",
+    "not_searched": "Not searched (run incomplete)",
+}
+_RANK_SCORE = {"organism": 4, "genus": 3, "family": 2, "order": 1}
+_ID_FILL = {
+    "organism": "FFC6EFCE", "genus": "FFE2F0D9", "family": "FFFFF2CC",
+    "order": "FFFCE4D6", "none": "FFF8CBAD", "no_reference": "FFEDEDED",
+    "no_hit": "FFD9D9D9", "not_searched": "FFD9D9D9",
+}
+# Header colours of the Best hit sheet, by column name: the query block
+# (navy), taxonomy (burnt orange) and, for everything else, BLAST metrics (teal).
+_ID_ZONE_COLS = frozenset(("Identification", "Hits", "Hit_rank", "Query_name"))
+_TAX_ZONE_COLS = frozenset(
+    ("Subject_Kingdom", "Subject_Class", "Tax_level_match")
+    + _SUBJECT_TAX_COLUMNS + tuple(QUERY_TAX_COLUMNS))
+
+
+def load_run_info(tsv_path: str) -> dict:
+    """What the Summary sheet needs to know about the run that produced
+    *tsv_path*, read from its blast-<run_id>.state.json (input files,
+    parameters, sequences searched). {} when there is no state file, e.g. a
+    table from the BLAST Results File tab: the summary then describes the
+    table alone."""
+    base = os.path.splitext(tsv_path)[0]
+    try:
+        with open(base + ".state.json", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        return {}
+    if st.get("kind") == "hit_table":
+        # Written by the BLAST Results File tab (see save_hit_table_info).
+        return {"kind": "hit_table", "params": st.get("params") or {},
+                "inputs": [(f, qs) for f, qs in st.get("inputs") or []]}
+    fasta = base + ".fa"
+    return {"kind": "search", "run_id": st.get("run_id", ""),
+            "files": st.get("files") or [], "params": st.get("params") or {},
+            "processed": st.get("processed"), "status": st.get("status", ""),
+            "fasta": fasta if os.path.isfile(fasta) else ""}
+
+
+def save_hit_table_info(tsv_path: str, inputs: list, params: dict):
+    """Keep what the Summary sheet says about a table built from NCBI Hit Table
+    files (the files and the queries of each, the settings) beside it, so the
+    sheet can be rebuilt when a reference is applied later. Never raises: this
+    only feeds the Summary."""
+    info = {"kind": "hit_table", "params": params,
+            "inputs": [[f, list(qs)] for f, qs in inputs]}
+    try:
+        with open(os.path.splitext(tsv_path)[0] + ".state.json", "w", encoding="utf-8") as fh:
+            json.dump(info, fh)
+    except Exception:
+        pass
+
+
+def _fasta_query_names(path: str) -> Optional[List[str]]:
+    """Query_name of every record of a FASTA as a BLAST run writes it (the
+    header without '>', spaces as '_'; see _to_single_line_fasta), or None if
+    the file cannot be read."""
+    if not path:
+        return None
+    try:
+        opener = __import__("gzip").open if path.lower().endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+            return [ln.strip().replace(" ", "_")[1:]
+                    for ln in fh if ln.lstrip().startswith(">")]
+    except Exception:
+        return None
+
+
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def pick_best_hits(headers: List[str], rows: List[list]) -> Dict[str, tuple]:
+    """Best hit of every query of a hit table: {Query_name: (row, n_hits)}.
+
+    The best hit is the one that agrees with the reference taxonomy at the
+    deepest rank (Tax_level_match), which is not necessarily BLAST's first.
+    Hits at the same rank (and every hit when no reference was applied, or
+    when none agrees, "none") are ordered by bit score, then identity, then
+    fewest gap openings and mismatches, then BLAST's own order. The query's
+    own ambiguities are the same for all of its hits, so they cannot
+    separate them.
+    """
+    col = {h: i for i, h in enumerate(headers)}
+
+    def get(r, name):
+        i = col.get(name)
+        return r[i] if i is not None and i < len(r) else ""
+
+    groups: Dict[str, list] = {}
+    for r in rows:
+        q = str(get(r, "Query_name")).strip()
+        if q:
+            groups.setdefault(q, []).append(r)
+
+    def key(r):
+        return (_RANK_SCORE.get(str(get(r, "Tax_level_match")).strip(), 0),
+                _to_float(get(r, "Bit_score")), _to_float(get(r, "P_identity")),
+                -_to_float(get(r, "Gap_opens")), -_to_float(get(r, "Num_mismatches")),
+                -_to_float(get(r, "Hit_rank")))
+
+    return {q: (max(hits, key=key), len(hits)) for q, hits in groups.items()}
+
+
+def _identification(row: list, col: dict, has_match: bool) -> str:
+    """Identification category of a query, from its best hit row."""
+    if not has_match:
+        return "blast_hit"
+    if not any(display_taxon(row[col[c]]) for c in QUERY_TAX_COLUMNS if c in col):
+        return "no_reference"
+    level = str(row[col["Tax_level_match"]]).strip()
+    return level if level in _RANK_SCORE else "none"
+
+
+def refresh_summary_sheets(wb, path: str, params_override: Optional[dict] = None) -> bool:
+    """Rebuild the Summary and Best hit sheets of a BLAST results workbook
+    already open in *wb* (saved at *path*) from its hit table, e.g. after the
+    table was edited in place by Best Sequence's reference step. Does nothing
+    and returns False when the workbook has neither sheet (not a BLAST panel
+    workbook, or one made before they existed)."""
+    if not ({"Summary", "Best hit"} & set(wb.sheetnames)):
+        return False
+    from .best_seq_panel import blast_sheet
+    sheet = blast_sheet(wb)
+    values = [["" if v is None else str(v) for v in r]
+              for r in sheet.iter_rows(values_only=True)]
+    values = [r for r in values if any(v.strip() for v in r)]
+    for name in ("Summary", "Best hit"):
+        if name in wb.sheetnames:
+            del wb[name]
+    if not values:
+        return False
+    headers = [h.strip() for h in values[0]]
+    n_cols = len(headers)
+    rows = [(r + [""] * n_cols)[:n_cols] for r in values[1:]]
+    run_info = load_run_info(path)
+    if params_override:
+        run_info["params"] = {**(run_info.get("params") or {}), **params_override}
+    _add_summary_sheets(wb, headers, rows, path, run_info)
+    return True
+
+
+def _add_summary_sheets(wb, headers: List[str], rows: List[list], tsv_path: str,
+                        run_info: dict):
+    """Add the "Summary" (first, shown on opening) and "Best hit" sheets
+    ahead of the hit table, in the hit table's style."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    thin = Side(style="thin", color="FFCCCCCC")
+    st = {
+        "H1": PatternFill(patternType="solid", fgColor="FF1A365D"),   # navy
+        "H2": PatternFill(patternType="solid", fgColor="FF0D5E6E"),   # teal
+        "H3": PatternFill(patternType="solid", fgColor="FF7C3200"),   # burnt orange
+        "white_bold": Font(color="FFFFFFFF", bold=True, size=10),
+        "normal_font": Font(size=10),
+        "bold_font": Font(size=10, bold=True),
+        "hdr_align": Alignment(horizontal="center", vertical="center"),
+        "dat_align": Alignment(vertical="center", wrap_text=False),
+        "border": Border(left=thin, right=thin, top=thin, bottom=thin),
+    }
+
+    col = {h: i for i, h in enumerate(headers)}
+    has_match = "Tax_level_match" in col
+    best = pick_best_hits(headers, rows)
+    kind = run_info.get("kind", "")
+    unit = "Queries" if kind == "hit_table" else "Sequences"
+
+    # ── Input files and the queries each one holds ──
+    inputs = run_info.get("inputs")          # [(path, [Query_name] | None)]
+    if inputs is None:
+        inputs = [(f, _fasta_query_names(f)) for f in run_info.get("files") or []]
+
+    # Every query of the run: those of the FASTA actually searched (so the
+    # sequences without hits count too), else those of the input files, plus
+    # any in the table.
+    all_q = set(best)
+    fa_q = _fasta_query_names(run_info.get("fasta", ""))
+    if fa_q:
+        all_q.update(fa_q)
+    else:
+        for _f, qs in inputs:
+            all_q.update(qs or [])
+    processed = run_info.get("processed")
+    processed = set(processed) if processed is not None else None
+
+    cats: Dict[str, str] = {}
+    for q in all_q:
+        if q in best:
+            cats[q] = _identification(best[q][0], col, has_match)
+        elif processed is not None and q not in processed:
+            cats[q] = "not_searched"
+        else:
+            cats[q] = "no_hit"
+
+    if has_match:
+        levels = ["organism", "genus", "family", "order", "none", "no_reference",
+                  "no_hit", "not_searched"]
+    else:
+        levels = ["blast_hit", "no_hit", "not_searched"]
+    counts = {lv: sum(1 for c in cats.values() if c == lv) for lv in levels}
+    levels = [lv for lv in levels
+              if counts[lv] or lv not in ("no_reference", "not_searched")]
+    n_total = len(all_q)
+
+    def fill(argb):
+        return PatternFill(patternType="solid", fgColor=argb)
+
+    # ── Best hit: one row per query ──
+    wsb = wb.create_sheet("Best hit", 0)
+    b_headers = ["Identification", "Hits"] + headers
+    wsb.append(b_headers)
+    for ci, name in enumerate(b_headers, 1):
+        cell = wsb.cell(row=1, column=ci)
+        cell.fill = (st["H1"] if name in _ID_ZONE_COLS
+                     else st["H3"] if name in _TAX_ZONE_COLS else st["H2"])
+        cell.font, cell.alignment, cell.border = st["white_bold"], st["hdr_align"], st["border"]
+    wsb.row_dimensions[1].height = 22
+    q_i = col.get("Query_name")
+    for rn, q in enumerate(sorted(all_q), start=2):
+        cat = cats[q]
+        if q in best:
+            row, n_hits = best[q]
+            vals = [_num(v) if headers[ci] in _NUMERIC_NAMES else v
+                    for ci, v in enumerate(row)]
+        else:
+            n_hits = 0
+            vals = [""] * len(headers)
+            if q_i is not None:
+                vals[q_i] = q
+        wsb.append([cat, n_hits] + vals)
+        for ci in range(1, len(b_headers) + 1):
+            cell = wsb.cell(row=rn, column=ci)
+            cell.font, cell.alignment, cell.border = st["normal_font"], st["dat_align"], st["border"]
+        if cat in _ID_FILL:
+            wsb.cell(row=rn, column=1).fill = fill(_ID_FILL[cat])
+    wsb.freeze_panes = "C2"
+    wsb.auto_filter.ref = wsb.dimensions
+    for ci, col_cells in enumerate(wsb.columns, 1):
+        width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+        wsb.column_dimensions[get_column_letter(ci)].width = min(width + 2, 55)
+
+    # ── Summary ──
+    ws = wb.create_sheet("Summary", 0)
+    title_font = Font(size=14, bold=True, color="FF1A365D")
+    note_font = Font(size=9, italic=True, color="FF666666")
+    r = [1]   # next row to write
+
+    def put(values, font=None, cell_fill=None, pct_from=None):
+        for ci, v in enumerate(values, 1):
+            cell = ws.cell(row=r[0], column=ci, value=v)
+            cell.font = font or st["normal_font"]
+            if cell_fill:
+                cell.fill = cell_fill
+            if pct_from and ci >= pct_from and isinstance(v, float):
+                cell.number_format = "0.0%"
+        r[0] += 1
+
+    def section(title, columns=()):
+        r[0] += 1
+        put([title] + list(columns), font=st["white_bold"], cell_fill=st["H1"])
+
+    def kv(label, value):
+        put([label, value])
+        ws.cell(row=r[0] - 1, column=1).font = st["bold_font"]
+
+    put(["BLAST results summary"], font=title_font)
+    kv("Results table", os.path.basename(tsv_path))
+    kv("Generated", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    if run_info.get("run_id"):
+        kv("Run ID", run_info["run_id"])
+    if run_info.get("status"):
+        kv("Run status", run_info["status"])
+
+    if inputs:
+        section("Input result files" if kind == "hit_table" else "Input FASTA files",
+                [unit, "Path"])
+        n_sum = 0
+        for f, qs in inputs:
+            n_sum += len(qs or [])
+            put([os.path.basename(f), len(qs) if qs is not None else "file not found",
+                 os.path.abspath(f)])
+        put(["Total", n_sum], font=st["bold_font"])
+        if n_total != n_sum:
+            put([f"Unique {unit.lower()} in the run", n_total], font=st["bold_font"])
+    else:
+        section("Input")
+        kv(f"{unit} in the table", len(best))
+
+    params = run_info.get("params") or {}
+    ref = params.get("tax_reference") or ""
+    section("Taxonomy reference")
+    kv("Reference file", os.path.basename(ref) if ref else "(none)")
+    if ref:
+        kv("Path", os.path.abspath(ref))
+        kv("Sample-ID suffix removed", params.get("strip_suffix") or "(none)")
+
+    if params.get("nhits"):
+        section("Parameters")
+        if kind == "hit_table":
+            kv("Hits per query kept", params.get("nhits"))
+        else:
+            kv("Database", params.get("database", ""))
+            kv("Program", params.get("program", ""))
+            kv("Hits per sequence", params.get("nhits"))
+            kv("Sequences per batch", params.get("nseq") or "Automatic")
+        kv("NCBI taxonomy fetched", "Yes" if params.get("fetch_taxonomy", True) else "No")
+
+    section("Results")
+    kv("Hit rows in the table", len(rows))
+    kv(f"{unit} with hits", len(best))
+    kv(f"{unit} without hits", counts.get("no_hit", 0))
+    if counts.get("not_searched"):
+        kv(f"{unit} not searched", counts["not_searched"])
+    if has_match and "Hit_rank" in col:
+        kv("Best hit is not BLAST's first hit",
+           sum(1 for row, _n in best.values()
+               if str(row[col["Hit_rank"]]).strip() not in ("", "1")))
+
+    section("Identification level", [unit, "%", "Cumulative %"])
+    cum = 0
+    for lv in levels:
+        n = counts[lv]
+        pct = n / n_total if n_total else 0.0
+        if lv in _RANK_SCORE:
+            cum += n
+            cum_pct = cum / n_total if n_total else 0.0
+        else:
+            cum_pct = ""
+        put([_ID_LABELS[lv], n, float(pct), cum_pct], pct_from=3)
+        if lv in _ID_FILL:
+            ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+    put(["Total", n_total], font=st["bold_font"])
+    if has_match:
+        put(["Rank at which each query's best hit agrees with the reference taxonomy "
+             "(Tax_level_match). Cumulative %: identified at that rank or deeper."],
+            font=note_font)
+    else:
+        put(["No reference taxonomy applied: add a query taxonomy reference to get "
+             "identification levels (organism, genus, family, order)."], font=note_font)
+    put(["Best hit sheet: one row per query. Best hit = deepest rank agreeing with the "
+         "reference; ties and 'none' by bit score, identity, fewest gaps and mismatches."],
+        font=note_font)
+
+    with_qs = [(f, qs) for f, qs in inputs if qs]
+    if len(with_qs) > 1:
+        section("Identification level by file",
+                [os.path.basename(f) for f, _qs in with_qs] + ["Total"])
+        for lv in levels:
+            per = [sum(1 for q in set(qs) if cats.get(q) == lv) for _f, qs in with_qs]
+            put([_ID_LABELS[lv]] + per + [counts[lv]])
+            if lv in _ID_FILL:
+                ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+        put(["Total"] + [len(set(qs)) for _f, qs in with_qs] + [n_total],
+            font=st["bold_font"])
+
+    # Column A holds labels and the long notes (left to overflow); the rest
+    # fit their values.
+    ws.column_dimensions["A"].width = 38
+    for ci in range(2, ws.max_column + 1):
+        letter = get_column_letter(ci)
+        width = max((len(str(c.value)) for c in ws[letter]
+                     if c.value is not None and not isinstance(c.value, float)), default=8)
+        ws.column_dimensions[letter].width = min(max(width + 2, 12), 60)
+
+    # Open on the Summary. Only one tab may be selected, or Excel groups them.
+    for sheet in wb.worksheets:
+        sheet.sheet_view.tabSelected = False
+    ws.sheet_view.tabSelected = True
+    wb.active = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -958,6 +1368,13 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
             if unknown:
                 examples = ", ".join(sorted(unknown)[:5])
                 msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
+            suffix = self._ref_group.suffix
+            empty = reference_empty_ids(
+                [sample_id_of(q, suffix) for q in table_column(tsv_path, "Query_name")],
+                ref_table)
+            if empty:
+                msg += (f"  {len(empty)} sample ID(s) in the reference with empty "
+                        f"taxonomy (e.g. {', '.join(empty[:5])}).")
             if n_match >= 0:
                 msg += f"  Tax_level_match updated on {n_match} row(s)."
             _fmt = reference_format_warning(ref_table)
@@ -968,7 +1385,8 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
             # whichever one (if any) sits next to it — otherwise it would keep
             # showing the pre-fix taxonomy even though the .tsv is now correct.
             try:
-                xlsx_path = build_xlsx_from_tsv(tsv_path)
+                xlsx_path = build_xlsx_from_tsv(tsv_path, params_override={
+                    "tax_reference": ref_path, "strip_suffix": suffix})
                 if xlsx_path:
                     msg += f"  {os.path.basename(xlsx_path)} updated."
             except Exception as exc:
@@ -1262,6 +1680,13 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_plan.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
         sg.addRow("", self._lbl_plan)
 
+        # Repeated headers among the loaded FASTA files (see _update_repeat_note).
+        self._lbl_repeats = QtWidgets.QLabel("")
+        self._lbl_repeats.setWordWrap(True)
+        self._lbl_repeats.setStyleSheet("color:#B45309; font-size:14px;")
+        self._lbl_repeats.hide()
+        sg.addRow("", self._lbl_repeats)
+
 
         self._tax_check = QtWidgets.QCheckBox("Fetch organism + taxonomic classification")
         self._tax_check.setChecked(True)
@@ -1422,7 +1847,11 @@ class BlastPanel(QtWidgets.QWidget):
             }}
             QTabBar::tab:!selected:hover {{ background: {BLUE_LIGHT}; color: {BLUE}; }}
         """)
-        self._tabs.setStyleSheet(f"QTabWidget::pane {{ border-top: 3px solid {BLUE}; }}")
+        # The pane takes the panel's own ground, like every other panel; the
+        # app's pane rule fills it with the card colour, which reads as white.
+        self._tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: none; border-top: 3px solid {BLUE};"
+            f" background: transparent; }}")
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -1486,9 +1915,29 @@ class BlastPanel(QtWidgets.QWidget):
         self._batch_spin.setVisible(not auto)
         self._update_batch_plan()
 
+    def _loaded_repeats(self):
+        """{header: copies} of the headers repeated within or across the loaded
+        files, as the search submits them (spaces as '_')."""
+        if len(self._drop.files) == 1:
+            return repeated_headers(list(fasta_headers(self._drop.files[0])), True)
+        headers = [h for f in self._drop.files for h in fasta_headers(f)]
+        return repeated_headers(headers, True)
+
+    def _update_repeat_note(self):
+        repeats = self._loaded_repeats() if self._drop.files else {}
+        if not repeats:
+            self._lbl_repeats.hide()
+            return
+        self._lbl_repeats.setText(
+            f"⚠ {repeated_note(repeats)}. A repeated header is one Query_name in "
+            f"the results table: the hits of its copies are mixed in the same rows, "
+            f"so they cannot be told apart. Give each sequence its own header.")
+        self._lbl_repeats.show()
+
     def _update_batch_plan(self, *_):
         """Show how the loaded sequences will be split, for the current mode."""
         ctx = "BlastPanel"
+        self._update_repeat_note()
         lengths = self._seq_lengths()
         auto = self._batch_mode.currentIndex() == 0
 
@@ -3215,10 +3664,11 @@ class _BlastWorker(QtCore.QThread):
 
     # ── TSV → XLSX conversion ─────────────────────────────────────────────
 
-    def _tsv_to_xlsx(self, tsv_path: str) -> str:
-        """Convert *tsv_path* to a formatted xlsx. Returns xlsx path or '' on failure."""
+    def _tsv_to_xlsx(self, tsv_path: str, run_info: Optional[dict] = None) -> str:
+        """Convert *tsv_path* to a formatted xlsx (with its Summary and Best hit
+        sheets, see build_xlsx_from_tsv). Returns xlsx path or '' on failure."""
         try:
-            return build_xlsx_from_tsv(tsv_path)
+            return build_xlsx_from_tsv(tsv_path, run_info)
         except _XlsxBuildError as e:
             self.statusUpdated.emit("result", f"XLSX skip  │ {e}")
             return ""
@@ -3523,10 +3973,13 @@ class _BlastWorker(QtCore.QThread):
         # ── Summary line (fixed slot "info") ──
         seq_info = (f"Resuming: {len(to_search)}/{seq_count} seqs left" if resuming
                     else f"Sequences: {seq_count}")
+        # Repeated headers share one Query_name: their hits end up mixed.
+        repeats = repeated_headers([h[1:] for h, _s in all_pairs])
         self.statusUpdated.emit(
             "info",
             f"{seq_info}  │  Batches: {n_batches}"
             f"  │  Hits/seq: {nhits}  │  DB: {cfg['database']}"
+            + (f"  │  ⚠ {len(repeats)} repeated header(s)" if repeats else "")
         )
         if resuming and not batch_pairs_list:
             self.statusUpdated.emit(
@@ -3792,14 +4245,20 @@ class _BlastWorker(QtCore.QThread):
             except Exception as exc:
                 ref_msg = f"Reference query taxonomy skipped: {exc}"
 
-        # ── Convert TSV → XLSX ──
-        xlsx_path = ""
-        if not self._stop and total_hits_done > 0:
-            xlsx_path = self._tsv_to_xlsx(tsv_path)
-
         # ── Final state: whether (and why) this run can still be resumed ──
         run_status = ("stopped" if self._stop
                       else "incomplete" if missing_pairs else "completed")
+
+        # ── Convert TSV → XLSX ──
+        xlsx_path = ""
+        if not self._stop and total_hits_done > 0:
+            xlsx_path = self._tsv_to_xlsx(tsv_path, {
+                "kind": "search", "run_id": mydate, "files": list(self.files),
+                "params": {k: cfg.get(k) for k in self._RUN_PARAMS},
+                "processed": self._processed, "status": run_status,
+                "fasta": fasta_path,
+            })
+
         self._save_state(run_status)
         resume_hint = "use Resume run… to finish it" if missing_pairs else ""
 
@@ -3873,7 +4332,9 @@ class _BlastWorker(QtCore.QThread):
             f"  NCBI API key      : {api_masked}",
             "",
             "Results:",
-            f"  Sequences found   : {seq_count}",
+            f"  Sequences found   : {seq_count}"
+            + (f"  (⚠ {repeated_note(repeats)}: their hits share one Query_name)"
+               if repeats else ""),
             f"  Sequences queried : {seqs_queried}/{seq_count}"
             f" ({n_batches} batch(es) planned{' this session' if resuming else ''})",
             f"  Hits written      : {total_hits_done}",
@@ -4016,11 +4477,14 @@ class _BlastFileWorker(_BlastWorker):
         self.statusUpdated.emit(
             "parse", f"Parse       │ Reading {len(self.files)} file(s)…")
         blast_rows: List[str] = []
+        file_queries = []   # (file, its Query_names) for the xlsx Summary
         for f in self.files:
             if self._stop:
                 break
             rows = self._read_hit_file(f)
             blast_rows.extend(rows)
+            file_queries.append(
+                (f, list(dict.fromkeys(r.split("	", 1)[0] for r in rows))))
             self.statusUpdated.emit(
                 "parse",
                 f"Parse       │ {os.path.basename(f)}: {len(rows)} hit row(s) kept"
@@ -4158,7 +4622,13 @@ class _BlastFileWorker(_BlastWorker):
 
         xlsx_path = ""
         if ranked_rows and not self._stop:
-            xlsx_path = self._tsv_to_xlsx(tsv_path)
+            hit_params = {"nhits": nhits, "fetch_taxonomy": fetch_tax,
+                          "tax_reference": ref_path,
+                          "strip_suffix": cfg.get("strip_suffix", "")}
+            save_hit_table_info(tsv_path, file_queries, hit_params)
+            xlsx_path = self._tsv_to_xlsx(tsv_path, {
+                "kind": "hit_table", "inputs": file_queries, "params": hit_params,
+            })
         self._emit_progress(total_expected, total_expected)
 
         extra_msgs = [m for m in (ref_msg, tax_match_msg) if m]

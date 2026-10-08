@@ -514,6 +514,14 @@ def dedup_consensus_filtered(run_folders: List[Tuple[str, str]],
             fh_rep.write(f"{sample}\t{len(variants)}\t{len(run_nums)}\t{n_runs}\t"
                          f"{_compress_ranges(run_nums)}\n")
 
+    # No sequence to merge (e.g. no run found any secondary variant): the
+    # report is kept, but not an empty FASTA.
+    if n_sequences_written == 0:
+        try:
+            os.remove(out_fasta)
+        except OSError:
+            pass
+
     return {
         "n_samples": n_samples,
         "n_collapsed": n_collapsed,

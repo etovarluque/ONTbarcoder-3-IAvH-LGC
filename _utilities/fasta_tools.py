@@ -122,11 +122,16 @@ class _FastaToolsWorker(QtCore.QThread):
         return records
 
     @staticmethod
-    def _write_fasta(records, path):
+    def _write_fasta(records, path) -> bool:
+        """Write *records* to *path*. With no records nothing is written (an
+        empty FASTA is no use to anyone) and False is returned."""
+        if not records:
+            return False
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             for hdr, seq in records:
                 fh.write(f">{hdr}\n{seq}\n")
+        return True
 
     @staticmethod
     def _stem(path):
@@ -136,6 +141,17 @@ class _FastaToolsWorker(QtCore.QThread):
             if name.lower().endswith(ext):
                 return name[: -len(ext)]
         return os.path.splitext(name)[0]
+
+    def _warn_repeats(self, name, records):
+        """Log repeated headers of *name* (they make several operations, and the
+        tools that read the result, treat different sequences as one)."""
+        from .best_seq_panel import repeated_headers, repeated_note
+        repeats = repeated_headers([h for h, _s in records])
+        if repeats:
+            self.log_line.emit(
+                f"⚠ {name}: {repeated_note(repeats)}. Different sequences "
+                f"with the same header are not told apart by the tools that "
+                f"read this file.\n")
 
     def _iter_inputs(self):
         """Yield (display_name, stem, records) per input to process.
@@ -148,6 +164,7 @@ class _FastaToolsWorker(QtCore.QThread):
                 if self._stop:
                     return
                 all_records.extend(self._read_fasta(path))
+            self._warn_repeats(f"Merged {len(self._files)} files", all_records)
             yield f"Merged {len(self._files)} files", "merged", all_records
         else:
             stems = [self._stem(p) for p in self._files]
@@ -169,7 +186,9 @@ class _FastaToolsWorker(QtCore.QThread):
                     stem = f"{base_stem}_{counter}"
                     counter += 1
                 used_stems.add(stem)
-                yield name, stem, self._read_fasta(path)
+                records = self._read_fasta(path)
+                self._warn_repeats(name, records)
+                yield name, stem, records
 
     @staticmethod
     def _cell_to_str(v) -> str:
@@ -205,14 +224,18 @@ class _FastaToolsWorker(QtCore.QThread):
                     unique.append((hdr, seq))
             removed = len(records) - len(unique)
             out_path = os.path.join(self._out_dir, f"{stem}_unique.fasta")
-            self._write_fasta(unique, out_path)
+            wrote = self._write_fasta(unique, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Total sequences in :  {len(records)}\n"
                 f"  Unique sequences   :  {len(unique)}\n"
                 f"  Duplicates removed :  {removed}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     def _run_identical(self):
@@ -226,7 +249,7 @@ class _FastaToolsWorker(QtCore.QThread):
 
             # FASTA output
             out_path = os.path.join(self._out_dir, f"{stem}_identical.fasta")
-            self._write_fasta(identical, out_path)
+            wrote = self._write_fasta(identical, out_path)
 
             # Excel: group IDs by sequence
             seq_to_ids: dict = {}
@@ -284,7 +307,11 @@ class _FastaToolsWorker(QtCore.QThread):
                 f"  Distinct duplicated seqs :  {dup_groups}\n"
                 f"  Excel groups file        :  {os.path.basename(xlsx_path)}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     def _run_grep(self):
@@ -342,7 +369,7 @@ class _FastaToolsWorker(QtCore.QThread):
             matched = [(hdr, seq) for hdr, seq in records if matches(hdr)]
             unmatched = len(records) - len(matched)
             out_path = os.path.join(self._out_dir, f"{stem}_grep.fasta")
-            self._write_fasta(matched, out_path)
+            wrote = self._write_fasta(matched, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Pattern ({mode_str})  :  {pat_summary}\n"
@@ -350,7 +377,11 @@ class _FastaToolsWorker(QtCore.QThread):
                 f"  Matched             :  {len(matched)}\n"
                 f"  Not matched         :  {unmatched}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     def _run_append(self):
@@ -389,7 +420,7 @@ class _FastaToolsWorker(QtCore.QThread):
                         not_found_ex.append(raw_id or "(empty)")
                 updated_list.append((new_hdr, seq))
             out_path = os.path.join(self._out_dir, f"{stem}_append.fasta")
-            self._write_fasta(updated_list, out_path)
+            wrote = self._write_fasta(updated_list, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Excel file          :  {excel_name}  ({n_excel_ids} IDs)\n"
@@ -400,7 +431,11 @@ class _FastaToolsWorker(QtCore.QThread):
                 + (f"  (e.g. {', '.join(not_found_ex)})" if not_found_ex else "")
                 + "\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     @classmethod
@@ -449,13 +484,17 @@ class _FastaToolsWorker(QtCore.QThread):
                 break
             reformatted = records if mode == "linearize" else [(hdr, _wrap(seq)) for hdr, seq in records]
             out_path = os.path.join(self._out_dir, f"{stem}{suffix}.fasta")
-            self._write_fasta(reformatted, out_path)
+            wrote = self._write_fasta(reformatted, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Mode                :  {mode_desc}\n"
                 f"  Total sequences     :  {len(records)}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     # NCBI translation table for each genetic code offered in the panel.
@@ -473,7 +512,7 @@ class _FastaToolsWorker(QtCore.QThread):
                 break
             out, counts, warns = trim_records(records, table, min_cov)
             out_path = os.path.join(self._out_dir, f"{stem}_orf.fasta")
-            self._write_fasta(out, out_path)
+            wrote = self._write_fasta(out, out_path)
             lens = Counter(len(s) for _h, s in out).most_common(5)
             n_empty = len(records) - len(out)
             msg = (
@@ -494,7 +533,11 @@ class _FastaToolsWorker(QtCore.QThread):
                 if len(warns) > len(shown):
                     msg += f"    … and {len(warns) - len(shown)} more\n"
             self.log_line.emit(msg)
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     def _run_sort(self):
@@ -529,14 +572,18 @@ class _FastaToolsWorker(QtCore.QThread):
                 working = sorted(working, key=_key, reverse=reverse)
 
             out_path = os.path.join(self._out_dir, f"{stem}_sorted.fasta")
-            self._write_fasta(working, out_path)
+            wrote = self._write_fasta(working, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Total sequences  :  {len(records)}\n"
                 f"  Separator        :  {sep_desc}\n"
                 f"  Sort levels      :  {levels_desc}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     def _run_filter_fields(self):
@@ -601,7 +648,7 @@ class _FastaToolsWorker(QtCore.QThread):
             matched   = [(h, s) for h, s in records if _passes(h)]
             unmatched = len(records) - len(matched)
             out_path  = os.path.join(self._out_dir, f"{stem}_filtered.fasta")
-            self._write_fasta(matched, out_path)
+            wrote = self._write_fasta(matched, out_path)
             self.log_line.emit(
                 f"{display_name}\n"
                 f"  Separator        :  {sep_desc}\n"
@@ -610,7 +657,11 @@ class _FastaToolsWorker(QtCore.QThread):
                 f"  Passed           :  {len(matched)}\n"
                 f"  Excluded         :  {unmatched}\n"
             )
-            outputs.append(out_path)
+            if wrote:
+                outputs.append(out_path)
+            else:
+                self.log_line.emit(
+                    f"  No sequences: {os.path.basename(out_path)} not written\n")
         return outputs
 
     @staticmethod
@@ -1007,7 +1058,7 @@ class _DragDropLineEdit(QtWidgets.QLineEdit):
     """QLineEdit that accepts a single file dragged onto it."""
 
     _DRAG_STYLE = (
-        f"QLineEdit {{ border: 2px solid {BLUE_MID}; background-color: {BLUE_LIGHT};"
+        f"QLineEdit {{ border: {DROP_DRAG_BORDER}; background-color: {DROP_DRAG_BG};"
         f" border-radius: 4px; }}"
     )
 

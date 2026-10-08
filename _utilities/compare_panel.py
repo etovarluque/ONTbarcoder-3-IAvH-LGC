@@ -1748,7 +1748,7 @@ def _write_outputs(
     """
     Generate all output files and return the write errors (empty if none):
       • summary.xlsx (with colors)
-      • best_barcodes.fa
+      • best_barcodes.fa   (each FASTA only when it has sequences)
       • identical.fa
       • compatible_iupac.fa
       • different.fa
@@ -1989,9 +1989,9 @@ def _write_outputs(
     for bn, entries in unique_entries.items():
         safe = bn.replace("/", "_").replace("\\", "_")
         fasta_jobs.append((f"unique_{safe}.fa", entries))
-    for i, (name, entries) in enumerate(fasta_jobs):
-        # best_barcodes.fa is always written; the rest only when non-empty
-        if i == 0 or entries:
+    for name, entries in fasta_jobs:
+        # A FASTA with no sequences is not written.
+        if entries:
             err = _write_fasta(os.path.join(outdir, name), entries)
             if err:
                 errors.append(err)

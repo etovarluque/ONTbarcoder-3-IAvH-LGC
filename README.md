@@ -14,6 +14,27 @@ Sweep) plus a non-coding marker mode.
 See [`CHANGELOG.md`](CHANGELOG.md) for the full list of differences from the
 original.
 
+## What's new in 3.7.0
+
+- **BLAST results workbook** with a **Summary** sheet (input files, reference,
+  parameters, sequences per file and how many were identified to species,
+  genus, family or order) and a **Best hit** sheet with one row per sequence:
+  the hit that best agrees with the expected taxonomy, not just BLAST's first.
+- **Best Sequence** accepts whole **folders**, splits the sequences it cannot
+  identify by cause (`_no_blast_hit`, `_tax_mismatch`), and *Open in Best
+  Sequence* from BLAST now starts a clean selection.
+- **Warnings for repeated FASTA headers** in BLAST, Best Sequence and FASTA
+  Tools, and no more empty FASTA files in any utility.
+- **Intra-sample variants** exported by tier (quality variants and
+  contamination / paralog alerts) and a final retry for BLAST sequences
+  without hits.
+- **FASTA Tools / FASTA Compare / Parameter Sweep** improvements (header
+  fields by key name and OR, ignore length differences at the ends, a table
+  of the sweep combinations).
+- **Interface:** clearer reference-file drop zones, one drag-over look for
+  every drop target, and tooltips that no longer vanish on scaled displays
+  (including 4K).
+
 ## Screenshots
 
 | Conventional mode | Real-time mode |

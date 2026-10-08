@@ -161,6 +161,33 @@ def fasta_headers(path: str) -> List[str]:
         return []
 
 
+def repeated_headers(headers, spaces_as_underscore: bool = False) -> Dict[str, int]:
+    """{header: copies} for every header that occurs more than once.
+
+    *spaces_as_underscore* compares headers as the BLAST panel submits them
+    (spaces become '_'), so two that differ only in spaces are one."""
+    counts: Dict[str, int] = {}
+    for h in headers:
+        key = h.replace(" ", "_") if spaces_as_underscore else h
+        counts[key] = counts.get(key, 0) + 1
+    return {h: n for h, n in counts.items() if n > 1}
+
+
+def repeated_note(repeats: Dict[str, int], limit: int = 3) -> str:
+    """'3 repeated header(s), e.g. a ×2, b ×2, c ×3' (the examples are capped)."""
+    if not repeats:
+        return ""
+    shown = ", ".join(f"{h[:40]}{'…' if len(h) > 40 else ''} ×{n}"
+                      for h, n in list(repeats.items())[:limit])
+    more = f" and {len(repeats) - limit} more" if len(repeats) > limit else ""
+    return f"{len(repeats)} repeated header(s), e.g. {shown}{more}"
+
+
+def fasta_repeats(path: str) -> Dict[str, int]:
+    """repeated_headers() of one FASTA file, cached while the file is unchanged."""
+    return _cached(path, "repeats", lambda p: repeated_headers(fasta_headers(p)))
+
+
 def table_column(path: str, column: str) -> List[str]:
     """Non-empty values of one column of a table (.xlsx/.tsv/.csv), [] if absent."""
     def load(p):
@@ -291,7 +318,8 @@ def lookup_tax(sample: str, ref: dict, ref_lower: dict):
     return tax
 
 
-def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str = ""):
+def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str = "",
+                        ref_path: str = ""):
     """Write the four Query_* columns into a BLAST table, in place.
 
     Every row is keyed by the sample ID of its Query_name (the text before
@@ -300,18 +328,29 @@ def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str
     table are overwritten; the missing ones are appended at its right end,
     so the original layout and formatting are left alone.
 
+    An .xlsx from the BLAST panel also gets its Tax_level_match column and
+    its Summary and Best hit sheets brought up to date (*ref_path* is the
+    reference file named in the Summary).
+
     Returns (rows seen, rows filled, sample IDs absent from the reference).
     """
     if path.lower().endswith(".xlsx"):
-        return _apply_reference_xlsx(path, ref, ref_lower, strip_suffix)
+        return _apply_reference_xlsx(path, ref, ref_lower, strip_suffix, ref_path)
     return _apply_reference_text(path, ref, ref_lower, strip_suffix)
 
 
-def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = ""):
+# Hit (Subject_*) taxonomy columns of a BLAST panel table, in the order of
+# the "order"/"family"/"genus"/"organism" ranks of concordance_level.
+_SUBJECT_RANK_COLUMNS = ("Subject_Order", "Subject_Family", "Subject_Genus",
+                         "Subject_organism")
+
+
+def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = "",
+                          ref_path: str = ""):
     import openpyxl
     from copy import copy
     wb = openpyxl.load_workbook(path)
-    sheet = wb[wb.sheetnames[0]]
+    sheet = blast_sheet(wb)
     header_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
     headers = [(str(c.value).strip() if c.value is not None else "")
                for c in header_row]
@@ -350,6 +389,35 @@ def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = ""):
             n_filled += 1
         for name, val in zip(QUERY_TAX_COLUMNS, tax):
             sheet.cell(row=row[0].row, column=col_idx[name], value=val)
+
+    # A BLAST panel table with hit taxonomy: keep its Tax_level_match (the
+    # deepest rank where hit and reference agree) in step with the new
+    # Query_* values, as the BLAST panel's own reference step does.
+    if all(c in headers for c in _SUBJECT_RANK_COLUMNS):
+        if "Tax_level_match" in headers:
+            m_col = headers.index("Tax_level_match") + 1
+        else:
+            m_col = next_col + 1
+            cell = sheet.cell(row=1, column=m_col, value="Tax_level_match")
+            cell._style = copy(style_src._style)
+        s_idx = [headers.index(c) + 1 for c in _SUBJECT_RANK_COLUMNS]
+        q_idx = [col_idx[c] for c in QUERY_TAX_COLUMNS]
+        ranks = ("order", "family", "genus", "organism")
+        for r in range(2, sheet.max_row + 1):
+            if not str(sheet.cell(row=r, column=q_i + 1).value or "").strip():
+                continue
+            hit = {k: display_taxon(sheet.cell(row=r, column=c).value)
+                   for k, c in zip(ranks, s_idx)}
+            qtax = {k: display_taxon(sheet.cell(row=r, column=c).value)
+                    for k, c in zip(ranks, q_idx)}
+            sheet.cell(row=r, column=m_col, value=concordance_level(hit, qtax))
+
+    # Its Summary and Best hit sheets are built from the hit table: rebuild
+    # them, or they would keep the previous reference's identifications.
+    from .blast_panel import refresh_summary_sheets
+    refresh_summary_sheets(wb, path, {"tax_reference": ref_path,
+                                      "strip_suffix": strip_suffix}
+                           if ref_path else None)
 
     tmp = path + ".tmp"
     wb.save(tmp)
@@ -540,13 +608,63 @@ def _is_blast(path: str) -> bool:
     return path.lower().endswith(_BLAST_EXT)
 
 
+# Files a run's folder holds besides its FASTA + BLAST table. A dropped folder
+# is read one level deep, and these must not be taken for inputs: their FASTA
+# or table-like extensions would otherwise pair with the wrong file.
+_NOT_INPUT_PREFIXES = (
+    "missing_seqs_", "nohit_seqs_", "blast_run_log_", "blastfile_run_log_",
+    "bestseq-", "bestseq_run_log_", "secondary_variants", "~$",
+)
+
+
+def scan_folder(folder: str) -> Tuple[List[str], List[str]]:
+    """FASTA files and BLAST tables directly inside *folder* (subfolders are
+    not read), as (inputs, ignored names). Files a run writes beside its
+    results (see _NOT_INPUT_PREFIXES) are ignored, and where a table exists
+    as .xlsx and also as .tsv/.csv/.txt of the same name (the BLAST panel
+    writes both) the .xlsx is the one kept."""
+    try:
+        names = sorted(os.listdir(folder), key=str.lower)
+    except OSError:
+        return [], []
+    inputs, ignored = [], []
+    for name in names:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path) or not (_is_fasta(path) or _is_blast(path)):
+            continue
+        if name.lower().startswith(_NOT_INPUT_PREFIXES):
+            ignored.append(name)
+        else:
+            inputs.append(path)
+    xlsx_stems = {_stem(f) for f in inputs if f.lower().endswith(".xlsx")}
+    kept = []
+    for f in inputs:
+        if _is_blast(f) and not f.lower().endswith(".xlsx") and _stem(f) in xlsx_stems:
+            ignored.append(os.path.basename(f))
+        else:
+            kept.append(f)
+    return kept, ignored
+
+
+# Name of the hit table's sheet in the BLAST panel's .xlsx, which also carries
+# a Summary and a Best hit sheet ahead of it. Other tables use their first sheet.
+BLAST_RESULTS_SHEET = "BLAST Results"
+
+
+def blast_sheet(wb):
+    """The sheet of a workbook that holds the BLAST hit table."""
+    if BLAST_RESULTS_SHEET in wb.sheetnames:
+        return wb[BLAST_RESULTS_SHEET]
+    return wb[wb.sheetnames[0]]
+
+
 def read_blast_header(path: str) -> List[str]:
     """Return the column names of a BLAST table (.xlsx / .tsv / .csv)."""
     if path.lower().endswith(".xlsx"):
         try:
             import openpyxl
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            sheet = wb[wb.sheetnames[0]]
+            sheet = blast_sheet(wb)
             row = next(sheet.iter_rows(values_only=True), ())
             wb.close()
             return [str(c).strip() if c is not None else "" for c in row]
@@ -566,7 +684,7 @@ def read_blast_rows(path: str) -> Tuple[List[str], List[tuple]]:
     if path.lower().endswith(".xlsx"):
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = wb[wb.sheetnames[0]]
+        sheet = blast_sheet(wb)
         rows = sheet.iter_rows(values_only=True)
         header = next(rows, ())
         headers = [str(c).strip() if c is not None else "" for c in header]
@@ -605,6 +723,10 @@ class _PairDropZone(QtWidgets.QFrame):
 
         self._fastas: List[str] = []
         self._blasts: List[str] = []
+        # Files that came from a dropped folder (paired by name only: see
+        # _match), and what was skipped from those folders, shown in the zone.
+        self._from_folder: set = set()
+        self._notices: List[str] = []
         self._seq_cache: Dict[str, int] = {}
         self._col_cache: Dict[str, List[str]] = {}
         # True when a taxonomy reference file is supplied: the Query_* columns
@@ -622,9 +744,11 @@ class _PairDropZone(QtWidgets.QFrame):
         self._lbl.setAlignment(QtCore.Qt.AlignCenter)
         self._lbl.setToolTip(
             "Drop every FASTA (.fa/.fas/.fasta) together with its BLAST table\n"
-            "(.xlsx/.tsv/.csv). Files are paired by name, so each pair must share\n"
-            "the same base name — e.g. run1.fa + run1.xlsx. A single FASTA and\n"
-            "a single table left without a match are paired anyway.\n"
+            "(.xlsx/.tsv/.csv), or the folders that hold them (only the files\n"
+            "directly inside each folder are read). Files are paired by name, so\n"
+            "each pair must share the same base name — e.g. run1.fa + run1.xlsx.\n"
+            "A single FASTA and a single table left without a match are paired\n"
+            "anyway, except when they come from a folder.\n"
             "One pair classifies that run; two or more compare them."
         )
 
@@ -737,7 +861,11 @@ class _PairDropZone(QtWidgets.QFrame):
         used = {_stem(b) for b in match.values() if b}
         free_fa = [fa for fa, bl in match.items() if bl is None]
         free_bl = [s for s in blast_by_stem if s not in used]
-        if len(free_fa) == 1 and len(free_bl) == 1:
+        # Not for files from a folder: next to many others, the only two left
+        # over are as likely to be unrelated as a pair.
+        if (len(free_fa) == 1 and len(free_bl) == 1
+                and free_fa[0] not in self._from_folder
+                and blast_by_stem[free_bl[0]] not in self._from_folder):
             match[free_fa[0]] = blast_by_stem[free_bl[0]]
         return match
 
@@ -812,6 +940,15 @@ class _PairDropZone(QtWidgets.QFrame):
         center.setSpacing(1)
         name_lbl = make_label(os.path.basename(fasta), size=15, color=TEXT_PRI)
         name_lbl.setWordWrap(False)
+        repeats = fasta_repeats(fasta)
+        if repeats:
+            # The run keeps the FIRST record of a repeated header (see _read_fasta).
+            name_lbl.setTextFormat(QtCore.Qt.RichText)
+            name_lbl.setText(
+                f"{__import__("html").escape(os.path.basename(fasta))}  <span style='color:#B45309;"
+                f" font-size:13px;'>⚠ {len(repeats)} repeated header(s) — "
+                f"only the first record of each is used</span>")
+            row.setToolTip(row.toolTip() + "\n\n" + repeated_note(repeats, 8))
         center.addWidget(name_lbl)
 
         n_seqs = self._count_seqs(fasta)
@@ -888,7 +1025,7 @@ class _PairDropZone(QtWidgets.QFrame):
         return list(self._match().items())
 
     def _adjust_height(self):
-        n = len(self._entries()) + len(self._orphans()[1])
+        n = len(self._entries()) + len(self._orphans()[1]) + len(self._notices)
         if n == 0:
             self.setFixedHeight(self._EMPTY_H)
         else:
@@ -903,7 +1040,7 @@ class _PairDropZone(QtWidgets.QFrame):
             if item.widget():
                 item.widget().deleteLater()
 
-        if not entries and not orphan_blasts:
+        if not entries and not orphan_blasts and not self._notices:
             self._rows_container.hide()
             self._clear_btn.hide()
             self._lbl.setText(_tr("BestSeqPairDropZone", self._lbl_src_empty))
@@ -917,6 +1054,11 @@ class _PairDropZone(QtWidgets.QFrame):
                     size=14, color=RED)
                 lbl.setContentsMargins(12, 4, 10, 4)
                 self._rows_layout.addWidget(lbl)
+            for note in self._notices:
+                lbl = make_label(note, size=14, color=RED)
+                lbl.setWordWrap(True)
+                lbl.setContentsMargins(12, 4, 10, 4)
+                self._rows_layout.addWidget(lbl)
             self._rows_container.show()
             self._clear_btn.show()
             n_pairs = len(self.pairs())
@@ -927,7 +1069,8 @@ class _PairDropZone(QtWidgets.QFrame):
             self.setProperty("filled", "true")
 
         _sp = QtWidgets.QSizePolicy
-        mode = _sp.Expanding if not entries and not orphan_blasts else _sp.Fixed
+        mode = (_sp.Expanding if not entries and not orphan_blasts and not self._notices
+                else _sp.Fixed)
         self._top_spacer.changeSize(0, 0, _sp.Minimum, mode)
         self._bot_spacer.changeSize(0, 0, _sp.Minimum, mode)
         self.layout().invalidate()
@@ -946,9 +1089,50 @@ class _PairDropZone(QtWidgets.QFrame):
         if files:
             self._add_files(files)
 
-    def _add_files(self, paths):
+    def _add_folders(self, folders):
+        """Add the FASTA files and BLAST tables directly inside each folder.
+
+        Pairs are matched by base name alone, so a base name that would come
+        from two places (two folders, or a folder and a file already loaded)
+        is not loaded at all: whichever pair it paired with could be the wrong
+        one, and one would silently replace the other. The zone says so."""
+        found, notes = [], []
+        for folder in folders:
+            files, ignored = scan_folder(folder)
+            name = os.path.basename(os.path.normpath(folder))
+            if not files:
+                notes.append(f"⚠  {name}: no FASTA or BLAST table directly inside it.")
+            if ignored:
+                notes.append(f"{name}: {len(ignored)} file(s) ignored (run outputs or "
+                             f"duplicate tables): {', '.join(ignored[:3])}"
+                             + ("…" if len(ignored) > 3 else ""))
+            found += files
+
+        have = [f for f in self._fastas + self._blasts if f not in found]
+        where: Dict[Tuple[bool, str], set] = {}
+        for f in found + have:
+            where.setdefault((_is_fasta(f), _stem(f)), set()).add(f)
+        clash = {k for k, v in where.items() if len(v) > 1 and any(f in found for f in v)}
+        if clash:
+            skipped = sorted({os.path.basename(f) for f in found
+                              if (_is_fasta(f), _stem(f)) in clash})
+            notes.append("⚠  Not loaded, the same name comes from more than one place: "
+                         + ", ".join(skipped[:4]) + ("…" if len(skipped) > 4 else "")
+                         + ". Click Clear if one is already loaded, then drop those folders one at a time.")
+            found = [f for f in found if (_is_fasta(f), _stem(f)) not in clash]
+
+        before = len(self._fastas) + len(self._blasts)
+        self._add_files(found, from_folder=True)
+        if notes or len(self._fastas) + len(self._blasts) == before:
+            self._notices.extend(n for n in notes if n not in self._notices)
+            self._update_display()
+            self.pairsChanged.emit(self.pairs())
+
+    def _add_files(self, paths, from_folder: bool = False):
         added = 0
         for p in paths:
+            if from_folder:
+                self._from_folder.add(p)
             if _is_fasta(p):
                 if p not in self._fastas:
                     self._fastas.append(p)
@@ -986,13 +1170,18 @@ class _PairDropZone(QtWidgets.QFrame):
         self._drag_icon_lbl.hide()
         refresh_style(self)
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
-        paths = [p for p in paths if p and (_is_fasta(p) or _is_blast(p))]
-        if paths:
-            self._add_files(paths)
+        folders = [p for p in paths if p and os.path.isdir(p)]
+        files = [p for p in paths if p and not os.path.isdir(p) and (_is_fasta(p) or _is_blast(p))]
+        if files:
+            self._add_files(files)
+        if folders:
+            self._add_folders(folders)
 
     def clear(self):
         self._fastas = []
         self._blasts = []
+        self._from_folder = set()
+        self._notices = []
         self._seq_cache = {}
         self._col_cache = {}
         self._update_display()
@@ -1054,20 +1243,24 @@ class _RefDropZone(QtWidgets.QFrame):
 
     _HINT = "Drag the reference file here  (.csv, .xlsx, .tsv)"
 
+    # Empty: white, with the same dashed line as the drop zones above it, so it
+    # stands out from the grey panel and the spot to drop the file is not lost.
+    # Dragging a file over it greys the fill and turns the line blue, as in
+    # those zones; one that cannot be used, red; a loaded file is green.
     _QSS = f"""
     QFrame#ref_drop_zone {{
-        background-color: {GRAY_BG};
-        border: 1px dashed #D8D8D4;
+        background-color: {WHITE};
+        border: 2px dashed #E6E6E3;
         border-radius: 8px;
         padding: 4px 10px;
     }}
     QFrame#ref_drop_zone[dragging="true"] {{
-        background-color: #EBEBEA;
-        border: 1px dashed {BLUE_MID};
+        background-color: {DROP_DRAG_BG};
+        border: {DROP_DRAG_BORDER};
     }}
     QFrame#ref_drop_zone[dragging="invalid"] {{
         background-color: {RED_LT};
-        border: 1px dashed {RED};
+        border: 2px dashed {RED};
     }}
     QFrame#ref_drop_zone[filled="true"] {{
         background-color: {GREEN_LT};
@@ -1646,6 +1839,21 @@ class BestSeqPanel(QtWidgets.QWidget):
 
     # ── Public API (called by MainWindow) ──────────────────────────────────
 
+    def load_run(self, paths: List[str]) -> bool:
+        """Start a fresh selection with *paths* (a FASTA and its BLAST table,
+        e.g. handed over by the BLAST panel): whatever an earlier selection left
+        in the panel (files, log, result buttons) is cleared first, so the
+        files come in as a single run and are classified, not compared with
+        the previous ones. Returns False, leaving the panel as it is, while a
+        run is in progress."""
+        # isHidden(), not isVisible(): the panel is behind BLAST when this is
+        # called, so isVisible() is False even while a run is in progress.
+        if not self._stop_btn.isHidden():
+            return False
+        self._reset()
+        self._drop._add_files(paths)
+        return True
+
     def _rebuild_log(self):
         sep = "─" * 56
         lines = [
@@ -1919,7 +2127,34 @@ class _BestSeqWorker(QtCore.QThread):
 
     def _apply_reference_tax(self, path: str, ref: dict, ref_lower: dict):
         """Write the four Query_* columns into a BLAST table, in place."""
-        return apply_reference_tax(path, ref, ref_lower, self.cfg.get("strip_suffix", ""))
+        return apply_reference_tax(path, ref, ref_lower, self.cfg.get("strip_suffix", ""),
+                                   self.cfg.get("tax_reference", ""))
+
+    def _sync_blast_tsv(self, path: str, ref: dict, ref_lower: dict) -> str:
+        """After the reference went into a BLAST .xlsx, write it into the .tsv
+        of the same name too (the BLAST panel's pair), so the two agree and an
+        .xlsx rebuilt from the .tsv later keeps it. Each file is edited in
+        place: rebuilding the .xlsx from the .tsv instead would drop whatever
+        was changed in it by hand. Returns the run-log line ("" when there is
+        no such .tsv); a failure is a warning, since this run reads the .xlsx."""
+        if not path.lower().endswith(".xlsx"):
+            return ""
+        tsv_path = os.path.splitext(path)[0] + ".tsv"
+        if not os.path.isfile(tsv_path):
+            return ""
+        from .blast_panel import apply_reference_and_tax_match
+        tsv_name = os.path.basename(tsv_path)
+        try:
+            n_rows, n_filled, _unknown, _n_match = apply_reference_and_tax_match(
+                tsv_path, ref, ref_lower, self.cfg.get("strip_suffix", ""))
+        except PermissionError:
+            msg = f"{tsv_name} not updated: open in another program"
+        except Exception as exc:
+            msg = f"{tsv_name} not updated: {exc}"
+        else:
+            return f"{tsv_name} updated too: {n_filled}/{n_rows} rows filled"
+        self.statusUpdated.emit("files", f"Warning     │ {msg}")
+        return "⚠ " + msg
 
     def _load_blast(self, path: str) -> Tuple[Dict[str, List[dict]],
                                               Dict[str, dict],
@@ -2224,6 +2459,9 @@ class _BestSeqWorker(QtCore.QThread):
                     + (f" · {len(unknown)} sample(s) not in the reference"
                        if unknown else "")
                 )
+                tsv_line = self._sync_blast_tsv(pair["blast"], ref_table, ref_lower)
+                if tsv_line:
+                    ref_lines.append(f"      {tsv_line}")
             _fmt = reference_format_warning(ref_table)
             if _fmt:
                 self.statusUpdated.emit("files", "Warning     │ " + _fmt)
@@ -2523,6 +2761,21 @@ class _BestSeqWorker(QtCore.QThread):
                 except Exception:
                     pass
 
+        # A FASTA that received no sequence is not left behind as an empty file.
+        fa_counts = {fa_all: "all", fa_id: "identified",
+                     fa_nohit: "no_blast_hit", fa_mism: "tax_mismatch"}
+        for fa_path, key in fa_counts.items():
+            if n_written[key] == 0:
+                try:
+                    os.remove(fa_path)
+                except OSError:
+                    pass
+
+        def _fa_line(fa_path, key):
+            n = n_written[key]
+            return (f"{os.path.basename(fa_path)}  ({n} seqs)" if n
+                    else "none (0 seqs, file not written)")
+
         if n_files == 1:
             self.statusUpdated.emit(
                 "select",
@@ -2646,10 +2899,10 @@ class _BestSeqWorker(QtCore.QThread):
             f"  Folder                   : {output_dir}",
             f"  Report TSV               : {os.path.basename(tsv_path)}",
             f"  Report XLSX              : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
-            f"  All best sequences       : {os.path.basename(fa_all)}  ({n_written['all']} seqs)",
-            f"  Taxonomically identified : {os.path.basename(fa_id)}  ({n_written['identified']} seqs)",
-            f"  No BLAST hit             : {os.path.basename(fa_nohit)}  ({n_written['no_blast_hit']} seqs)",
-            f"  Taxonomic mismatch       : {os.path.basename(fa_mism)}  ({n_written['tax_mismatch']} seqs)",
+            f"  All best sequences       : {_fa_line(fa_all, 'all')}",
+            f"  Taxonomically identified : {_fa_line(fa_id, 'identified')}",
+            f"  No BLAST hit             : {_fa_line(fa_nohit, 'no_blast_hit')}",
+            f"  Taxonomic mismatch       : {_fa_line(fa_mism, 'tax_mismatch')}",
             "",
             "NOTE: the subsets split strictly on taxonomic concordance and together add",
             "      up to the '_all' file. '_identified' holds the sequences whose best hit",

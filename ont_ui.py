@@ -210,8 +210,14 @@ class _TipMirror(QtWidgets.QLabel):
     RADIUS = 16
 
     def __init__(self):
+        # WindowTransparentForInput: this is a real OS window, and
+        # WA_TransparentForMouseEvents only covers Qt's own hit testing. With
+        # the window flag too, a mirror that lands under the cursor (a tall tip,
+        # or one moved up at the screen edge) can never take the mouse from the
+        # widget, which Qt would read as a Leave and hide the native tip.
         super().__init__(None, QtCore.Qt.ToolTip | QtCore.Qt.FramelessWindowHint
-                         | QtCore.Qt.NoDropShadowWindowHint)
+                         | QtCore.Qt.NoDropShadowWindowHint
+                         | QtCore.Qt.WindowTransparentForInput)
         self.setObjectName("ont_tooltip")
         for attr in (QtCore.Qt.WA_TranslucentBackground, QtCore.Qt.WA_ShowWithoutActivating,
                      QtCore.Qt.WA_TransparentForMouseEvents):
@@ -228,6 +234,12 @@ class _TipMirror(QtWidgets.QLabel):
         avail = screen.availableGeometry()
         geo.moveRight(min(geo.right(), avail.right()))
         geo.moveBottom(min(geo.bottom(), avail.bottom()))
+        # Never over the cursor: if the tip ended up there, put it above it.
+        cursor = QtGui.QCursor.pos()
+        if geo.contains(cursor):
+            geo.moveBottom(cursor.y() - 4)
+            if geo.top() < avail.top():
+                geo.moveTop(cursor.y() + 20)
         self.move(geo.topLeft())
         self.show()
         self.raise_()
@@ -247,7 +259,29 @@ class _RoundTooltips(QtCore.QObject):
     """Hides Qt's native tip label and mirrors it with _TipMirror."""
 
     _SYNC = (QtCore.QEvent.Show, QtCore.QEvent.Move, QtCore.QEvent.Resize)
-    _PARKED = QtCore.QPoint(-32000, -32000)
+    # The native tip is parked far off-screen. Coordinates are device
+    # independent while Windows only takes +-32768 PHYSICAL pixels, so a fixed
+    # spot fails on a scaled display (-32000 at 1.25x is -40000 px): Windows
+    # clamps it, the clamped spot was taken for the tip's real position and the
+    # rounded copy followed it off every screen (the tooltip flashed and
+    # vanished). The spot is therefore derived from the largest display scale,
+    # so it fits at any resolution (4K, 8K, a 300 % UI size).
+    _PARK_PX = 24000   # physical pixels, well inside Windows' limit
+
+    @classmethod
+    def _parked_pos(cls) -> QtCore.QPoint:
+        scale = max([s.devicePixelRatio() for s in QtGui.QGuiApplication.screens()] or [1.0])
+        d = -int(cls._PARK_PX / max(scale, 1.0))
+        return QtCore.QPoint(d, d)
+
+    @staticmethod
+    def _is_parked(pos: QtCore.QPoint) -> bool:
+        """True when *pos* is on no screen: where this filter parked the tip,
+        where Qt measures one (about -40000) or where Windows clamped either.
+        A tip being shown is always on a screen, whichever monitor it is on
+        (also one left of or above the primary, which has negative
+        coordinates)."""
+        return QtGui.QGuiApplication.screenAt(pos) is None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,13 +299,14 @@ class _RoundTooltips(QtCore.QObject):
                     obj.setWindowOpacity(0.0)
                     if et != QtCore.QEvent.Polish and obj.isVisible():
                         # Qt (re)placed the tip: remember where, then park it.
-                        if obj.pos() != self._PARKED:
+                        parked = self._is_parked(obj.pos())
+                        if not parked:
                             self._anchor = obj.pos()
                         if self._mirror is None:
                             self._mirror = _TipMirror()
                         self._mirror.sync(obj, self._anchor)
-                        if obj.pos() != self._PARKED:
-                            obj.move(self._PARKED)
+                        if not parked:
+                            obj.move(self._parked_pos())
         return False
 
 

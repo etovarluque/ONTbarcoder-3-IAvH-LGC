@@ -77,11 +77,12 @@ def _run_folders_in(path: str) -> List[str]:
 
 def _zone_style(selector: str, state: str) -> str:
     """Drop-zone look shared by this panel: white with a dashed border when
-    empty, blue while something is dragged over it, light green once loaded
+    empty, grey with a blue line while something is dragged over it (as the
+    other drop zones), light green once loaded
     (the same colours as the app's file drop zones)."""
     bg, border = {
         "empty":  (WHITE, f"1.5px dashed {GRAY_LINE}"),
-        "drag":   (BLUE_LIGHT, f"1.5px dashed {BLUE}"),
+        "drag":   (DROP_DRAG_BG, DROP_DRAG_BORDER),
         "filled": (GREEN_LT, f"1.5px solid {GREEN_MID}"),
     }[state]
     return f"{selector} {{ background:{bg}; border:{border}; border-radius:8px; }}"
@@ -316,7 +317,8 @@ class _SweepFolderSlot(_CheckedFolderSlot):
 class _BestSeqFolderSlot(_CheckedFolderSlot):
     HINT = "Drag the Best Sequence output folder here (…_bestseq)."
     BROWSE_TITLE = "Coverage report — pick the Best Sequence output folder"
-    NEEDS = ("bestseq-*_identified.fasta",)
+    # The report .tsv is always written; the FASTA files only when not empty.
+    NEEDS = ("bestseq-*.tsv",)
     WHAT = "Pick a Best Sequence Selection output folder."
 
 
@@ -631,7 +633,7 @@ class BatchSweepPanel(QtWidgets.QWidget):
 
         cov_slots = QtWidgets.QHBoxLayout()
         cov_slots.setSpacing(12)
-        self._cov_sweep = _SweepFolderSlot("Sweep folder")
+        self._cov_sweep = _SweepFolderSlot("Sweep/Merge folder")
         self._cov_bestseq = _BestSeqFolderSlot("Best Sequence folder")
         for slot in (self._cov_sweep, self._cov_bestseq):
             slot.setMinimumHeight(130)
@@ -1425,17 +1427,19 @@ class BatchSweepPanel(QtWidgets.QWidget):
                 f"  Deduplication across runs: {summary.get('n_samples', 0)} unique sample(s) "
                 f"total, {summary.get('n_collapsed', 0)} with the same sequence in every run "
                 f"they appear in, {summary.get('n_with_variants', 0)} with 2+ distinct "
-                f"sequences across runs -> {summary.get('n_sequences_written', 0)} sequence(s) "
-                f"written to unique_consensus_filtered.fasta "
-                f"(see batch_dedup_report.tsv for the per-sample breakdown).")
+                f"sequences across runs -> {summary.get('n_sequences_written', 0)} sequence(s)"
+                + (" written to unique_consensus_filtered.fasta "
+                   if summary.get("n_sequences_written") else " (no FASTA written) ")
+                + "(see batch_dedup_report.tsv for the per-sample breakdown).")
         if "variants" in summary:
             v = summary["variants"]
             lines.append(
                 f"  Secondary variants (raw + corrected) across runs: "
                 f"{v.get('n_samples', 0)} sample(s) with variants -> "
-                f"{v.get('n_sequences_written', 0)} distinct sequence(s) written to "
-                f"unique_secondary_variants.fasta "
-                f"(see batch_variants_dedup_report.tsv).")
+                f"{v.get('n_sequences_written', 0)} distinct sequence(s)"
+                + (" written to unique_secondary_variants.fasta "
+                   if v.get("n_sequences_written") else " (no FASTA written) ")
+                + "(see batch_variants_dedup_report.tsv).")
         return lines
 
     def on_error(self, msg: str):

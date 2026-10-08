@@ -63,6 +63,33 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   failed batches, are searched once more at the end of the run. Every hit row
   without organism or lineage is looked up again (also negatives cached by
   earlier runs) and rewritten. The run log reports both.
+- **Repeated FASTA headers are reported wherever sequences are loaded.**
+  *BLAST API Search* shows a warning under the batch plan as soon as the files
+  are loaded (within and across files; spaces count as `_`, as submitted) and
+  repeats it in the run log: a repeated header is one `Query_name`, so the hits
+  of its copies end up mixed. *Best Sequence* marks the file row (only the first
+  record of a repeated header is used). *FASTA Tools* logs it for each file read
+  (or for the merge). FASTA Compare and the demultiplexing CSV already did.
+- **Best Sequence: drop folders.** One or several folders can be dropped
+  instead of their files; the FASTA files and BLAST tables directly inside
+  each (subfolders are not read) are paired by name as before. Run outputs
+  (`missing_seqs_*`, `nohit_seqs_*`, logs, `bestseq-*`) and a `.tsv` beside an
+  `.xlsx` of the same name are ignored. A name that would come from two places
+  is not loaded and the zone says so, and the single leftover FASTA + table
+  are not paired by force when they come from a folder.
+- **BLAST: Summary and Best hit sheets in the results .xlsx.** *Summary*
+  (opens first) lists the input files with their sequence counts and total,
+  the taxonomy reference, the run parameters, and how many sequences were
+  identified to organism, genus, family or order (count, %, cumulative %),
+  overall and per input file. *Best hit* has one row per sequence: the hit
+  that agrees with the reference at the deepest rank, not necessarily
+  BLAST's first; ties and `none` are decided by bit score, identity, fewest
+  gaps and mismatches. Sequences without hits or not searched are listed too.
+  *Apply reference taxonomy* regenerates both sheets, and so does Best
+  Sequence when it writes the reference into a BLAST .xlsx in place (it now
+  updates that table's `Tax_level_match` too, and writes the reference into
+  the `.tsv` of the same name as well, so both files agree). Best Sequence reads the
+  *BLAST Results* sheet by name.
 - **Best Sequence: not-identified sequences split by cause.**
   `_no_blast_hit.fasta` (no hit, or only hits shorter than the minimum
   alignment) and `_tax_mismatch.fasta` (good hits of another taxon, and hits
@@ -76,8 +103,34 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 - **Manual:** the BLAST results columns (§13.5, *Query* = your sequence and
   your expected taxonomy, *Subject* = the database hit and its NCBI
   taxonomy), `Tax_level_match` with examples, and the variant export tiers.
+  Also the *Summary* and *Best hit* sheets (§13.5), dropping folders in Best
+  Sequence (§14.1), repeated-header warnings (§11, §13.1, §14.1), *Open in
+  Best Sequence* (§13.1), reference updates of a BLAST `.xlsx` (§13.4), FASTA
+  files written only when they have sequences (§8, §10, §11, §17) and the
+  *Sweep/Merge folder* slot (§17).
 
 ### Changed
+- **No empty FASTA files, in every utility.** A FASTA with no sequences is no
+  longer written (BLAST and Best Sequence already did this). Now also:
+  FASTA Compare (`best_barcodes.fa` was always written), every FASTA Tools
+  operation (the log notes `No sequences: … not written`), the Parameter Sweep
+  / Merge `unique_*.fasta` (the report `.tsv` is kept), and the ONT run's
+  `Fixed_barcodes_*err.fa` and `Remaining.fa`. `consensus_*.fa`,
+  `Allbarcodes.fa`, `QC_Compliant_*` and `Filtered_*` are always written:
+  later steps and the utilities read them to recognise a run folder.
+- **Reference file drop zone:** it is easier to spot. Empty, it is white with the
+  same dashed line as the other drop zones (it was grey on grey with a faint
+  border), light blue on hover, a blue dashed line while a file is dragged
+  over it, red for a file that cannot be used, green once loaded. Same zone in Best Sequence, both BLAST tabs, BOLD
+  Formatter and *Apply reference taxonomy*.
+- **BLAST panel background:** both tabs were white while every other panel
+  has the light grey ground; the tab pane now takes the panel's ground.
+- **Drop targets, one look while a file is held over them:** grey fill with a
+  blue dashed line, as in the main drop zones. The Parameter Sweep folder
+  zones, the path fields that take a dropped path (output folder, Dorado, …)
+  and the FASTA Tools file fields used light blue or a solid line.
+- **Parameter Sweep, Coverage report:** the first folder slot is labelled
+  *Sweep/Merge folder*, since it takes either kind of folder.
 - **FASTA Tools:** *Extract sequences* groups Unique, Identical, By pattern
   and By header fields. Field separators are a drop-down (`|`, `;`, `,`,
   space, tab, `_`, `-`, Custom…); the field box is capped at the headers'
@@ -129,8 +182,29 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   Excel) is reported as an error instead of being lost silently.
 - A small empty window flashed at startup, and the process took seconds to
   exit after closing (crash during Qt teardown).
+- Tooltips flashed and vanished in under a second on scaled displays (seen on
+  FASTA Compare's *ID delimiter*, but it hit every tooltip). The rounded
+  tooltip parks Qt's own tip off-screen at -32000, which Windows rejects once
+  the UI is scaled (1.25x is -40000 px) and clamps elsewhere; that spot was
+  taken for the tip's real position and its rounded copy followed it off every
+  screen. It now parks at a spot derived from the display scale (fits 4K, 8K
+  or a 300 % UI size), treats any position on no screen as parked (a monitor
+  left of the primary has negative coordinates), no longer receives the mouse
+  and is kept off the cursor.
+- BLAST → *Open in Best Sequence* now starts the panel clean. The files and
+  log of an earlier selection stayed, so the new pair was compared with them
+  (button *Select best sequences*) instead of being classified on its own
+  (*Classify sequences*). If Best Sequence is running, a message says so.
 - BLAST: switching the batch size to Manual showed the Automatic value (e.g. 99)
   instead of Manual's own default of 50.
+- Query-taxonomy reference: BOLD Formatter now logs the layout warning and the
+  samples whose reference taxonomy is empty (it only listed the missing ones),
+  and *Apply reference taxonomy* reports the empty-taxonomy samples too — as
+  Best Sequence and both BLAST tabs already did.
+- Best Sequence no longer leaves empty FASTA files (e.g. `_tax_mismatch.fasta`
+  when every sample was identified); the run log lists them as *none (0 seqs)*.
+  The coverage report and its folder check read the `bestseq-*.tsv` report, so
+  a run with no identified sequence is still accepted.
 
 ---
 

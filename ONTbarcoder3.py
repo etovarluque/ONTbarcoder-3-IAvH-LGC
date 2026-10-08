@@ -1724,8 +1724,8 @@ class PathDropLineEdit(QtWidgets.QLineEdit):
                 (e.g. for the Dorado executable field)."""
 
     _HL_SS = (
-        f"QLineEdit {{ border: 2px solid {BLUE}; border-radius: 4px;"
-        f" background: {BLUE_LIGHT}; }}"
+        f"QLineEdit {{ border: 2px dashed {BLUE_MID}; border-radius: 4px;"
+        f" background: #EBEBEA; }}"
     )
 
     def __init__(self, *args, mode="dir", **kwargs):
@@ -5825,8 +5825,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _open_in_best_seq(self, paths: list):
         """BLAST → Best Sequence: load the queried FASTA and its results table
-        as a pair and show the panel."""
-        self._panel_best_seq._drop._add_files(paths)
+        as a pair and show the panel. The panel starts clean: a previous
+        selection and its log would otherwise stay, and the new pair would
+        be compared with them instead of classified on its own."""
+        if not self._panel_best_seq.load_run(paths):
+            QtWidgets.QMessageBox.information(
+                self, "Best Sequence",
+                "Best Sequence is running. Wait for it to finish, or stop it, "
+                "and open the BLAST results again.")
+            return
         self._switch_panel("best_seq")
 
     def _on_ui_scale_changed(self, value):
@@ -8567,6 +8574,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"{(s.get('seq') or '').count('N')} Ns) — too weak to "
                     f"export, possible trace contamination", "warn")
 
+    @staticmethod
+    def _remove_if_empty(path: str):
+        """Delete *path* when it holds nothing (a FASTA with no sequences)."""
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) == 0:
+                os.remove(path)
+        except OSError:
+            pass
+
     def _write_secondary_variants_fa(self, corrected=None):
         """Writes the single secondary_variants.fa (consensus_by_length and the
         output root). Each secondary consensus is written as-is (type=raw) and,
@@ -9548,6 +9564,12 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             for fh in file_map.values():
                 fh.close()
+        # Allbarcodes.fa, QC_Compliant_* and Filtered_* are read by later steps
+        # and utilities (and mark a run folder), so they always stay. The
+        # correction bins are only reports: an empty one is not left behind.
+        for _name in ("Fixed_barcodes_1to5err.fa", "Fixed_barcodes_6to10err.fa",
+                      "Fixed_barcodes_11to15err.fa", "Fixed_barcodes_16to20err.fa"):
+            self._remove_if_empty(os.path.join(main, _name))
 
         # Authoritative QC count after Phase 3: force it so the card reflects
         # corrections that reduce the total (e.g. 80 after 2b → 79 after Phase 3).
@@ -9576,6 +9598,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if each not in alllist:
                     outfile1.write(self.errbarcodeset[each])
                     self.nerr += 1
+        self._remove_if_empty(os.path.join(main, "Remaining.fa"))
 
         for subdir in ["QC_Compliant", "Filtered", "1to5errors", "6to10errors",
                        "11to15errors", "Over16errors", "Remaining"]:

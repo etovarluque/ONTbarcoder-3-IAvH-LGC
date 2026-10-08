@@ -486,15 +486,17 @@ def run_coverage_report(batch_dir: str, bestseq_dir: str,
     # The FASTA of the SAME Best Sequence run (shared timestamp), so two runs
     # saved in one folder are never mixed.
     identified_fasta = bestseq_tsv[:-len(".tsv")] + "_identified.fasta"
-    if not os.path.isfile(identified_fasta):
-        raise FileNotFoundError(
-            f"{os.path.basename(identified_fasta)} not found next to "
-            f"{os.path.basename(bestseq_tsv)} in {bestseq_dir}")
-    log(f"  Using {os.path.basename(bestseq_tsv)} + {os.path.basename(identified_fasta)}")
+    # Best Sequence does not write a FASTA that would be empty: no
+    # _identified.fasta means no sequence was taxonomically identified.
+    has_identified = os.path.isfile(identified_fasta)
+    log(f"  Using {os.path.basename(bestseq_tsv)} + "
+        + (os.path.basename(identified_fasta) if has_identified
+           else "no _identified.fasta (0 identified sequences)"))
 
     tax_info = load_tax_info(bestseq_tsv)
-    winners = {sample_of(h): (host_of(h), seq.upper())
-               for h, seq in read_fasta(identified_fasta)}
+    winners = ({sample_of(h): (host_of(h), seq.upper())
+                for h, seq in read_fasta(identified_fasta)}
+               if has_identified else {})
     n_var = sum(1 for label in winners if _VARIANT_SUFFIX.search(label))
     log(f"  {len(winners)} taxonomically-identified sequences loaded"
         + (f" ({n_var} of them secondary variants)" if n_var else ""))
