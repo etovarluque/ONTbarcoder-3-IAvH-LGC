@@ -108,6 +108,36 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   Best Sequence* (§13.1), reference updates of a BLAST `.xlsx` (§13.4), FASTA
   files written only when they have sequences (§8, §10, §11, §17) and the
   *Sweep/Merge folder* slot (§17).
+- **Help icons.** A **?** next to each panel's main title opens the matching
+  section of the manual in the browser (Input files, Parameters, Analysis,
+  Results, the utilities, Parameter Sweep, and *Configuration - real time
+  mode* -> §5.2).
+- **Sidebar tabs remember their panel.** Selecting *Workflow* or *Utilities*
+  shows the last panel used in that tab (Input files and FASTA Tools by
+  default; FASTA Tools now comes first in Utilities). A locked or hidden panel
+  falls back to the first one.
+- **BLAST: Result checks per search (2-30, default 5).** How many times NCBI is
+  asked for a search's result (about one minute apart) before that search is
+  abandoned and the same sequences are sent again with a new RID.
+- **BLAST: searches NCBI never answers.** Every poll that is not READY counts
+  (WAITING included); a batch is resubmitted from scratch up to 3 times, then
+  left for the *Final retry* and, if it stalls again, left aside in
+  `missing_seqs_*.fa` and listed in the run log (*Left aside*) instead of being
+  split. The status line reads *Fetching results: retry #n*.
+- **BLAST Summary sheet redesigned:** key-figure cards, identification level
+  with a Total of 100 % and text bars (same in every Excel version),
+  *Best-hit identity* (>= 99, 97-99, 95-97, < 95 %), *Sequences to review*
+  (low identity, best hit not BLAST's first, no match with the reference),
+  *Run* (duration, sessions, searches sent again, sequences left aside), a
+  100 % stacked chart by file when there are several input files, and the
+  paths at the bottom so they no longer stretch the columns. Files with the
+  same name are told apart by their folder.
+- **HTML report:** *Intra-sample variants* section (mixed samples, quality
+  variants, contamination / paralog alerts, traces, samples to review), *Read
+  funnel* (raw -> length filter -> demultiplexing -> assigned), one-line
+  summary, *Status* and *Variants* columns in the sample table with filter and
+  sorting, Real-Time folder and cycle trigger, light / dark / print styles with
+  a theme button (dark by default).
 
 ### Changed
 - **No empty FASTA files, in every utility.** A FASTA with no sequences is no
@@ -159,6 +189,13 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
 - **FASTA Tools / FASTA Compare:** *Append info to headers* (ID and field
   separators) and the Compare ID delimiter use the same separator drop-down
   as *By header fields*.
+- Initial window size is 1323 x 945 px.
+- BLAST Summary: the *Cumulative %* column is gone.
+- HTML report charts are inline SVG and the fonts are system fonts, so the
+  report no longer needs internet access (the Real-Time charts used to come out
+  empty offline). Real-Time charts use minutes for runs shorter than an hour.
+- Real-Time charts: the coverage summary is centred, and the help icon's hover
+  has its own colour in both themes.
 
 ### Fixed
 - Compare: a delimiter occurring fewer times than the chosen occurrence made
@@ -207,6 +244,10 @@ fixes and small adjustments). Earlier releases used `X.Yb` tags.
   a run with no identified sequence is still accepted.
 
 ---
+- HTML report: *>10 indels* only counted barcodes with 11-15 indels; it is now
+  *11-15* plus a new *>15 indels*. The variant-detection parameters no longer
+  run off the table, the Phase 2a coverages read `25, 50, 100` instead of a
+  Python list, and the page language is English.
 
 ## [3.6.5] — 2026-10-06
 

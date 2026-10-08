@@ -447,6 +447,7 @@ def load_run_info(tsv_path: str) -> dict:
     return {"kind": "search", "run_id": st.get("run_id", ""),
             "files": st.get("files") or [], "params": st.get("params") or {},
             "processed": st.get("processed"), "status": st.get("status", ""),
+            "sessions": st.get("sessions") or [],
             "fasta": fasta if os.path.isfile(fasta) else ""}
 
 
@@ -556,6 +557,35 @@ def refresh_summary_sheets(wb, path: str, params_override: Optional[dict] = None
     return True
 
 
+_BAR_WIDTH = 50
+
+
+def _text_bar(frac: float, width: int = _BAR_WIDTH) -> str:
+    """Bar of whole block characters, `width` characters = 100 % (2 % per
+    character). Text, not an Excel data bar, so it looks the same in every
+    Excel version and in LibreOffice; the exact value sits beside it. A
+    non-zero value always shows at least one block."""
+    if frac <= 0:
+        return ""
+    return "█" * max(1, min(width, int(round(frac * width))))
+
+
+def _file_labels(paths: List[str]) -> List[str]:
+    """Short, distinct labels for input files: the file name, plus the first
+    folder that tells equally named files apart ("Lote_1 · name.fasta")."""
+    names = [os.path.basename(p) for p in paths]
+    if len(set(names)) == len(names):
+        return names
+    dirs = [os.path.dirname(os.path.abspath(p)).replace("\\", "/").split("/") for p in paths]
+    common = 0
+    while all(len(d) > common for d in dirs) and len({d[common] for d in dirs}) == 1:
+        common += 1
+    labels = [f"{d[common]} · {n}" if len(d) > common else n for d, n in zip(dirs, names)]
+    if len(set(labels)) == len(labels):
+        return labels
+    return [f"{'/'.join(d[common:])}/{n}" for d, n in zip(dirs, names)]
+
+
 def _add_summary_sheets(wb, headers: List[str], rows: List[list], tsv_path: str,
                         run_info: dict):
     """Add the "Summary" (first, shown on opening) and "Best hit" sheets
@@ -657,9 +687,19 @@ def _add_summary_sheets(wb, headers: List[str], rows: List[list], tsv_path: str,
         wsb.column_dimensions[get_column_letter(ci)].width = min(width + 2, 55)
 
     # ── Summary ──
+    from openpyxl.chart import BarChart, Reference
     ws = wb.create_sheet("Summary", 0)
-    title_font = Font(size=14, bold=True, color="FF1A365D")
+    ws.sheet_view.showGridLines = False
+    title_font = Font(size=16, bold=True, color="FF1A365D")
     note_font = Font(size=9, italic=True, color="FF666666")
+    path_font = Font(size=9, color="FF595959")
+    bar_font = Font(name="Consolas", size=10, color="FF5B9BD5")
+    grey = PatternFill(patternType="solid", fgColor="FFF2F2F2")
+    card_side = Side(style="thin", color="FFBFBFBF")
+    NC = 6                                   # columns A:F
+    ws.column_dimensions["A"].width = 38
+    for letter in "BCDEF":
+        ws.column_dimensions[letter].width = 17
     r = [1]   # next row to write
 
     def put(values, font=None, cell_fill=None, pct_from=None):
@@ -668,116 +708,242 @@ def _add_summary_sheets(wb, headers: List[str], rows: List[list], tsv_path: str,
             cell.font = font or st["normal_font"]
             if cell_fill:
                 cell.fill = cell_fill
-            if pct_from and ci >= pct_from and isinstance(v, float):
+            if isinstance(v, float) and pct_from and ci >= pct_from:
                 cell.number_format = "0.0%"
+            elif isinstance(v, int) and ci > 1:
+                cell.number_format = "#,##0"
         r[0] += 1
 
     def section(title, columns=()):
         r[0] += 1
-        put([title] + list(columns), font=st["white_bold"], cell_fill=st["H1"])
+        vals = ([title] + list(columns) + [""] * NC)[:NC]
+        put(vals, font=st["white_bold"], cell_fill=st["H1"])
+        row = r[0] - 1
+        lines = 1
+        for ci in range(2, NC + 1):
+            c = ws.cell(row=row, column=ci)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if c.value:
+                lines = max(lines, -(-len(str(c.value)) // 15))
+        if lines > 1:
+            ws.row_dimensions[row].height = 14 * lines + 4
 
-    def kv(label, value):
-        put([label, value])
-        ws.cell(row=r[0] - 1, column=1).font = st["bold_font"]
+    def wide(text, font, height=None, first_col=1):
+        """Text across first_col:F, wrapped."""
+        ws.cell(row=r[0], column=first_col, value=text).font = font
+        ws.merge_cells(start_row=r[0], start_column=first_col, end_row=r[0], end_column=NC)
+        ws.cell(row=r[0], column=first_col).alignment = Alignment(wrap_text=True, vertical="top")
+        if height:
+            ws.row_dimensions[r[0]].height = height
+        r[0] += 1
 
-    put(["BLAST results summary"], font=title_font)
-    kv("Results table", os.path.basename(tsv_path))
-    kv("Generated", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    def total_row(values, pct_col=None):
+        put(values, font=st["bold_font"], pct_from=pct_col)
+        for ci in range(1, NC + 1):
+            ws.cell(row=r[0] - 1, column=ci).border = Border(top=Side(style="thin", color="FF000000"))
+
+    def bar_cell(frac):
+        c = ws.cell(row=r[0] - 1, column=4, value=_text_bar(frac))
+        c.font = bar_font
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.merge_cells(start_row=r[0] - 1, start_column=4, end_row=r[0] - 1, end_column=NC)
+
+    # ── Title and one-line description of the run ──
+    put([f"BLAST results summary"], font=title_font)
+    params = run_info.get("params") or {}
+    bits = [os.path.basename(tsv_path)]
     if run_info.get("run_id"):
-        kv("Run ID", run_info["run_id"])
+        bits.append(f"run {run_info['run_id']}")
     if run_info.get("status"):
-        kv("Run status", run_info["status"])
+        bits.append(run_info["status"])
+    bits.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    if kind != "hit_table" and params.get("database"):
+        bits.append(str(params["database"]))
+        bits.append(str(params.get("program", "")).split("&")[0])
+    if params.get("nhits"):
+        bits.append(f"{params['nhits']} hits per {unit[:-1].lower()}")
+    if kind != "hit_table" and params.get("nseq"):
+        bits.append(f"{params['nseq']} seq/batch")
+    bits.append("taxonomy fetched" if params.get("fetch_taxonomy", True) else "no taxonomy")
+    wide(" · ".join(b for b in bits if b), note_font, 28)
 
+    # ── Key figures (cards) ──
+    pident = col.get("P_identity")
+    low_ident = sum(1 for row, _n in best.values()
+                    if pident is not None and 0 < _to_float(row[pident]) < 97.0)
+    not_first = (sum(1 for row, _n in best.values()
+                     if str(row[col["Hit_rank"]]).strip() not in ("", "1"))
+                 if has_match and "Hit_rank" in col else None)
+    cards = [(unit.upper(), n_total, "FF1A365D"),
+             ("WITH HITS", len(best), "FF2E7D32"),
+             ("NO BLAST HIT", counts.get("no_hit", 0), "FF757575"),
+             ("HIT ROWS", len(rows), "FF1A365D")]
+    if not_first is not None:
+        cards.append(("BEST ≠ 1st HIT", not_first, "FFB45309"))
+    elif counts.get("not_searched"):
+        cards.append(("NOT SEARCHED", counts["not_searched"], "FFB45309"))
+    r[0] += 1
+    lab_row, val_row = r[0], r[0] + 1
+    for j, (lab, val, color) in enumerate(cards):       # from column A, like the tables
+        c1 = ws.cell(row=lab_row, column=1 + j, value=lab)
+        c1.font = Font(size=8, color="FF595959")
+        c1.alignment = Alignment(horizontal="center", vertical="center")
+        c1.fill = grey
+        c1.border = Border(top=card_side, left=card_side, right=card_side)
+        c2 = ws.cell(row=val_row, column=1 + j, value=val)
+        c2.font = Font(size=18, bold=True, color=color)
+        c2.alignment = Alignment(horizontal="center", vertical="center")
+        c2.number_format = "#,##0"
+        c2.fill = grey
+        c2.border = Border(bottom=card_side, left=card_side, right=card_side)
+    ws.row_dimensions[lab_row].height = 16
+    ws.row_dimensions[val_row].height = 32
+    r[0] = val_row + 1
+
+    # ── Identification level ──
+    section("Identification level", [unit, "%", "Share of the total"])
+    for lv in levels:
+        n = counts[lv]
+        pct = n / n_total if n_total else 0.0
+        put([_ID_LABELS[lv], n, float(pct)], pct_from=3)
+        bar_cell(pct)
+        if lv in _ID_FILL:
+            ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+    total_row(["Total", n_total, 1.0 if n_total else 0.0], pct_col=3)
+    if has_match:
+        wide("Rank at which each query's best hit agrees with the reference taxonomy "
+             "(Tax_level_match). Best hit = deepest rank agreeing with the reference; "
+             "ties and 'none' by bit score, identity, fewest gaps and mismatches.",
+             note_font, 28)
+    else:
+        wide("No reference taxonomy applied: add a query taxonomy reference to get "
+             "identification levels (organism, genus, family, order).", note_font, 28)
+
+    # ── Best-hit identity ──
+    if pident is not None and best:
+        bins = [("99 % or more", 99.0, 101.0), ("97 – 99 %", 97.0, 99.0),
+                ("95 – 97 %", 95.0, 97.0), ("Below 95 %", -1.0, 95.0)]
+        n_hit = len(best)
+        section("Best-hit identity", [unit, "%", "Share of the total"])
+        n_bins = 0
+        for lab, lo, hi in bins:
+            n = sum(1 for row, _n in best.values() if lo <= _to_float(row[pident]) < hi)
+            n_bins += n
+            put([lab, n, n / n_hit], pct_from=3)
+            bar_cell(n / n_hit)
+        total_row(["Total", n_bins, n_bins / n_hit], pct_col=3)
+        wide(f"P_identity of the best hit of each of the {n_hit:,} {unit.lower()} with hits.",
+             note_font)
+
+    # ── To review ──
+    section(f"{unit} to review", [unit])
+    if pident is not None:
+        put(["Best hit identity below 97 %", low_ident])
+    if not_first is not None:
+        put(["Best hit is not BLAST's first hit", not_first])
+    if has_match:
+        put([_ID_LABELS["none"], counts.get("none", 0)])
+    put([f"{unit} without hits", counts.get("no_hit", 0)])
+    if counts.get("not_searched"):
+        put([f"{unit} not searched", counts["not_searched"]])
+    ws.cell(row=r[0], column=1, value="Open the Best hit sheet (filter by Identification, "
+            "Hits or P_identity)").hyperlink = "#'Best hit'!A1"
+    ws.cell(row=r[0], column=1).font = Font(size=10, color="FF0563C1", underline="single")
+    r[0] += 1
+
+    # ── By file: "n (%)" text, plus a hidden numeric copy that feeds the chart ──
+    labels = _file_labels([f for f, _qs in inputs]) if inputs else []
+    with_qs = [(lab, qs) for lab, (f, qs) in zip(labels, inputs) if qs]
+    if len(with_qs) > 1:
+        section("Identification level by file", [lab for lab, _qs in with_qs] + ["Total"])
+        hdr_row = r[0] - 1
+        ws.row_dimensions[hdr_row].height = 62
+        tots = [len(set(qs)) for _l, qs in with_qs] + [n_total]
+        H0 = 9                                   # hidden helper block: columns I..
+        first_lv = r[0]
+        for j, (lab, _qs) in enumerate(with_qs):
+            ws.cell(row=hdr_row, column=H0 + 1 + j, value=lab)
+        for lv in levels:
+            per = [sum(1 for q in set(qs) if cats.get(q) == lv) for _l, qs in with_qs] + [counts[lv]]
+            put([_ID_LABELS[lv]] + [
+                f"{n:,} ({100.0 * n / t:.0f}%)" if t else f"{n:,}"
+                for n, t in zip(per, tots)])
+            for ci in range(2, NC + 1):
+                ws.cell(row=r[0] - 1, column=ci).alignment = Alignment(horizontal="right")
+            if lv in _ID_FILL:
+                ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+            ws.cell(row=r[0] - 1, column=H0, value=_ID_LABELS[lv])
+            for j, n in enumerate(per[:-1]):
+                ws.cell(row=r[0] - 1, column=H0 + 1 + j, value=n)
+        total_row(["Total"] + tots)
+        for ci in range(H0, H0 + 2 + len(with_qs)):
+            ws.column_dimensions[get_column_letter(ci)].hidden = True
+        chart = BarChart()
+        chart.type = "bar"
+        chart.grouping = "percentStacked"
+        chart.overlap = 100
+        chart.title = "Identification level by file"
+        chart.height, chart.width = 7.5, 22
+        chart.legend.position = "b"
+        chart.y_axis.majorGridlines = None       # no vertical guide lines
+        chart.visible_cells_only = False         # data sits in hidden columns
+        chart.add_data(Reference(ws, min_col=H0, max_col=H0 + len(with_qs),
+                                 min_row=first_lv, max_row=first_lv + len(levels) - 1),
+                       from_rows=True, titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=H0 + 1, max_col=H0 + len(with_qs),
+                                       min_row=hdr_row, max_row=hdr_row))
+        for series, lv in zip(chart.series, levels):
+            series.graphicalProperties.solidFill = _ID_FILL.get(lv, "FFD9D9D9")[2:]
+            series.graphicalProperties.line.solidFill = "FFFFFF"
+        r[0] += 1
+        ws.add_chart(chart, f"A{r[0]}")
+        r[0] += 16
+
+    # ── Run (duration, resumptions, NCBI problems) ──
+    sessions = run_info.get("sessions") or []
+    if kind == "search" and sessions:
+        section("Run", [""])
+        secs = sum(int(x.get("elapsed_s", 0)) for x in sessions)
+        put(["Duration", f"{secs // 3600}h {secs % 3600 // 60:02d}m {secs % 60:02d}s"])
+        if len(sessions) > 1:
+            put(["Sessions (run was resumed)", len(sessions)])
+        if any("left_aside" in x for x in sessions):
+            put(["Searches sent again (NCBI did not answer)",
+                 sum(int(x.get("rid_restarts", 0)) for x in sessions)])
+            put(["Sequences left aside (NCBI never answered)",
+                 int(sessions[-1].get("left_aside", 0))])
+        for rr in range(r[0] - (3 if any("left_aside" in x for x in sessions) else
+                                2 if len(sessions) > 1 else 1), r[0]):
+            ws.cell(row=rr, column=1).font = st["bold_font"]
+            ws.cell(row=rr, column=2).alignment = Alignment(horizontal="left")
+
+    # ── Input files, reference and paths (long, so they wrap across the sheet) ──
     if inputs:
         section("Input result files" if kind == "hit_table" else "Input FASTA files",
                 [unit, "Path"])
         n_sum = 0
-        for f, qs in inputs:
+        for lab, (f, qs) in zip(labels, inputs):
             n_sum += len(qs or [])
-            put([os.path.basename(f), len(qs) if qs is not None else "file not found",
-                 os.path.abspath(f)])
-        put(["Total", n_sum], font=st["bold_font"])
+            put([lab, len(qs) if qs is not None else "n/a"])
+            ws.cell(row=r[0] - 1, column=3, value=os.path.abspath(f)).font = path_font
+            ws.merge_cells(start_row=r[0] - 1, start_column=3, end_row=r[0] - 1, end_column=NC)
+            ws.cell(row=r[0] - 1, column=3).alignment = Alignment(wrap_text=True, vertical="center")
+            ws.row_dimensions[r[0] - 1].height = 26
+        total_row(["Total", n_sum])
         if n_total != n_sum:
             put([f"Unique {unit.lower()} in the run", n_total], font=st["bold_font"])
-    else:
-        section("Input")
-        kv(f"{unit} in the table", len(best))
-
-    params = run_info.get("params") or {}
     ref = params.get("tax_reference") or ""
     section("Taxonomy reference")
-    kv("Reference file", os.path.basename(ref) if ref else "(none)")
     if ref:
-        kv("Path", os.path.abspath(ref))
-        kv("Sample-ID suffix removed", params.get("strip_suffix") or "(none)")
-
-    if params.get("nhits"):
-        section("Parameters")
-        if kind == "hit_table":
-            kv("Hits per query kept", params.get("nhits"))
-        else:
-            kv("Database", params.get("database", ""))
-            kv("Program", params.get("program", ""))
-            kv("Hits per sequence", params.get("nhits"))
-            kv("Sequences per batch", params.get("nseq") or "Automatic")
-        kv("NCBI taxonomy fetched", "Yes" if params.get("fetch_taxonomy", True) else "No")
-
-    section("Results")
-    kv("Hit rows in the table", len(rows))
-    kv(f"{unit} with hits", len(best))
-    kv(f"{unit} without hits", counts.get("no_hit", 0))
-    if counts.get("not_searched"):
-        kv(f"{unit} not searched", counts["not_searched"])
-    if has_match and "Hit_rank" in col:
-        kv("Best hit is not BLAST's first hit",
-           sum(1 for row, _n in best.values()
-               if str(row[col["Hit_rank"]]).strip() not in ("", "1")))
-
-    section("Identification level", [unit, "%", "Cumulative %"])
-    cum = 0
-    for lv in levels:
-        n = counts[lv]
-        pct = n / n_total if n_total else 0.0
-        if lv in _RANK_SCORE:
-            cum += n
-            cum_pct = cum / n_total if n_total else 0.0
-        else:
-            cum_pct = ""
-        put([_ID_LABELS[lv], n, float(pct), cum_pct], pct_from=3)
-        if lv in _ID_FILL:
-            ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
-    put(["Total", n_total], font=st["bold_font"])
-    if has_match:
-        put(["Rank at which each query's best hit agrees with the reference taxonomy "
-             "(Tax_level_match). Cumulative %: identified at that rank or deeper."],
-            font=note_font)
+        put([os.path.basename(ref)])
+        ws.cell(row=r[0] - 1, column=2, value=os.path.abspath(ref)).font = path_font
+        ws.merge_cells(start_row=r[0] - 1, start_column=2, end_row=r[0] - 1, end_column=NC)
+        ws.cell(row=r[0] - 1, column=2).alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[r[0] - 1].height = 26
+        put(["Sample-ID suffix removed", params.get("strip_suffix") or "(none)"])
+        ws.cell(row=r[0] - 1, column=2).alignment = Alignment(horizontal="left")
     else:
-        put(["No reference taxonomy applied: add a query taxonomy reference to get "
-             "identification levels (organism, genus, family, order)."], font=note_font)
-    put(["Best hit sheet: one row per query. Best hit = deepest rank agreeing with the "
-         "reference; ties and 'none' by bit score, identity, fewest gaps and mismatches."],
-        font=note_font)
-
-    with_qs = [(f, qs) for f, qs in inputs if qs]
-    if len(with_qs) > 1:
-        section("Identification level by file",
-                [os.path.basename(f) for f, _qs in with_qs] + ["Total"])
-        for lv in levels:
-            per = [sum(1 for q in set(qs) if cats.get(q) == lv) for _f, qs in with_qs]
-            put([_ID_LABELS[lv]] + per + [counts[lv]])
-            if lv in _ID_FILL:
-                ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
-        put(["Total"] + [len(set(qs)) for _f, qs in with_qs] + [n_total],
-            font=st["bold_font"])
-
-    # Column A holds labels and the long notes (left to overflow); the rest
-    # fit their values.
-    ws.column_dimensions["A"].width = 38
-    for ci in range(2, ws.max_column + 1):
-        letter = get_column_letter(ci)
-        width = max((len(str(c.value)) for c in ws[letter]
-                     if c.value is not None and not isinstance(c.value, float)), default=8)
-        ws.column_dimensions[letter].width = min(max(width + 2, 12), 60)
+        put(["(none)"])
 
     # Open on the Summary. Only one tab may be selected, or Excel groups them.
     for sheet in wb.worksheets:
@@ -1626,6 +1792,27 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_hits = QtWidgets.QLabel("Hits per sequence (1–100):")
         sg.addRow(self._lbl_hits, hits_row)
 
+        tries_row = QtWidgets.QWidget()
+        tl = QtWidgets.QHBoxLayout(tries_row)
+        tl.setContentsMargins(0, 0, 0, 0)
+        self._tries_spin = QtWidgets.QSpinBox()
+        self._tries_spin.setRange(2, 30)
+        self._tries_spin.setValue(5)
+        self._tries_spin.setFixedWidth(80)
+        self._tries_spin.setToolTip(
+            "How many times to ask NCBI for the result\n"
+            "of a search (about one minute apart) before\n"
+            "giving up and sending the same sequences\n"
+            "again as a new search.\n"
+            "A search that works is normally ready within\n"
+            "a minute; raise this only if your batches are\n"
+            "big and legitimately take longer.")
+        tl.addWidget(self._tries_spin)
+        tl.addStretch()
+        self._lbl_tries = QtWidgets.QLabel("Result checks per search (2–30):")
+        self._lbl_tries.setToolTip(self._tries_spin.toolTip())
+        sg.addRow(self._lbl_tries, tries_row)
+
         batch_row = QtWidgets.QWidget()
         bl2 = QtWidgets.QHBoxLayout(batch_row)
         bl2.setContentsMargins(0, 0, 0, 0)
@@ -2088,6 +2275,7 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_prog.setText(_tr(ctx, "Program:"))
         self._lbl_hits.setText(_tr(ctx, "Hits per sequence (1–100):"))
         self._lbl_batch.setText(_tr(ctx, "Sequences per BLAST search:"))
+        self._lbl_tries.setText(_tr(ctx, "Result checks per search (2–30):"))
         self._ncbi_warn_icon.setToolTip(_tr(ctx, "NCBI usage policy — click to read"))
         _mode = self._batch_mode.currentIndex()
         self._batch_mode.blockSignals(True)
@@ -2167,6 +2355,7 @@ class BlastPanel(QtWidgets.QWidget):
             "program":        self._PROGRAMS[self._prog_combo.currentIndex()],
             "nhits":          self._hits_spin.value(),
             "nseq":           self._effective_nseq(),
+            "rid_tries":      self._tries_spin.value(),
             "fetch_taxonomy": self._tax_check.isChecked(),
             "tax_reference":  self._ref_group.path,
             "strip_suffix":   self._ref_group.suffix,
@@ -2196,7 +2385,8 @@ class BlastPanel(QtWidgets.QWidget):
         # batch may change between sessions without making the table
         # inconsistent — but only when the user confirms it, since the panel
         # may simply hold its defaults after a restart.
-        cfg = {"api_key": self._api_key_edit.text().strip()}
+        cfg = {"api_key": self._api_key_edit.text().strip(),
+               "rid_tries": self._tries_spin.value()}
         try:
             with open(path, encoding="utf-8") as fh:
                 params = json.load(fh).get("params") or {}
@@ -2719,6 +2909,14 @@ class _BlastWorker(QtCore.QThread):
     _POLL_MIN     = 60    # polling interval while the job still looks quick
     _POLL_MAX     = 120   # interval cap once the job is clearly a long one
     _POLL_FAST_S  = 300   # keep the short interval for this long before backing off
+    # NCBI sometimes never delivers an RID's result (empty replies, or WAITING
+    # forever) while the same job resubmitted is ready within ~1 min. So every
+    # poll that is not READY counts: after _STALL_MAX the RID is abandoned and
+    # the batch is submitted from scratch with a new RID, at most
+    # _MAX_RESTARTS times before the usual batch split / "missing" handling.
+    _STALL_MAX    = 5     # default; the panel's "Result checks per search" overrides
+    _MAX_RESTARTS = 3
+    _STALLED      = "NCBI stopped answering for this RID"
     _BLAST_GAP    = 10.0  # min seconds between ANY two Blast.cgi requests
     # Max seconds blocked in one socket operation (connect, or one read — not
     # the whole download). Bounds how long Stop can take to unwind a request.
@@ -2781,6 +2979,7 @@ class _BlastWorker(QtCore.QThread):
         self._state: Optional[dict] = None
         self._state_path = ""
         self._processed: set = set()   # Query_names answered and written to the TSV
+        self._stalled_ids: set = set()  # Query_names of batches NCBI never answered
         self._session: dict = {}
         self._session_t0 = 0.0
 
@@ -2887,7 +3086,7 @@ class _BlastWorker(QtCore.QThread):
             ctx.verify_flags &= ~strict
         return ctx
 
-    def _http_get(self, url, params=None, timeout=60):
+    def _http_get(self, url, params=None, timeout=60, max_attempts=None):
         import urllib.request, urllib.parse, urllib.error
         params = self._eutils_params(url, params)
         if params:
@@ -2895,7 +3094,7 @@ class _BlastWorker(QtCore.QThread):
         if url.startswith(self._BLAST_URL) and "tool=" not in url:
             url += ("&" if "?" in url else "?") + f"tool={self._NCBI_TOOL}"
         timeout = min(timeout, self._SOCK_TIMEOUT)
-        for attempt in range(self._MAX_RETRY):
+        for attempt in range(max_attempts or self._MAX_RETRY):
             if self._stop:
                 return ""
             self._rate_acquire(url)
@@ -3130,6 +3329,12 @@ class _BlastWorker(QtCore.QThread):
             return None, rtoe, reason
         return rid, rtoe, ""
 
+    def _stall_max(self):
+        try:
+            return max(2, int(self.cfg.get("rid_tries") or self._STALL_MAX))
+        except (TypeError, ValueError):
+            return self._STALL_MAX
+
     def _blast_poll(self, rid, batch_label=""):
         """Wait for one RID, up to _POLL_BUDGET seconds.
 
@@ -3147,17 +3352,19 @@ class _BlastWorker(QtCore.QThread):
         deadline = t0 + self._POLL_BUDGET
         prefix = f"BLAST       │ [{batch_label}] " if batch_label else "BLAST       │ "
 
-        def _progress(state=""):
-            elapsed = int(time.monotonic() - t0)
-            self.statusUpdated.emit(
-                "blast",
-                f"{prefix}Waiting for RID {rid}{state}… "
-                f"({elapsed // 60}m {elapsed % 60:02d}s of "
-                f"{self._POLL_BUDGET // 60}m max · try {polls})"
-            )
+        stalls = 0
+
+        def _progress():
+            if stalls:
+                msg = f"Fetching results: retry #{stalls}"
+            else:
+                msg = f"Waiting for RID {rid}…"
+            self.statusUpdated.emit("blast", f"{prefix}{msg}")
 
         while not self._stop and time.monotonic() < deadline:
-            resp = self._http_get(url)
+            # One attempt only: _http_get's own retry loop could block for
+            # many minutes on exactly the non-answers counted here.
+            resp = self._http_get(url, max_attempts=1)
             polls += 1
             if self._stop:
                 return False, "stopped"
@@ -3171,8 +3378,13 @@ class _BlastWorker(QtCore.QThread):
             if "Status=UNKNOWN" in resp:
                 self.statusUpdated.emit("blast", f"{prefix}Search expired for RID {rid}.")
                 return False, "search expired (RID UNKNOWN)"
-            # WAITING, or an empty/unrecognised reply: both mean "not yet".
-            _progress("" if "Status=WAITING" in resp else " (no status in reply)")
+            # Any reply that is not READY counts, WAITING included: a batch
+            # that works is READY within ~1 min, so a RID still WAITING after
+            # _STALL_MAX polls is treated as stuck and resubmitted.
+            stalls += 1
+            if stalls >= self._stall_max():
+                return False, self._STALLED
+            _progress()
             self._interruptible_sleep(interval)
             # Once a minute (the NCBI minimum per RID) for the first
             # _POLL_FAST_S; only once the job is clearly long does the
@@ -3192,17 +3404,27 @@ class _BlastWorker(QtCore.QThread):
             )
         return False, "timed out waiting for RID"
 
-    def _blast_get_tabular(self, rid):
+    def _blast_get_tabular(self, rid, batch_label=""):
+        """Download the tabular results; None after _STALL_MAX failed tries
+        (one per _POLL_MIN, the NCBI minimum per RID)."""
         url = (
             f"{self._BLAST_URL}"
             f"?CMD=Get&FORMAT_TYPE=Text&ALIGNMENT_VIEW=Tabular&RID={rid}"
         )
-        resp = self._http_get(url, timeout=120)
-        # A real reply (even with 0 hits) always carries '#' comment lines;
-        # an empty one means the download failed, not "no hits".
-        if not resp or "#" not in resp:
-            return None
-        return self._parse_tabular(resp)
+        prefix = f"BLAST       │ [{batch_label}] " if batch_label else "BLAST       │ "
+        for attempt in range(self._stall_max()):
+            resp = self._http_get(url, timeout=120, max_attempts=1)
+            if self._stop:
+                return None
+            # A real reply (even with 0 hits) always carries '#' comment
+            # lines; an empty one means the download failed, not "no hits".
+            if resp and "#" in resp:
+                return self._parse_tabular(resp)
+            self.statusUpdated.emit(
+                "blast", f"{prefix}Fetching results: retry #{attempt + 1}")
+            if attempt < self._stall_max() - 1:
+                self._interruptible_sleep(self._POLL_MIN)
+        return None
 
     def _parse_tabular(self, text):
         # Equivalent to: grep -A nhits '^#' | sed '/^#/d; /^--/d'
@@ -3689,8 +3911,10 @@ class _BlastWorker(QtCore.QThread):
         exactly which sequences were really queried.
         """
         batch_fasta = "\n".join(h + "\n" + s for h, s in pairs)
-        rid, rtoe, reason = self._blast_submit(batch_fasta, label=batch_label)
-        if rid:
+        for restart in range(self._MAX_RESTARTS + 1):
+            rid, rtoe, reason = self._blast_submit(batch_fasta, label=batch_label)
+            if not rid:
+                break
             self.statusUpdated.emit(
                 "blast",
                 f"BLAST       │ [{batch_label}] RID={rid}  waiting {rtoe}s…"
@@ -3700,27 +3924,45 @@ class _BlastWorker(QtCore.QThread):
                     return [], []
                 time.sleep(1)
             ok, poll_reason = self._blast_poll(rid, batch_label)
+            stalled = (not ok) and poll_reason == self._STALLED
             if ok:
-                rows = self._blast_get_tabular(rid)
+                rows = self._blast_get_tabular(rid, batch_label)
                 if rows is not None:
                     return rows, pairs
                 if self._stop:
                     return [], []
-                # The search finished but its results could not be downloaded:
-                # mark the batch missing (so it can be re-run) instead of
-                # reporting its sequences as "no hits".
+                stalled = True
+            if not stalled:
+                reason = poll_reason
+                break
+            if self._stop:
+                return [], []
+            reason = self._STALLED
+            if restart < self._MAX_RESTARTS:
+                _ses = getattr(self, "_session", None)
+                if isinstance(_ses, dict):
+                    _ses["rid_restarts"] = _ses.get("rid_restarts", 0) + 1
                 self.statusUpdated.emit(
                     "blast",
-                    f"BLAST       │ [{batch_label}] results of RID {rid} could not be "
-                    f"downloaded — {len(pairs)} sequence(s) marked missing."
+                    f"BLAST       │ [{batch_label}] RID {rid} did not answer — "
+                    f"submitting again from scratch ({restart + 1}/{self._MAX_RESTARTS})…"
                 )
-                return [], []
-            reason = poll_reason
 
         if self._stop:
             return [], []
 
         n = len(pairs)
+        if reason == self._STALLED:
+            # Every RID of this batch went silent: do not split it (that
+            # multiplies the waiting). Leave it for the final retry pass and,
+            # if it stalls again there, aside in the missing FASTA + report.
+            self._stalled_ids.update(h[1:] for h, _s in pairs)
+            self.statusUpdated.emit(
+                "blast",
+                f"BLAST       │ [{batch_label}] NCBI never delivered the results — "
+                f"{n} sequence(s) left for the final retry."
+            )
+            return [], []
         if n > self._MIN_SPLIT_SEQS and depth < self._MAX_SPLIT_DEPTH:
             half = -(-n // 2)  # ceil
             self.statusUpdated.emit(
@@ -4172,6 +4414,10 @@ class _BlastWorker(QtCore.QThread):
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
         # Over the whole run, so after a resume it lists what is still left.
         missing_pairs = [(h, s) for h, s in all_pairs if h[1:] not in self._processed]
+        # Sequences whose batch stalled at NCBI in this session, again in the
+        # final retry: set aside (they are in the missing FASTA too).
+        stalled_aside = [h[1:] for h, _s in missing_pairs
+                         if h[1:] in self._stalled_ids]
 
         miss_msg = ""
         miss_path = os.path.join(output_dir, f"missing_seqs_{mydate}.fa")
@@ -4251,11 +4497,14 @@ class _BlastWorker(QtCore.QThread):
 
         # ── Convert TSV → XLSX ──
         xlsx_path = ""
+        self._session["left_aside"] = len(stalled_aside)
+        self._session["elapsed_s"] = int(time.monotonic() - self._session_t0)
         if not self._stop and total_hits_done > 0:
             xlsx_path = self._tsv_to_xlsx(tsv_path, {
                 "kind": "search", "run_id": mydate, "files": list(self.files),
                 "params": {k: cfg.get(k) for k in self._RUN_PARAMS},
                 "processed": self._processed, "status": run_status,
+                "sessions": list(state.get("sessions") or []),
                 "fasta": fasta_path,
             })
 
@@ -4355,6 +4604,13 @@ class _BlastWorker(QtCore.QThread):
                              f"failed batches searched again · {n_rescued} now with hits"
                              + (" (the rest are confirmed: no hit after retry)"
                                 if n_rescued < n_retried else ""))
+        if stalled_aside:
+            log_lines.append(
+                f"  Left aside        : {len(stalled_aside)} seq(s) whose search NCBI never "
+                f"delivered ({self._stall_max()} checks x {self._MAX_RESTARTS + 1} RIDs, also in the final "
+                f"retry) — listed in the missing FASTA; run Resume later")
+            for q in stalled_aside:
+                log_lines.append(f"    {q}")
         if n_tax_fixed or n_tax_still:
             log_lines.append(f"  Taxonomy check    : {n_tax_fixed} hit row(s) without organism / "
                              f"lineage repaired · {n_tax_still} still unresolved")

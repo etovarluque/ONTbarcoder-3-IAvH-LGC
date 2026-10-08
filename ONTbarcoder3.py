@@ -729,8 +729,8 @@ class SidebarWidget(QtWidgets.QWidget):
         ("results",     "Results"),
     ]
     TOOLS = [
-        ("compare",         "FASTA Compare"),
         ("fasta_tools",     "FASTA Tools"),
+        ("compare",         "FASTA Compare"),
         ("fastq_inspector", "FASTQ Inspector"),
         ("blast",           "BLAST"),
         ("best_seq",        "Best Sequence"),
@@ -772,6 +772,8 @@ class SidebarWidget(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
 
         self._buttons = {}
+        # Last panel selected in each tab; a tab click reopens it.
+        self._last_key = {0: self.ITEMS[0][0], 1: self.TOOLS[0][0]}
         self._states = {k: "pending" for k, _ in self.ITEMS + self.TOOLS}
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -793,7 +795,7 @@ class SidebarWidget(QtWidgets.QWidget):
             tb.setCheckable(True)
             tb.setFixedHeight(36)
             tb.setCursor(QtCore.Qt.PointingHandCursor)
-            tb.clicked.connect(lambda _, n=i: self._pages.setCurrentIndex(n))
+            tb.clicked.connect(lambda _, n=i: self._on_tab_clicked(n))
             self._tab_group.addButton(tb, i)
             self._tab_btns.append(tb)
             tl.addWidget(tb, 1)
@@ -876,6 +878,15 @@ class SidebarWidget(QtWidgets.QWidget):
         btn.clicked.connect(lambda _, k=key: self._on_item_clicked(k))
         return btn
 
+    def _on_tab_clicked(self, n):
+        self._pages.setCurrentIndex(n)
+        items = self.ITEMS if n == 0 else self.TOOLS
+        key = self._last_key[n]
+        btn = self._buttons.get(key)
+        if self._states.get(key) == "locked" or (btn is not None and btn.isHidden()):
+            key = items[0][0]
+        self.panelRequested.emit(key)
+
     def _on_item_clicked(self, key):
         if self._states.get(key) == "locked":
             return   # ignore click on locked panel
@@ -922,8 +933,10 @@ class SidebarWidget(QtWidgets.QWidget):
         # Follow the selection: show the tab that holds the active panel.
         if key in dict(self.TOOLS):
             self._pages.setCurrentIndex(1)
+            self._last_key[1] = key
         elif key in dict(self.ITEMS):
             self._pages.setCurrentIndex(0)
+            self._last_key[0] = key
         for k, btn in self._buttons.items():
             self._refresh_item(k)
             # Never override a locked item: keep its locked look and cursor so
@@ -5060,8 +5073,11 @@ class LiveChartPanel(BasePanel):
         for col, color in enumerate((RED, AMBER, GREEN)):
             n_lbl = make_label("0", size=22, bold=True, color=color)
             d_lbl = make_label("", size=13, color=TEXT_SEC)
-            cov_lay.addWidget(n_lbl, 1, col)
-            cov_lay.addWidget(d_lbl, 2, col)
+            n_lbl.setAlignment(QtCore.Qt.AlignCenter)
+            d_lbl.setAlignment(QtCore.Qt.AlignCenter)
+            cov_lay.addWidget(n_lbl, 1, col, QtCore.Qt.AlignHCenter)
+            cov_lay.addWidget(d_lbl, 2, col, QtCore.Qt.AlignHCenter)
+            cov_lay.setColumnStretch(col, 1)   # three equal, centred segments
             self._cov_cells.append((n_lbl, d_lbl))
         self._cov_frame.hide()
         self.add(self._cov_frame)
@@ -5533,7 +5549,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # the current screen.  With UI auto-scaling the *logical* screen can be
         # smaller than these px values, so a fixed minimum would push the window
         # off-screen (behind the taskbar).  Clamp both to the available area.
-        self._apply_initial_geometry(pref_w=1320, pref_h=1000,
+        self._apply_initial_geometry(pref_w=1323, pref_h=945,
                                      min_w=1280, min_h=920)
 
         # Icon in title bar and taskbar
@@ -5768,30 +5784,102 @@ class MainWindow(QtWidgets.QMainWindow):
             "bold_formatter": ("BOLD Formatter",), "notes": ("Notes",),
             "batch_sweep": ("Parameter Sweep (Optional)",),
         }
+        manual = {
+            "compare": "util-compare", "fasta_tools": "util-tools",
+            "fastq_inspector": "util-fastq", "blast": "util-blast",
+            "best_seq": "util-best", "bold_formatter": "util-bold",
+            "notes": "util-notes", "batch_sweep": "util-batch",
+        }
         self._title_icons = []
+        self._help_btns = []
         for key, panel in panels.items():
             for lbl in panel.findChildren(QtWidgets.QLabel):
                 if lbl.text().strip() not in titles[key]:
                     continue
-                layout = lbl.parentWidget().layout() if lbl.parentWidget() else None
-                if layout is None or layout.indexOf(lbl) < 0:
-                    continue
-                row = QtWidgets.QWidget()
-                hl = QtWidgets.QHBoxLayout(row)
-                hl.setContentsMargins(0, 0, 0, 0)
-                hl.setSpacing(8)
                 ico = QtWidgets.QLabel()
                 ico.setFixedSize(24, 24)
-                hl.addWidget(ico)
-                layout.replaceWidget(lbl, row)
-                hl.addWidget(lbl, 1)
-                self._title_icons.append((ico, SidebarWidget.ICONS[key]))
+                if self._wrap_title(lbl, manual[key], ico):
+                    self._title_icons.append((ico, SidebarWidget.ICONS[key]))
+        # Workflow panels: main title -> manual section.
+        for panel, attr, anchor in (
+            (self._panel_setup, "_lbl_mode_title", "modes"),
+            (self._panel_setup, "_lbl_conv_section", "inputs"),
+            (self._panel_setup, "_lbl_live_section", "mode-rt"),
+            (self._panel_params, "_lbl_params_title", "params"),
+            (self._panel_params, "_lbl_profiles_title", "profiles"),
+            (self._panel_progress, "_analysis_title_lbl", "workflow"),
+            (self._panel_live_chart, "_lbl_chart_title", "modes"),
+            (self._panel_results, "_lbl_results_title", "outputs"),
+        ):
+            lbl = getattr(panel, attr, None)
+            if lbl is not None:
+                self._wrap_title(lbl, anchor)
         self._refresh_title_icons()
+
+    def _wrap_title(self, lbl, anchor, ico=None):
+        """Replace `lbl` in its layout by a row [icon] label [?]; the ? opens
+        the manual at `anchor`."""
+        layout = lbl.parentWidget().layout() if lbl.parentWidget() else None
+        if layout is None or layout.indexOf(lbl) < 0:
+            return False
+        row = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        if ico is not None:
+            hl.addWidget(ico)
+        layout.replaceWidget(lbl, row)
+        hl.addWidget(lbl)
+        btn = QtWidgets.QToolButton()
+        btn.setAutoRaise(True)
+        btn.setFixedSize(26, 26)
+        btn.setIconSize(QtCore.QSize(20, 20))
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setToolTip(_tr("MainWindow", "Open this section in the manual"))
+        btn.clicked.connect(lambda _=False, a=anchor: self._open_manual(a))
+        hl.addWidget(btn)
+        hl.addStretch(1)
+        self._help_btns.append(btn)
+        return True
+
+    def _open_manual(self, anchor=""):
+        path = os.path.join(_get_base_dir(), "guide", "MANUAL.html")
+        if not os.path.isfile(path):
+            QtWidgets.QMessageBox.warning(
+                self, "Manual", f"Manual not found:\n{path}")
+            return
+        url = QtCore.QUrl.fromLocalFile(path)
+        if anchor:
+            url.setFragment(anchor)
+        # The OS file-association launcher drops the #fragment of file URLs,
+        # so open a tiny temp page that redirects to the anchor instead.
+        if anchor:
+            try:
+                import tempfile
+                target = url.toString()
+                page = os.path.join(tempfile.gettempdir(), "ontbarcoder_manual_jump.html")
+                with open(page, "w", encoding="utf-8") as fh:
+                    fh.write('<!doctype html><meta charset="utf-8">'
+                             f'<meta http-equiv="refresh" content="0;url={target}">'
+                             f'<script>location.replace("{target}")</script>'
+                             f'<a href="{target}">Open manual</a>')
+                url = QtCore.QUrl.fromLocalFile(page)
+            except Exception:
+                pass
+        QtGui.QDesktopServices.openUrl(url)
 
     def _refresh_title_icons(self):
         color = ont_ui.tok("accent_fg")
         for ico, name in self._title_icons:
             ico.setPixmap(ont_ui.icon_pixmap(name, color, 24))
+        # accent_tint is almost the panel colour in dark mode: use a lighter indigo there.
+        hover_bg = "#3F4380" if ont_ui.current_theme() == "dark" else ont_ui.tok("accent_tint")
+        for btn in getattr(self, "_help_btns", []):
+            btn.setIcon(ont_ui.make_icon("help", color, 20))
+            btn.setStyleSheet(
+                "QToolButton { background: transparent; border: none; border-radius: 13px; }"
+                f"QToolButton:hover {{ background: {hover_bg}; }}"
+                f"QToolButton:pressed {{ background: {ont_ui.tok('accent')}; }}")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -9754,27 +9842,86 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<td>{r.get('ok',0)}</td></tr>\n"
             )
 
+        # ── Intra-sample variants per sample (same tiers as secondary_variants.fa) ──
+        _rm_p = (summary.get("params", {}) or {}).get("resolve_mixed", {}) or {}
+        _var_enabled = bool(_rm_p.get("enabled", False))
+        _per_var = {}      # sample -> {"quality": n, "alert": n, "trace": n}
+        _review = set()
+        if _var_enabled:
+            for _k, _v in getattr(self, 'mixinfo_all', {}).items():
+                if _k not in getattr(self, 'con200barcodes', {}) or not _v.get("secondary"):
+                    continue
+                if _v.get("needs_review"):
+                    _review.add(_k)
+                if not _v.get("secondaries"):
+                    _v = dict(_v, secondaries=[{"frac": 1.0 - float(_v.get("frac", 0)),
+                                                "seq": _v.get("secondary", ""),
+                                                "translates": None}])
+                _c = {"quality": 0, "alert": 0, "trace": 0}
+                try:
+                    for _i, _sec, _tier in self._sample_variant_tiers(_v):
+                        if _tier in _c:
+                            _c[_tier] += 1
+                except Exception:
+                    pass
+                _per_var[_k] = _c
+
         # ── Sample table (from sampleids) ─────────────────────────────
         sample_rows = ""
         _con200bc  = getattr(self, 'con200barcodes', {})
         _n90bc     = getattr(self, 'n90barcodes', {})
         _con200cov = getattr(self, 'con200cov', {})
         _n90cov    = getattr(self, 'n90cov', {})
+        _con200fl  = getattr(self, 'con200flags', {})
+        _n90fl     = getattr(self, 'n90flags', {})
+        _mincov_t  = self._min_cov()
+        _status_n  = {"QC OK": 0, "Barcode, not QC": 0, "Review": 0,
+                      "Low coverage": 0, "No barcode": 0, "No reads": 0}
         for sid, cnt in sorted(getattr(self, 'sampleids', {}).items(),
                                 key=lambda x: -x[1]):
             if sid in _con200bc:
                 has_bc = "✓"
                 cov_val = _con200cov.get(sid, "—")
                 ambs_val = _con200bc[sid].count("N")
+                _qc = bool(_con200fl.get(sid, False))
             elif sid in _n90bc:
                 has_bc = "✓"
                 cov_val = _n90cov.get(sid, "—")
                 ambs_val = _n90bc[sid].count("N")
+                _qc = bool(_n90fl.get(sid, False))
             else:
-                has_bc, cov_val, ambs_val = "—", "—", "—"
+                has_bc, cov_val, ambs_val, _qc = "—", "—", "—", False
+            if not cnt:
+                st, cls = "No reads", "gray"
+            elif has_bc == "—":
+                st, cls = ("Low coverage", "amber") if cnt < _mincov_t else ("No barcode", "red")
+            elif sid in _review:
+                st, cls = "Review", "amber"
+            elif _qc:
+                st, cls = "QC OK", "green"
+            else:
+                st, cls = "Barcode, not QC", "blue"
+            _status_n[st] += 1
+            _pv = _per_var.get(sid)
+            if _pv and (_pv["quality"] or _pv["alert"] or _pv["trace"]):
+                _vt = " ".join(x for x in (
+                    f"<span class='chip blue'>{_pv['quality']} quality</span>" if _pv["quality"] else "",
+                    f"<span class='chip red'>{_pv['alert']} alert</span>" if _pv["alert"] else "",
+                    f"<span class='chip gray'>{_pv['trace']} trace</span>" if _pv["trace"] else "") if x)
+                _vsort = _pv["alert"] * 1000 + _pv["quality"] * 10 + _pv["trace"]
+            else:
+                _vt, _vsort = "", 0
+            _cv = cov_val if isinstance(cov_val, (int, float)) else -1
+            _av = ambs_val if isinstance(ambs_val, (int, float)) else -1
             sample_rows += (
-                f"<tr><td>{sid}</td><td style='text-align:center'>{cnt:,}</td><td style='text-align:center'>{has_bc}</td>"
-                f"<td style='text-align:center'>{cov_val}</td><td style='text-align:center'>{ambs_val}</td></tr>\n"
+                f"<tr><td>{sid}</td>"
+                f"<td style='text-align:center' data-v='{cnt}'>{cnt:,}</td>"
+                f"<td style='text-align:center' data-v='{1 if has_bc == '✓' else 0}'>{has_bc}</td>"
+                f"<td style='text-align:center' data-v='{_cv}'>{cov_val}</td>"
+                f"<td style='text-align:center' data-v='{_av}'>{ambs_val}</td>"
+                f"<td data-v='{st}'><span class='chip {cls}'>{st}</span></td>"
+                + (f"<td data-v='{_vsort}'>{_vt}</td>" if _var_enabled else "")
+                + "</tr>\n"
             )
 
         # ── Phase 2a breakdown by coverage ───────────────────────────────
@@ -9813,98 +9960,68 @@ class MainWindow(QtWidgets.QMainWindow):
             phase2a_cov_html = ""
 
         # ──Graphics section ─────────────────────── ───────────────────────
+        def _svg_chart(xs, series, ylabel, xlabel):
+            """Inline SVG line chart (no external library, so it also renders
+            offline). `series` = [(name, colour, values)]; each point carries a
+            native tooltip."""
+            W, H, ml, mr, mt, mb = 560, 270, 62, 14, 12, 44
+            xmax = max(xs) if xs and max(xs) > 0 else 1
+            ymax = max((max(v) if v else 0) for _n, _c, v in series) or 1
+            mag = 10 ** (len(str(int(ymax))) - 1)
+            step = max(1, mag / 2 if ymax / mag < 3 else mag)
+            ytop = step * (int(ymax / step) + (0 if ymax % step == 0 else 1))
+            def X(x): return ml + (W - ml - mr) * x / xmax
+            def Y(y): return mt + (H - mt - mb) * (1 - y / ytop)
+            out = [f'<svg class="chart" viewBox="0 0 {W} {H}" role="img">']
+            yv = 0.0
+            while yv <= ytop + 1e-9:
+                out.append(f'<line class="grid" x1="{ml}" x2="{W - mr}" y1="{Y(yv):.1f}" y2="{Y(yv):.1f}"/>')
+                out.append(f'<text x="{ml - 6}" y="{Y(yv) + 4:.1f}" text-anchor="end">{int(yv):,}</text>')
+                yv += step
+            for i in range(6):
+                xv = xmax * i / 5
+                lab = f"{xv:.0f}" if xmax >= 10 else f"{xv:.1f}"
+                out.append(f'<text x="{X(xv):.1f}" y="{H - mb + 16}" text-anchor="middle">{lab}</text>')
+            out.append(f'<line class="axis" x1="{ml}" x2="{W - mr}" y1="{Y(0):.1f}" y2="{Y(0):.1f}"/>')
+            out.append(f'<text x="{(ml + W - mr) / 2:.0f}" y="{H - 6}" text-anchor="middle">{xlabel}</text>')
+            out.append(f'<text transform="translate(13 {(mt + H - mb) / 2:.0f}) rotate(-90)" text-anchor="middle">{ylabel}</text>')
+            for name, col, vals in series:
+                pts = " ".join(f"{X(x):.1f},{Y(v):.1f}" for x, v in zip(xs, vals))
+                out.append(f'<polyline points="{pts}" fill="none" stroke="{col}" stroke-width="2"/>')
+                for x, v, ts in zip(xs, vals, tl_ts_list):
+                    out.append(f'<circle cx="{X(x):.1f}" cy="{Y(v):.1f}" r="3.2" fill="{col}">'
+                               f'<title>{name}: {v:,} — {ts} ({x:g} {xlabel.split()[-1].strip("()")})</title></circle>')
+            out.append('</svg>')
+            return "".join(out)
+
         if is_rt and timeline:
+            tl_ts_list = [r.get("ts", "") for r in extended_timeline]
+            _mins = [r.get("min", 0) for r in extended_timeline]
+            if max(_mins) < 60:
+                _xs, _xl = [round(m, 2) for m in _mins], "Time (min)"
+            else:
+                _xs, _xl = [round(m / 60.0, 2) for m in _mins], "Time (h)"
+            _legend = lambda items: '<div class="legend">' + "".join(
+                f'<span><i style="background:{c}"></i>{n}</span>' for n, c in items) + '</div>'
             charts_section = f"""
             <section class="section" id="sec-charts">
               <h2 class="section-title">Real-Time charts</h2>
               <div class="charts-grid">
                 <div class="chart-card">
                   <div class="chart-label">Demultiplexed and total reads</div>
-                  <canvas id="chartReads"></canvas>
+                  {_legend([("Total reads", "#38bdf8"), ("Demultiplexed", "#818cf8")])}
+                  {_svg_chart(_xs, [("Total reads", "#38bdf8", [r.get("total", 0) for r in extended_timeline]),
+                                    ("Demultiplexed", "#818cf8", [r.get("dem", 0) for r in extended_timeline])],
+                              "Reads", _xl)}
                 </div>
                 <div class="chart-card">
                   <div class="chart-label">Accumulated QC Compliant Barcodes</div>
-                  <canvas id="chartOk"></canvas>
+                  {_legend([("QC Compliant barcodes", "#34d399")])}
+                  {_svg_chart(_xs, [("QC Compliant barcodes", "#34d399", [r.get("ok", 0) for r in extended_timeline])],
+                              "QC barcodes", _xl)}
                 </div>
               </div>
             </section>"""
-            charts_js = f"""
-            <script>
-            const tl_labels = {tl_labels};
-            const tl_total  = {tl_total};
-            const tl_dem    = {tl_dem};
-            const tl_ok     = {tl_ok};
-            const tl_ts     = {tl_ts};
-
-            function mkChart(id, datasets, yLabel) {{
-              const ctx = document.getElementById(id);
-              if (!ctx) return;
-              new Chart(ctx, {{
-                type: 'line',
-                data: {{ labels: tl_labels, datasets }},
-                options: {{
-                  responsive: true,
-                  animation: {{ duration: 600, easing: 'easeInOutQuart' }},
-                  interaction: {{ mode: 'index', intersect: false }},
-                  plugins: {{
-                    legend: {{ labels: {{
-                      color: '#e2e8f0', font: {{ family: 'DM Mono', size: 11 }},
-                      boxWidth: 12, boxHeight: 12,
-                      generateLabels: function(chart) {{
-                        const orig = Chart.defaults.plugins.legend.labels.generateLabels(chart);
-                        orig.forEach(l => {{ l.fillStyle = l.strokeStyle; l.lineWidth = 0; }});
-                        return orig;
-                      }}
-                    }} }},
-                    tooltip: {{
-                      backgroundColor: 'rgba(15,23,42,0.92)',
-                      titleColor: '#94a3b8',
-                      bodyColor: '#e2e8f0',
-                      borderColor: '#334155',
-                      borderWidth: 1,
-                      callbacks: {{
-                        title: items => `t = ${{items[0].label}} h`,
-                        afterBody: items => `${{tl_ts[items[0].dataIndex]}}`
-                      }}
-                    }}
-                  }},
-                  scales: {{
-                    x: {{
-                      title: {{ display: true, text: 'Time (h)', color: '#64748b' }},
-                      ticks: {{ color: '#64748b', font: {{ family: 'DM Mono', size: 10 }} }},
-                      grid: {{ color: 'rgba(100,116,139,0.15)' }},
-                      min: 0,
-                      suggestedMin: 0
-                    }},
-                    y: {{
-                      title: {{ display: true, text: yLabel, color: '#64748b' }},
-                      ticks: {{ color: '#64748b', font: {{ family: 'DM Mono', size: 10 }} }},
-                      grid: {{ color: 'rgba(100,116,139,0.15)' }},
-                      beginAtZero: true,
-                      min: 0,
-                      suggestedMin: 0
-                    }}
-                  }}
-                }}
-              }});
-            }}
-
-            mkChart('chartReads', [
-              {{ label: 'Total reads',        data: tl_total, borderColor: '#38bdf8',
-                backgroundColor: 'rgba(56,189,248,0.08)', borderWidth: 2,
-                pointRadius: 3, fill: true, tension: 0 }},
-              {{ label: 'Demultiplexed',       data: tl_dem,   borderColor: '#818cf8',
-                backgroundColor: 'rgba(129,140,248,0.08)', borderWidth: 2,
-                pointRadius: 3, fill: true, tension: 0 }}
-            ], 'Reads');
-
-            mkChart('chartOk', [
-              {{ label: 'QC Compliant barcodes', data: tl_ok,   borderColor: '#34d399',
-                backgroundColor: 'rgba(52,211,153,0.12)', borderWidth: 2,
-                pointRadius: 4, fill: true, tension: 0 }}
-            ], 'QC barcodes');
-            </script>
-            """
         elif b64_reads or b64_ok:
             # Conventional or RT mode without data: show PNGs if they exist
             img_reads = f'<img src="data:image/png;base64,{b64_reads}" alt="Reads chart">' if b64_reads else ""
@@ -9951,26 +10068,28 @@ class MainWindow(QtWidgets.QMainWindow):
             # Intra-sample variant detection (marker-agnostic)
             _rm = p.get("resolve_mixed", {}) or {}
             _rm_enabled = bool(_rm.get("enabled", False))
-            _rm_lbl = "On" if _rm_enabled else "Off"
-            if _rm_enabled:
-                _rm_lbl += (f" (min secondary variant fraction: {_rm.get('min_secondary_frac','?')}; "
-                            f"variant tolerance: {_rm.get('tolerance','?')}; "
-                            f"min reads per exported variant: {_rm.get('min_variant_reads', 10)}; "
-                            f"contamination alert divergence: {_rm.get('alert_divergence', 0.03)}; "
-                            f"derived polymorphism threshold: {_rm.get('minor_thresh','?')})")
-                _rstats = getattr(self, "_resolve_stats", {}) or {}
-                if _rstats.get("enabled"):
-                    _rm_lbl += (f" — {_rstats.get('mixed',0)} mixed sample(s) resolved, "
-                                f"{_rstats.get('recovered',0)} now QC-compliant")
-                    if _rstats.get("needs_review"):
-                        _rm_lbl += (f", {_rstats.get('needs_review')} need manual "
-                                    f"review")
-                    if _rstats.get("recovered_variants"):
-                        _rm_lbl += (f"; {_rstats.get('recovered_variants')} secondary "
-                                    f"variant(s) recovered "
-                                    f"({_rstats.get('recovered_valid',0)} valid)")
             _rm_row = (f"<tr><td>Intra-sample variant detection (dominant haplotype)</td>"
-                       f"<td>{_rm_lbl}</td></tr>")
+                       f"<td>{'On' if _rm_enabled else 'Off'}</td></tr>")
+            if _rm_enabled:
+                for _lab, _val in (
+                        ("&nbsp;&nbsp;Min. secondary variant fraction", _rm.get('min_secondary_frac', '?')),
+                        ("&nbsp;&nbsp;Variant tolerance", _rm.get('tolerance', '?')),
+                        ("&nbsp;&nbsp;Min. reads per exported variant", _rm.get('min_variant_reads', 10)),
+                        ("&nbsp;&nbsp;Contamination alert divergence", _rm.get('alert_divergence', 0.03)),
+                        ("&nbsp;&nbsp;Derived polymorphism threshold", _rm.get('minor_thresh', '?'))):
+                    _rm_row += f"<tr><td>{_lab}</td><td>{_val}</td></tr>"
+            _cl = p.get('coveragelist', '?')
+            if isinstance(_cl, (list, tuple)):
+                _cl = ", ".join(str(x) for x in _cl)
+            else:
+                _cl = str(_cl).strip("[]")
+            _rt_row = ""
+            if is_rt:
+                _n_rt = p.get("live_consensus_reads")
+                _m_rt = p.get("live_consensus_minutes")
+                _trig = (f"every {int(_n_rt):,} new reads" if _n_rt else
+                         f"every {_m_rt} min" if _m_rt else "—")
+                _rt_row = f"<tr><td>Real-Time cycle trigger</td><td>{_trig}</td></tr>"
             params_rows = (
                 f"<tr><td>Non-Coding marker</td><td>{non_coi_lbl}</td></tr>"
                 f"{_rm_row}"
@@ -9984,8 +10103,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"<tr><td>Minimum read coverage</td><td>{p.get('mincoverage','?')}</td></tr>"
                 f"<tr><td>Primer mismatches allowed</td><td>{p.get('primermismatch','?')}</td></tr>"
                 f"<tr><td>Tag mismatches allowed</td><td>{p.get('tagmm','?')}</td></tr>"
-                f"<tr><td>Phase 2a coverages</td><td>{p.get('coveragelist','?')}</td></tr>"
+                f"<tr><td>Phase 2a coverages</td><td>{_cl}</td></tr>"
                 f"<tr><td>Main consensus calling frequency</td><td>{p.get('consfreqfixed','?')} (range {p.get('consfreqmin','?')}–{p.get('consfreqmax','?')})</td></tr>"
+                f"{_rt_row}"
                 f"<tr><td>Threads</td><td>{p.get('n_threads','?')}</td></tr>"
                 f"<tr><td>Active phases</td><td>{', '.join(fases)}</td></tr>"
             )
@@ -10007,11 +10127,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if sample_rows:
             samples_section = f"""
             <section class="section" id="sec-samples">
-              <h2 class="section-title">Demultiplexed samples</h2>
+              <h2 class="section-title">Samples</h2>
+              <div class="toolbar no-print">
+                <input type="search" id="sampleFilter" placeholder="Filter by sample or status…">
+                <span class="count" id="sampleCount"></span>
+                <span class="count">Click a column header to sort</span>
+              </div>
               <div class="table-wrap" style="max-height:650px; overflow-y:auto;">
-                <table style="position: relative;">
+                <table id="sampleTable" style="position: relative;">
                     <thead style="position: sticky; top: 0; background: var(--bg3); z-index: 10;">
-                        <tr><th style="width:20%">Sample ID</th><th style="text-align:center">Assigned reads</th><th style="text-align:center">Barcode</th><th style="text-align:center">Coverage</th><th style="text-align:center">Ambiguities</th></tr>
+                        <tr><th class="sortable" style="width:20%">Sample ID</th><th class="sortable" style="text-align:center">Assigned reads</th><th class="sortable" style="text-align:center">Barcode</th><th class="sortable" style="text-align:center">Coverage</th><th class="sortable" style="text-align:center">Ambiguities</th><th class="sortable">Status</th>{"<th class='sortable'>Variants</th>" if _var_enabled else ""}</tr>
                     </thead>
                   <tbody>{sample_rows}</tbody>
                 </table>
@@ -10030,6 +10155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         n_few      = summary.get("few_indels", 0)
         n_mid      = summary.get("mid_indels", 0)
         n_many     = summary.get("many_indels", 0)
+        n_over15   = getattr(self, 'nover16errbarcodes', 0)
         total_reads = getattr(self, 'totalseqs', '—')
         n_dem       = getattr(self, 'ndemultiplexed', '—')
         # sampleids holds every CSV sample (incl. 0 reads): count demultiplexed ones
@@ -10074,6 +10200,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 f'<span>📄 CSV: <strong>{_csv_name}</strong></span>'
                 if _csv_name else ''
             )
+            _rt_dir = getattr(self, '_live_fastq_dir', '')
+            if _rt_dir:
+                input_files_html += f'<span>📡 FASTQ folder: <strong>{_rt_dir}</strong></span>'
         else:
             parts = []
             if _fastq_name:
@@ -10091,15 +10220,137 @@ class MainWindow(QtWidgets.QMainWindow):
             f'  </div>'
         ) if is_rt else ""
 
+        _light_vars = ("--bg:#f1f5f9;--bg2:#ffffff;--bg3:#e2e8f0;"
+                       "--border:rgba(15,23,42,0.12);--border2:rgba(15,23,42,0.22);"
+                       "--text:#0f172a;--muted:#475569;--accent1:#0369a1;--accent2:#4f46e5;"
+                       "--green:#047857;--amber:#b45309;--red:#b91c1c;"
+                       "--nav-bg:rgba(241,245,249,0.9);color-scheme:light;")
+
+        # ── Summary line ──────────────────────────────────────────────────────
+        _n_review_s = len(_review)
+        _bits = [f"<b>{n_qc}</b> of <b>{n_samples}</b> samples with a QC-compliant barcode"]
+        if n_unres:
+            _bits.append(f"<b>{n_unres}</b> unresolved")
+        if _n_review_s:
+            _bits.append(f"<b>{_n_review_s}</b> to review")
+        _n_noread = _status_n["No reads"]
+        if _n_noread:
+            _bits.append(f"<b>{_n_noread}</b> without reads")
+        summary_line_html = '<div class="summary-line">' + " · ".join(_bits) + "</div>"
+
+        # ── Reads funnel ──────────────────────────────────────────────────────
+        reads_funnel_html = ""
+        _raw = total_reads if isinstance(total_reads, int) else 0
+        _pass = getattr(self, 'nseqspasslen', None)
+        _use = getattr(self, 'nseqsfordemultiplexing', None)
+        if _raw > 0:
+            _steps = [("Raw reads", _raw)]
+            if isinstance(_pass, int) and _pass > 0:
+                _steps.append(("Passing the length filter", _pass))
+            if isinstance(_use, int) and _use > 0:
+                _steps.append(("Used for demultiplexing (after splitting)", _use))
+            if isinstance(n_dem, int):
+                _steps.append(("Assigned to a sample", n_dem))
+            _rows = "".join(
+                f'<div class="funnel-row"><span class="lbl">{lab}</span>'
+                f'<span class="bar"><i style="width:{min(100.0, 100.0 * v / _raw):.1f}%"></i></span>'
+                f'<span class="val">{v:,} · {100.0 * v / _raw:.1f}%</span></div>'
+                for lab, v in _steps)
+            reads_funnel_html = f"""
+<section class="section" id="sec-reads">
+  <h2 class="section-title">Read funnel</h2>
+  <div class="funnel">{_rows}</div>
+  <div class="note">Percentages are relative to the raw reads. Reads lost between steps were
+  too short or too long, failed the quality filter, or did not match a primer / tag pair.</div>
+</section>"""
+
+        # ── Intra-sample variants section ─────────────────────────────────────
+        variants_section = ""
+        _rs = getattr(self, "_resolve_stats", {}) or {}
+        if _var_enabled and _rs.get("enabled"):
+            def _vc(lbl, val, cls):
+                return (f'<div class="stat {cls}"><div class="stat-label">{lbl}</div>'
+                        f'<div class="stat-value" style="font-size:28px">{val}</div></div>')
+            _cards = "".join((
+                _vc("Mixed samples", _rs.get("mixed", 0), "indigo"),
+                _vc("Now QC-compliant", _rs.get("recovered", 0), "green"),
+                _vc("Need review", _rs.get("needs_review", 0), "amber"),
+                _vc("Quality variants", _rs.get("tier_quality", 0), "blue"),
+                _vc("Contamination / paralog alerts", _rs.get("tier_alert", 0), "red"),
+                _vc("Traces (not exported)", _rs.get("tier_trace", 0), "indigo"),
+                _vc("Close, low support", _rs.get("tier_dropped", 0), "indigo"),
+            ))
+            _attn = sorted(
+                [(k, c) for k, c in _per_var.items()
+                 if c["alert"] or c["trace"] or k in _review],
+                key=lambda kc: (-(kc[1]["alert"]), -(kc[0] in _review), kc[0]))
+            _rev_chip = "<span class='chip amber'>Review</span>"
+            _attn_rows = "".join(
+                f"<tr><td>{k}</td><td>{_rev_chip if k in _review else ''}</td>"
+                f"<td>{c['quality']}</td><td>{c['alert'] or ''}</td><td>{c['trace'] or ''}</td></tr>"
+                for k, c in _attn)
+            _attn_html = (f"""
+  <div class="table-wrap" style="max-height:420px; overflow-y:auto; margin-top:18px;">
+    <table>
+      <thead><tr><th>Sample needing attention</th><th>Flag</th><th>Quality</th><th>Alerts</th><th>Traces</th></tr></thead>
+      <tbody>{_attn_rows}</tbody>
+    </table>
+  </div>""" if _attn_rows else '<div class="note">No sample has contamination / paralog alerts, traces or review flags.</div>')
+            variants_section = f"""
+<section class="section" id="sec-variants">
+  <h2 class="section-title">Intra-sample variants</h2>
+  <div class="stats-grid" style="padding:0">{_cards}</div>
+  {_attn_html}
+  <div class="note">Quality variants and alerts are exported to <b>secondary_variants.fa</b>
+  (headers carry <code>tier=</code>); traces are only listed in the log.</div>
+</section>"""
+
+        # ── Page script: theme toggle, table filter and sort ──────────────────
+        page_js = """<script>
+(function () {
+  var root = document.documentElement, btn = document.getElementById('themeBtn');
+  try { var t = localStorage.getItem('ont-report-theme'); if (t) root.setAttribute('data-theme', t); } catch (e) {}
+  if (btn) btn.addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') !== 'light';
+    var n = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', n);
+    try { localStorage.setItem('ont-report-theme', n); } catch (e) {}
+  });
+  var tbl = document.getElementById('sampleTable'); if (!tbl) return;
+  var body = tbl.tBodies[0], rows = Array.prototype.slice.call(body.rows);
+  var inp = document.getElementById('sampleFilter'), cnt = document.getElementById('sampleCount');
+  function upd() {
+    var q = (inp.value || '').toLowerCase(), n = 0;
+    rows.forEach(function (r) {
+      var ok = !q || r.textContent.toLowerCase().indexOf(q) >= 0;
+      r.style.display = ok ? '' : 'none'; if (ok) n++;
+    });
+    cnt.textContent = n + ' / ' + rows.length + ' samples';
+  }
+  inp.addEventListener('input', upd); upd();
+  Array.prototype.forEach.call(tbl.tHead.rows[0].cells, function (th, i) {
+    var asc = false;
+    th.addEventListener('click', function () {
+      asc = !asc;
+      rows.sort(function (a, b) {
+        var x = a.cells[i].getAttribute('data-v'), y = b.cells[i].getAttribute('data-v');
+        if (x === null) { x = a.cells[i].textContent; y = b.cells[i].textContent; }
+        var nx = parseFloat(x), ny = parseFloat(y);
+        var c = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(String(y));
+        return asc ? c : -c;
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+})();
+</script>"""
+
         html = f"""<!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ONTbarcoder — {run_name}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-{chartjs_cdn}
 <style>
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
@@ -10116,9 +10367,20 @@ class MainWindow(QtWidgets.QMainWindow):
     --green:     #34d399;
     --amber:     #fbbf24;
     --red:       #f87171;
-    --serif:     'DM Serif Display', Georgia, serif;
-    --mono:      'DM Mono', 'Courier New', monospace;
-    --sans:      'DM Sans', system-ui, sans-serif;
+    --serif:     'DM Serif Display', Georgia, 'Times New Roman', serif;
+    --mono:      'DM Mono', ui-monospace, 'Cascadia Mono', Consolas, 'Courier New', monospace;
+    --sans:      'DM Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    --nav-bg:    rgba(11,17,32,0.85);
+    color-scheme: dark;
+  }}
+  :root[data-theme="light"] {{ {_light_vars} }}
+  @media print {{
+    :root {{ {_light_vars} }}
+    nav, .no-print {{ display: none !important; }}
+    body {{ background: #fff; }}
+    .section, .stat, .phase-card, .chart-card {{ break-inside: avoid; }}
+    .table-wrap {{ max-height: none !important; overflow: visible !important; }}
+    .stat:hover {{ transform: none; }}
   }}
 
   html {{ scroll-behavior: smooth; }}
@@ -10141,7 +10403,7 @@ class MainWindow(QtWidgets.QMainWindow):
   /* ── NAV ── */
   nav {{
     position: sticky; top: 0; z-index: 100;
-    background: rgba(11,17,32,0.85);
+    background: var(--nav-bg);
     backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--border);
     display: flex; align-items: center; gap: 24px;
@@ -10187,7 +10449,7 @@ class MainWindow(QtWidgets.QMainWindow):
   /* ── STATS GRID ── */
   .stats-grid {{
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
     gap: 16px; padding: 40px 40px 0;
   }}
   .stat {{
@@ -10206,8 +10468,8 @@ class MainWindow(QtWidgets.QMainWindow):
   .stat.indigo::after {{ background: var(--accent2); }}
   .stat.amber::after  {{ background: var(--amber); }}
   .stat.red::after    {{ background: var(--red); }}
-  .stat-label {{ font-size: 14px; color: var(--muted); font-family: var(--mono);
-                 letter-spacing: .5px; text-transform: uppercase; margin-bottom: 8px; }}
+  .stat-label {{ font-size: 12px; color: var(--muted); font-family: var(--mono);
+                 letter-spacing: .3px; text-transform: uppercase; margin-bottom: 8px; }}
   .stat-value {{ font-size: 32px; font-family: var(--serif); color: var(--text);
                  line-height: 1; }}
   .stat-sub   {{ font-size: 13px; color: var(--muted); margin-top: 4px; }}
@@ -10292,8 +10554,52 @@ class MainWindow(QtWidgets.QMainWindow):
     flex-wrap: wrap; gap: 8px;
   }}
 
+  /* ── NEW COMPONENTS ── */
+  .theme-btn {{ background: transparent; border: 1px solid var(--border2); color: var(--muted);
+                border-radius: 20px; padding: 2px 12px; cursor: pointer;
+                font-family: var(--mono); font-size: 13px; }}
+  .theme-btn:hover {{ color: var(--text); }}
+  .summary-line {{ margin: 28px 40px 0; padding: 14px 18px; border-radius: 10px;
+                   background: var(--bg2); border: 1px solid var(--border);
+                   font-size: 15px; color: var(--text); }}
+  .summary-line b {{ font-family: var(--mono); }}
+  .chip {{ display: inline-block; padding: 1px 9px; border-radius: 12px; font-size: 12px;
+           font-family: var(--mono); border: 1px solid transparent; white-space: nowrap; }}
+  .chip.green {{ color: var(--green); border-color: var(--green); }}
+  .chip.blue  {{ color: var(--accent1); border-color: var(--accent1); }}
+  .chip.amber {{ color: var(--amber); border-color: var(--amber); }}
+  .chip.red   {{ color: var(--red); border-color: var(--red); }}
+  .chip.gray  {{ color: var(--muted); border-color: var(--border2); }}
+  .funnel {{ display: grid; gap: 10px; }}
+  .funnel-row {{ display: grid; grid-template-columns: 270px 1fr 150px; gap: 14px;
+                 align-items: center; font-size: 13px; }}
+  .funnel-row .lbl {{ color: var(--muted); font-family: var(--mono); }}
+  .funnel-row .bar {{ height: 10px; border-radius: 5px; background: var(--border2); position: relative; }}
+  .funnel-row .bar > i {{ position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+                          background: linear-gradient(90deg, var(--accent1), var(--accent2)); }}
+  .funnel-row .val {{ font-family: var(--mono); text-align: right; }}
+  .note {{ font-size: 13px; color: var(--muted); margin-top: 12px; }}
+  .toolbar {{ display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }}
+  .toolbar input {{ background: var(--bg2); border: 1px solid var(--border2); color: var(--text);
+                    border-radius: 8px; padding: 7px 12px; font-family: var(--mono);
+                    font-size: 13px; min-width: 240px; }}
+  .toolbar .count {{ font-size: 12px; color: var(--muted); font-family: var(--mono); }}
+  th.sortable {{ cursor: pointer; user-select: none; }}
+  th.sortable:hover {{ color: var(--text); }}
+  .legend {{ display: flex; gap: 16px; font-size: 12px; font-family: var(--mono);
+             color: var(--muted); margin-bottom: 6px; }}
+  .legend i {{ display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+               margin-right: 6px; vertical-align: -1px; }}
+  svg.chart {{ width: 100%; height: auto; display: block; }}
+  svg.chart text {{ fill: var(--muted); font-family: var(--mono); font-size: 11px; }}
+  svg.chart .grid {{ stroke: var(--border2); stroke-width: 1; }}
+  svg.chart .axis {{ stroke: var(--muted); stroke-width: 1; }}
+
   @media (max-width: 600px) {{
     nav, .hero, .stats-grid, .section {{ padding-left: 20px; padding-right: 20px; }}
+    .summary-line {{ margin-left: 20px; margin-right: 20px; }}
+    .funnel-row {{ grid-template-columns: 1fr; gap: 4px; }}
+    .funnel-row .val {{ text-align: left; }}
   }}
 </style>
 </head>
@@ -10305,9 +10611,11 @@ class MainWindow(QtWidgets.QMainWindow):
   <a href="#sec-phases">Phases</a>
   {"<a href='#sec-charts'>Graphs</a>" if charts_section else ""}
   {"<a href='#sec-timeline'>Timeline</a>" if timeline_section else ""}
+  {"<a href='#sec-variants'>Variants</a>" if variants_section else ""}
   {"<a href='#sec-params'>Parameters</a>" if params_section else ""}
   {"<a href='#sec-samples'>Samples</a>" if sample_rows else ""}
   <span class="spacer"></span>
+  <button class="theme-btn no-print" id="themeBtn" type="button" title="Light / dark">◐ Theme</button>
   <span class="{mode_badge_cls}">{mode_badge_txt}</span>
 </nav>
 
@@ -10321,6 +10629,8 @@ class MainWindow(QtWidgets.QMainWindow):
     {input_files_html}
   </div>
 </header>
+
+{summary_line_html}
 
 <!-- STATS PRINCIPALES -->
 <div class="stats-grid" id="sec-summary">
@@ -10356,6 +10666,8 @@ class MainWindow(QtWidgets.QMainWindow):
   </div>
   {rt_cycles_card}
 </div>
+
+{reads_funnel_html}
 
 <!-- PHASES -->
 <section class="section" id="sec-phases">
@@ -10403,14 +10715,22 @@ class MainWindow(QtWidgets.QMainWindow):
       <div class="qual-card">
         <div class="qual-dot" style="background:var(--red)"></div>
         <div class="qual-info">
-          <div class="qual-label">&gt;10 indels</div>
+          <div class="qual-label">11–15 indels</div>
           <div class="qual-val">''' + str(n_many) + '''</div>
+        </div>
+      </div>
+      <div class="qual-card">
+        <div class="qual-dot" style="background:var(--red)"></div>
+        <div class="qual-info">
+          <div class="qual-label">&gt;15 indels</div>
+          <div class="qual-val">''' + str(n_over15) + '''</div>
         </div>
       </div>
     </div>
   </div>'''}
 </section>
 
+{variants_section}
 {params_section}
 {charts_section}
 {timeline_section}
@@ -10421,7 +10741,7 @@ class MainWindow(QtWidgets.QMainWindow):
   <span>{outpath}</span>
 </footer>
 
-{charts_js}
+{page_js}
 </body>
 </html>"""
 
