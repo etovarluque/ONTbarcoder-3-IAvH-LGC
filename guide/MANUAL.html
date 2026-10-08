@@ -283,11 +283,14 @@ version</b> or <b>Remind me later</b>; untick <i>Check for updates at start-up</
 <h2 id="workflow">3. Workflow overview</h2>
 <p>The left sidebar of the application has two tabs: <b>Workflow</b> (the analysis
 pipeline) and <b>Utilities</b> (standalone tools). The tab follows whichever panel is open,
-and every item carries a monochrome icon that changes colour with its state. The
+and clicking a tab reopens the last panel used in it (<b>Input files</b> and <b>FASTA Tools</b>
+the first time; a locked or hidden panel falls back to the first one). Every item carries a monochrome icon that changes colour with its state. The
 <b>Dark</b>/<b>Light</b> button in the top bar switches the colour theme; the choice is
 remembered between sessions. The mouse wheel scrolls the page and never changes a value:
 numeric fields, drop-down lists and sliders ignore it, so scrolling past a parameter cannot
-edit it by accident (use the keyboard, the field's arrows or a click instead). A typical run
+edit it by accident (use the keyboard, the field's arrows or a click instead).
+A <b>?</b> icon next to each panel's main title opens the matching section of this manual in
+the browser (the Real-Time configuration opens §5.2). A typical run
 moves through the workflow panels in order:</p>
 
 <div class="phase-flow">
@@ -1004,7 +1007,20 @@ because later steps and the utilities read them to recognise a run folder.</p>
 </table>
 <p>The HTML report (<code>report.html</code>) summarizes the same run; its <b>Breakdown by
 coverage — Phase 2a</b> table counts every barcode resolved at each coverage level,
-accumulated over all Real-Time cycles.</p>
+accumulated over all Real-Time cycles. It also contains:</p>
+<ul>
+  <li>A one-line summary and a <b>Read funnel</b> (raw reads &rarr; length filter &rarr;
+      demultiplexing &rarr; assigned).</li>
+  <li>The sample table, with <b>Status</b> (QC OK, Barcode not QC, Review, Low coverage, No
+      barcode, No reads) and <b>Variants</b> columns that can be filtered and sorted.</li>
+  <li>An <b>Intra-sample variants</b> section (when variant resolution is on): mixed samples,
+      quality variants, contamination / paralog alerts, traces and the samples to review.</li>
+  <li>In Real-Time mode, the cycle charts (inline SVG, minutes for runs shorter than an hour)
+      and the Real-Time folder and cycle trigger.</li>
+  <li>The <i>&gt;10 indels</i> class is split into <b>11-15</b> and <b>&gt;15 indels</b>.</li>
+</ul>
+<p>The report works offline (no external scripts or fonts) and has light, dark and print styles
+with a theme button (dark by default).</p>
 
 <!-- ════════════════════════════════════════════════════ -->
 <h2 id="profiles">9. Parameter profiles</h2>
@@ -1463,6 +1479,13 @@ submitted again as two smaller searches, as for a rejected batch above; only a b
 cannot be split further goes to <code>missing_seqs_&lt;ts&gt;.fa</code>. A search can also stay
 in NCBI's queue indefinitely: rather than waiting the whole budget, you can press <b>Stop</b>
 and then <b>Resume run…</b>, which submits that batch again as a new search.</p>
+<p><b>Result checks per search</b> (2-30, default 5) sets how many times NCBI is asked for a
+search's result, about one minute apart, before that search is abandoned and the same
+sequences are sent again with a new RID. Every poll that is not <i>READY</i> counts, WAITING
+included. A batch is resubmitted from scratch up to 3 times; if it still stalls it is left for
+the <i>Final retry</i> and, if it stalls again, it is left aside (not split) in
+<code>missing_seqs_&lt;ts&gt;.fa</code> and listed in the run log under <i>Left aside</i>. The
+status line reads <i>Fetching results: retry #n</i>.</p>
 
 <h4>Stopping and resuming a run</h4>
 <p>Each run keeps a small state file, <code>blast-&lt;ts&gt;.state.json</code>, next to its
@@ -1739,6 +1762,8 @@ or a short alignment instead means the database simply holds nothing close to yo
 <b>Best hit</b> and <b>BLAST Results</b>, the table described above. Best Sequence reads the
 <i>BLAST Results</i> sheet by name.</p>
 <p><b>Summary</b> answers &laquo;what was searched and how far did it get&raquo;:</p>
+<p>The sheet starts with <b>key-figure cards</b>, and the paths are at the bottom so they do not
+stretch the columns. Files with the same name are told apart by their folder.</p>
 <ul>
   <li><b>Input files</b> with the number of sequences of each and the total (on the BLAST web
       results tab, the result files and their queries).</li>
@@ -1748,11 +1773,16 @@ or a short alignment instead means the database simply holds nothing close to yo
   <li><b>Results</b>: hit rows, sequences with hits, without hits and, in an incomplete run,
       not searched; and how many times the best hit is not BLAST's first one.</li>
   <li><b>Identification level</b>: how many sequences were identified to organism, genus,
-      family or order (count, % and cumulative %), how many shared no rank with the
+      family or order (count and %, with a Total of 100 % and text bars that look the same in every
+      Excel version), how many shared no rank with the
       reference (<code>none</code>), had no expected taxonomy, or got no hit; and the same
       table per input file when there are several. Without a reference file there is no
       taxonomic level to count, and the sheet only separates sequences with and without
-      hits.</li>
+      hits. With several input files, a 100 % stacked chart shows the levels by file.</li>
+  <li><b>Best-hit identity</b>: sequences with a best hit of &ge; 99, 97-99, 95-97 and &lt; 95 %.</li>
+  <li><b>Sequences to review</b>: low identity, best hit that is not BLAST's first, and no
+      match with the reference.</li>
+  <li><b>Run</b>: duration, sessions, searches sent again and sequences left aside.</li>
 </ul>
 <p><b>Best hit</b> has <b>one row per sequence</b>, sorted by name, with two extra columns at
 the left: <code>Identification</code> (coloured) and <code>Hits</code> (how many hits the
