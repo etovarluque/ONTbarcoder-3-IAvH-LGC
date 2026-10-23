@@ -5853,7 +5853,17 @@ class MainWindow(QtWidgets.QMainWindow):
             url.setFragment(anchor)
         # The OS file-association launcher drops the #fragment of file URLs,
         # so open a tiny temp page that redirects to the anchor instead.
-        if anchor:
+        if anchor and sys.platform.startswith("linux"):
+            # Sandboxed browsers (snap/flatpak) cannot read a redirect page in
+            # /tmp (-> "File not found"): open the manual with the anchor directly.
+            try:
+                import webbrowser
+                if webbrowser.open(url.toString()):
+                    return
+            except Exception:
+                pass
+            url = QtCore.QUrl.fromLocalFile(path)
+        elif anchor:
             try:
                 import tempfile
                 target = url.toString()
@@ -6372,7 +6382,6 @@ class MainWindow(QtWidgets.QMainWindow):
             os.makedirs(os.path.join(outpath, "barcodesets", "consensus_by_similarity"), exist_ok=True)
             os.makedirs(os.path.join(outpath, "barcodesets", "fixing"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "barcodesets", "temps"), exist_ok=True)
-        os.makedirs(os.path.join(outpath, "demultiplexingfiles"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "demultiplexed"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "2a_ConsensusByLength"), exist_ok=True)
 
@@ -6797,7 +6806,6 @@ class MainWindow(QtWidgets.QMainWindow):
             os.makedirs(os.path.join(outpath, "barcodesets", "consensus_by_similarity"), exist_ok=True)
             os.makedirs(os.path.join(outpath, "barcodesets", "fixing"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "barcodesets", "temps"), exist_ok=True)
-        os.makedirs(os.path.join(outpath, "demultiplexingfiles"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "demultiplexed"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "2a_ConsensusByLength"), exist_ok=True)
         os.makedirs(os.path.join(outpath, "1_demultiplexing"), exist_ok=True)
@@ -7758,7 +7766,7 @@ class MainWindow(QtWidgets.QMainWindow):
         output root for this guarantee to hold.
         """
         # Delete entire intermediate folders
-        for folder in ["1_demultiplexing", "demultiplexed", "demultiplexingfiles",
+        for folder in ["1_demultiplexing", "demultiplexed",
                        "2a_ConsensusByLength", "2b_ConsensusBySimilarity",
                        "3_ConsensusByBarcodeComparison", "barcodesets",
                        "Main_barcode_results"]:
@@ -7768,10 +7776,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     shutil.rmtree(d)
                 except Exception:
                     pass
-        
+
         # Recreate directories needed for the pipeline
         non_coi = params.get("non_coi", False)
-        base_dirs = ["1_demultiplexing", "demultiplexed", "demultiplexingfiles",
+        base_dirs = ["1_demultiplexing", "demultiplexed",
                      "2a_ConsensusByLength"]
         if not non_coi:
             base_dirs += ["2b_ConsensusBySimilarity", "3_ConsensusByBarcodeComparison"]
@@ -10788,7 +10796,6 @@ class MainWindow(QtWidgets.QMainWindow):
         target_folders = [
             "1_demultiplexing",
             "demultiplexed",
-            "demultiplexingfiles",
             "2a_ConsensusByLength",
             "2b_ConsensusBySimilarity",
             "3_ConsensusByBarcodeComparison",
@@ -11874,7 +11881,7 @@ class MainWindow(QtWidgets.QMainWindow):
         _non_coi_final = params.get("non_coi", False)
         _final_dirs = [
             "barcodesets", "barcodesets/consensus_by_length",
-            "barcodesets/temps", "demultiplexingfiles", "demultiplexed",
+            "barcodesets/temps", "demultiplexed",
             "2a_ConsensusByLength", "1_demultiplexing",
         ]
         if not _non_coi_final:
@@ -12019,7 +12026,7 @@ class MainWindow(QtWidgets.QMainWindow):
         import glob
         
         # Delete entire intermediate folders
-        for folder in ["1_demultiplexing", "demultiplexed", "demultiplexingfiles",
+        for folder in ["1_demultiplexing", "demultiplexed",
                        "2a_ConsensusByLength", "2b_ConsensusBySimilarity",
                        "3_ConsensusByBarcodeComparison", "barcodesets",
                        "Main_barcode_results", "live_fastq_processed"]:
@@ -12038,7 +12045,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         
         # Recreate required directories
-        for d in ["1_demultiplexing", "demultiplexed", "demultiplexingfiles",
+        for d in ["1_demultiplexing", "demultiplexed",
                   "2a_ConsensusByLength", "2b_ConsensusBySimilarity",
                   "3_ConsensusByBarcodeComparison"]:
             os.makedirs(os.path.join(outpath, d), exist_ok=True)

@@ -1690,10 +1690,7 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_title = make_label("BLAST API Search", size=19, bold=True)
         self._lbl_desc = make_label(
             "BLAST sequences in NCBI. "
-            "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta).\n"
-            "Optional: results might include organism and taxonomic classification from NCBI Taxonomy.\n"
-            "The queried sequences are saved as a FASTA named after the results, "
-            "ready to use as a pair in Best Sequence.",
+            "Drag-and-drop one or more FASTA files (.fa, .fas, .fasta).",
             color=TEXT_SEC
         )
         self._lbl_desc.setWordWrap(True)
